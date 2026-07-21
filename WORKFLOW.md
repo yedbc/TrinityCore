@@ -189,3 +189,131 @@ Use `--parallel 2` for RelWithDebInfo; higher parallelism exhausts the PCH heap
   released file whose hash changed, and MySQL stops at the first error — so one
   inapplicable statement silently skips the rest of the file, and TC treats a failed
   update as fatal.
+
+---
+
+## 7. Keeping current with upstream TrinityCore
+
+There is **one remote**, `origin` = our fork (`github.com/agatho/TrinityCore.git`).
+`origin/master` is our mirror of upstream TrinityCore and is the canonical base every
+feature branch should sit on. Wire the real upstream once:
+
+```sh
+git --git-dir=I:/TrinityCore/.bare remote add upstream https://github.com/TrinityCore/TrinityCore.git
+```
+
+There are **two update cadences**, and they are not the same job.
+
+### 7a. Minor bump (a patch within the same expansion, e.g. 12.0.5 -> 12.0.7)
+
+Bugfixes and a handful of opcode/struct tweaks. Handle it at integration level:
+
+1. `git fetch upstream && git checkout master && git merge --ff-only upstream/master && git push origin master`
+2. `git merge master` into each integration line; resolve conflicts once, here.
+3. Compile `--target worldserver`, run the offline validators (7d), boot-test.
+4. Active feature branches rebase onto the new master; done ones ride in via integration.
+
+### 7b. Major update (a version jump, e.g. 12.0.x -> 12.1) — this is a MIGRATION
+
+A version jump renumbers opcodes, restructures DB2/wire, and adds or reworks whole
+systems. **Do NOT try to verify this on the integration branch in one pass — the
+codebase is too large and you WILL be overwhelmed.** The reason feature branches exist
+is to make this tractable: each is a bounded, focusable subsystem (housing, warband,
+delves, mythic+, crafting-orders ...). You never verify "everything" at once; you verify
+one subsystem at a time, in its own branch, with its own tooling and agent context.
+
+The subsystems are independent, so this **parallelizes**: give each feature branch its
+own focused agent session (that is what the per-feature wrapper — `CLAUDE.md`, `.claude/`,
+`.mcp.json`, and analysis tooling like `housing/sniff_verify/` — is FOR; never discard it).
+
+Per feature branch, in focus:
+
+1. Rebase onto the new base: `git rebase --onto <new-master> <old-base> feature/X`.
+2. **Compile** the subsystem — catches renamed APIs and changed signatures.
+3. **Verify opcodes / wire / DB2** — these do NOT compile-fail, they break silently.
+   Use the deep sources in 7c and the offline validators in 7d.
+4. Fix what the update broke; commit on the branch.
+5. Record the subsystem's state in the migration manifest (7e).
+
+Only after the branches are re-verified do you **rebuild integration from them** and
+boot-test the whole. Integration is the product of the verified branches, not the place
+the migration happens.
+
+The 67186 -> 68275 migration was exactly this process (see
+`MIGRATION_68275_PIPELINE_RESULT.md` and the per-system dossiers in memory). It was
+hardest precisely where feature-branch focus had been lost.
+
+### 7c. Deep information sources — you MUST dig into ALL of these
+
+Verifying an update is NOT a code-reading exercise on the TC repo alone. TC is the
+*server's* view; the ground truth for opcodes, wire layouts, DB2 structures, enums and
+event payloads lives in the client and its data. Getting an update right means going deep
+and thorough into every one of these. Do not shortcut this — a missed opcode renumber or
+a changed DB2 field is silent until it corrupts the wire at runtime.
+
+- **IDA Pro (client disassembly)** — `"C:/Program Files/IDA Professional 9.3/idat.exe"`,
+  enriched IDB `c:/dumps/wow_dump.bin.i64`, cfunc-cache SQLite `c:/dumps/wow_dump.bin.tc_wow.db`
+  (pseudocode keyed by real VA), plugin `tc_wow_analyzer` (~70 analyzers). Authority for:
+  opcode dispatch, (de)serializer internals, wire field order, packet handlers,
+  RTTI/vtables, hash/FDID resolution. Disassemble the client's own serializer for a CMSG
+  to get its exact wire with no sniff (see `[[cmsg_wire_from_serializer_68275]]`).
+- **Ghidra (fallback decompiler)** — `C:/Users/daimon/Downloads/ghidra_12.0.2_PUBLIC`,
+  project `c:/dumps/ghidra_proj3/`. For functions Hex-Rays crashes on. Import `-noanalysis`.
+- **WoWDBDefs** — `c:/dumps/WoWDBDefs/definitions/*.dbd` (1320 defs). Per-build, per-
+  layout-hash DB2 column layouts. THE source for how a DB2 struct changed between builds
+  (field inserted/renamed/resigned). A `.dbd` lists every BUILD a LAYOUT applies to — match
+  the new build's layout hash for the exact field order (this caught the
+  WarbandScenePlacement field insertion in 68275).
+- **wago.tools** (online: https://wago.tools) — browsable DB2 data per build with
+  build-to-build diffs, DBD, hotfixes, and the listfile. Fastest way to see WHAT changed in
+  the data/structures between two builds before digging into the binary. Cross-check
+  against WoWDBDefs. CASC listfile locally: `C:/Users/daimon/Downloads/CASCExplorer/listfile.csv`
+  (FileDataID -> path).
+- **WoW UI Lua / API docs** — `c:/dumps/external/wow-ui-source-12.0.5/` and the newer
+  `external/wow-ui-source/`; 587 `*Documentation.lua` files under
+  `Interface/AddOns/Blizzard_APIDocumentationGenerated/`. Authority for: enum value->name,
+  event payload shapes, and UI-side field semantics. When the binary gives a bitfield but
+  not its meaning, the Lua UI source names it (how CLUB_FINDER_REQUEST_TYPE and the
+  neutral-faction u8 mapping were resolved). Diff the 12.1 UI source against 12.0.x to see
+  which enums/events changed.
+- **Client binary + AutoDump JSONs** — raw `c:/dumps/wow_dump.bin` (memory dump; real base
+  `0x7FF7B3140000`, see `[[wow_dump_runtime_base_68275]]`), plus per-build
+  `wow_opcode_dispatch_<build>.json`, `wow_db2_metadata_<build>.json`,
+  `wow_jam_messages_<build>.json`, `wow_string_xrefs`, `wow_rtti`, etc. Regenerate via
+  AutoDump on the new client; diff `wow_build_diff` for the moved/added/removed function
+  buckets to target the migration.
+- **Live sniffs** — `C:/sniff/*.pkt` (custom PKT 3.1; parser `parse_sniff_pkt.py`). Only a
+  live capture on the new build settles a field VALUE the binary can't (reflection ceiling,
+  `[[re_blindspot_map_and_full_catalog_68275]]`). Structure is recoverable offline; some
+  semantics are not.
+- **TrinityCore master** — `origin/master` / upstream. 15 years of RE; its opcode and
+  struct declarations are authoritative for the new build once it updates
+  (`[[tc_opcodes_verified_68275]]`, `[[feedback_tc_authority]]`). But the CLIENT BINARY
+  outranks it in a wire conflict (`[[feedback_client_binary_is_arbiter]]`).
+
+Rule of thumb: **the client binary is the final arbiter of wire; WoWDBDefs + wago for DB2
+structure; UI Lua for enum/event semantics; TC for the server contract; a live sniff only
+for values nothing else can give.** Consult ALL of them — no single source is complete,
+and each update you must dig deep and thorough through every one.
+
+### 7d. Offline validators (run per branch, and on integration)
+
+Built during the 68275 migration; reusable every update (scratchpad / memory):
+
+- `db2_validate.py` — replicates LoadDB2's structure assert offline (DB2Metadata vs
+  DB2LoadInfo); catches every mismatched store in one pass. Note: both sides of that assert
+  come from OUR headers — the `.db2` file is never read.
+- `db2_signcheck.py` — replicates DB2FileLoader's signedness rule; Index/ParentIndexField
+  are always unsigned.
+- `stmt_check.py` — every prepared statement's columns vs the actual table shape.
+- Opcode-value scan against the client binary + TC `Opcodes.h`; PE `.pdata` vtable-walk for
+  handler recovery (`[[opcode_handler_recovery]]`).
+- Then, always, a **boot test** — the only thing that exercises SQL, DB2 load, and the
+  send/handler gates together.
+
+### 7e. Migration manifest
+
+Track every subsystem so nothing is silently skipped across dozens of branches. One row per
+feature branch, columns: rebased / compiles / opcodes-verified / wire-verified /
+DB2-verified / booted. A branch is "done" only when every column is checked. Silence is not
+success — an unchecked column is an unverified subsystem, not a passing one.
