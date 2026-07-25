@@ -9045,6 +9045,53 @@ void Unit::SetFlightCapabilityID(int32 flightCapabilityId, bool clientUpdate)
     UpdateAdvFlyingSpeed(ADV_FLYING_SURFACE_FRICTION, clientUpdate);
     UpdateAdvFlyingSpeed(ADV_FLYING_OVER_MAX_DECELERATION, clientUpdate);
     UpdateAdvFlyingSpeed(ADV_FLYING_LAUNCH_SPEED_COEFFICIENT, clientUpdate);
+
+    // Vigor - the Skyriding resource - is a spell-charge system: SpellCategory 2391 ("Skryriding
+    // Charges - Core" [sic], 6 charges / 15s recovery) is consumed by Skyward Ascent / Surge Forward
+    // and refunded by Second Wind; the Skyriding aura (406095) speeds recovery up via
+    // SPELL_AURA_CHARGE_RECOVERY_MULTIPLIER. Since 11.2.7 retail has NO vigor bar - the client shows
+    // the charge count on the ability icons (native SetSpellCharges traffic covers that). The only
+    // extra server duty is mirroring the charge count into POWER_ALTERNATE_MOUNT (seen as
+    // SMSG_POWER_UPDATE type 25 on the retail wire) and pacing the speed-scaled recharge -
+    // Player::UpdateVigor does both.
+    if (Player* vigorPlayer = ToPlayer())
+    {
+        constexpr uint32 SPELL_CATEGORY_SKYRIDING_VIGOR = 2391;
+        // Retail swaps the action bar to the dragonriding kit while a skyriding capability is
+        // engaged: OverrideSpellData 2106 = Surge Forward, Skyward Ascent, Whirling Surge, Bronze
+        // Timelock + Dismount in the last slot. No spell in this build's data carries it as an
+        // OVERRIDE_SPELLS aura, so apply it here, mirroring HandleAuraOverrideSpells.
+        constexpr uint32 OVERRIDE_SPELLS_SKYRIDING = 2106;
+
+        if (flightCapabilityId)
+        {
+            vigorPlayer->SetMaxPower(POWER_ALTERNATE_MOUNT, vigorPlayer->GetSpellHistory()->GetMaxCharges(SPELL_CATEGORY_SKYRIDING_VIGOR));
+            vigorPlayer->UpdateVigor();
+
+            vigorPlayer->SetOverrideSpellsId(OVERRIDE_SPELLS_SKYRIDING);
+            if (OverrideSpellDataEntry const* overrideSpells = sOverrideSpellDataStore.LookupEntry(OVERRIDE_SPELLS_SKYRIDING))
+                for (uint8 i = 0; i < MAX_OVERRIDE_SPELL; ++i)
+                    if (uint32 spellId = overrideSpells->Spells[i])
+                        vigorPlayer->AddTemporarySpell(spellId);
+        }
+        else
+        {
+            if (vigorPlayer->GetMaxPower(POWER_ALTERNATE_MOUNT) > 0)
+            {
+                vigorPlayer->SetPower(POWER_ALTERNATE_MOUNT, 0);
+                vigorPlayer->SetMaxPower(POWER_ALTERNATE_MOUNT, 0);
+            }
+
+            if (vigorPlayer->m_activePlayerData->OverrideSpellsID == int32(OVERRIDE_SPELLS_SKYRIDING))
+            {
+                vigorPlayer->SetOverrideSpellsId(0);
+                if (OverrideSpellDataEntry const* overrideSpells = sOverrideSpellDataStore.LookupEntry(OVERRIDE_SPELLS_SKYRIDING))
+                    for (uint8 i = 0; i < MAX_OVERRIDE_SPELL; ++i)
+                        if (uint32 spellId = overrideSpells->Spells[i])
+                            vigorPlayer->RemoveTemporarySpell(spellId);
+            }
+        }
+    }
 }
 
 void Unit::SetDriveCapabilityID(int32 driveCapabilityId, bool clientUpdate)
@@ -9089,7 +9136,29 @@ void Unit::SetDriveCapabilityID(int32 driveCapabilityId, bool clientUpdate)
     }
 }
 
-void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUpdate)
+void Unit::SendAdvFlyingSpeedBurst()
+{
+    // The complete FlightCapability parameter burst, in the retail order (sniff 66709: sent on every
+    // mount-engage, strictly AFTER SMSG_MOVE_SET_CAN_ADV_FLY). The client's double-jump launch gate
+    // requires its physics-param array populated, and the change-suppression in UpdateAdvFlyingSpeed
+    // would swallow most of it - m_advFlyingSpeed is pre-seeded with FlightCapability fallback row 1,
+    // which differs from typical live rows in only a field or two - so force all 13.
+    UpdateAdvFlyingSpeed(ADV_FLYING_AIR_FRICTION, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_MAX_VEL, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_LIFT_COEFFICIENT, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_DOUBLE_JUMP_VEL_MOD, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_GLIDE_START_MIN_HEIGHT, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_ADD_IMPULSE_MAX_SPEED, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_BANKING_RATE, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_PITCHING_RATE_DOWN, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_PITCHING_RATE_UP, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_TURN_VELOCITY_THRESHOLD, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_SURFACE_FRICTION, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_OVER_MAX_DECELERATION, true, true);
+    UpdateAdvFlyingSpeed(ADV_FLYING_LAUNCH_SPEED_COEFFICIENT, true, true);
+}
+
+void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUpdate, bool force /*= false*/)
 {
     FlightCapabilityEntry const* flightCapabilityEntry = sFlightCapabilityStore.LookupEntry(GetFlightCapabilityID());
     if (!flightCapabilityEntry)
@@ -9132,7 +9201,7 @@ void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUp
             ApplyPct(newValue, pos);
     }
 
-    if (m_advFlyingSpeed[speedType] == newValue)
+    if (!force && m_advFlyingSpeed[speedType] == newValue)
         return;
 
     m_advFlyingSpeed[speedType] = newValue;
@@ -9150,7 +9219,7 @@ void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeSingle speedType, bool clientUp
     }
 }
 
-void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeRange speedType, bool clientUpdate)
+void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeRange speedType, bool clientUpdate, bool force /*= false*/)
 {
     FlightCapabilityEntry const* flightCapabilityEntry = sFlightCapabilityStore.LookupEntry(GetFlightCapabilityID());
     if (!flightCapabilityEntry)
@@ -9189,7 +9258,7 @@ void Unit::UpdateAdvFlyingSpeed(AdvFlyingRateTypeRange speedType, bool clientUpd
         }
     }
 
-    if (m_advFlyingSpeed[speedType] == min && m_advFlyingSpeed[speedType + 1] == max)
+    if (!force && m_advFlyingSpeed[speedType] == min && m_advFlyingSpeed[speedType + 1] == max)
         return;
 
     m_advFlyingSpeed[speedType] = min;

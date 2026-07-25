@@ -1683,21 +1683,17 @@ void Player::Regenerate(Powers power)
     if (!powerType)
         return;
 
+    // Vigor (Skyriding) is not a value-regenerating power: it is a mirror of the SpellCategory 2391
+    // charge state (PowerType 25 has zero base regen in every build's data). Keep the mirror and
+    // the speed-scaled recharge pacing in sync from the regen tick instead.
+    if (power == POWER_ALTERNATE_MOUNT)
+    {
+        UpdateVigor(m_regenTimer);
+        return;
+    }
+
     int32 curValue = GetPower(power);
     float addvalue = GetPowerRegen(power) * 0.001f * m_regenTimer;
-
-    // Vigor regen scales with forward velocity during advanced flying
-    if (power == POWER_ALTERNATE_MOUNT && m_movementInfo.HasExtraMovementFlag2(MOVEMENTFLAG3_ADV_FLYING) && m_movementInfo.advFlying)
-    {
-        if (FlightCapabilityEntry const* flightCapability = sFlightCapabilityStore.LookupEntry(GetFlightCapabilityID()))
-        {
-            if (flightCapability->VigorRegenMaxVelCoefficient > 0.0f && flightCapability->MaxVel > 0.0f)
-            {
-                float velocityPct = std::min(m_movementInfo.advFlying->forwardVelocity / flightCapability->MaxVel, 1.0f);
-                addvalue *= 1.0f + velocityPct * flightCapability->VigorRegenMaxVelCoefficient;
-            }
-        }
-    }
 
     int32 minPower = powerType->MinPower;
     int32 maxPower = GetMaxPower(power);
@@ -1789,6 +1785,53 @@ void Player::InterruptPowerRegen(Powers power)
     m_regenInterruptTimestamp = GameTime::Now();
     m_powerFraction[powerIndex] = 0.0f;
     SendDirectMessage(WorldPackets::Combat::InterruptPowerRegen(power).Write());
+}
+
+void Player::UpdateVigor(uint32 elapsedMs /*= 0*/)
+{
+    // Vigor (Skyriding) = the charge state of SpellCategory 2391. Since 11.2.7 retail shows it only
+    // as the charge count on the ability icons (no bar), so the server work is: mirror the count
+    // into POWER_ALTERNATE_MOUNT, and pace the recharge with forward speed - retail recovers a
+    // charge in ~12s when slow and ~6s at high speed; the flat data value (15s scaled by the
+    // Skyriding aura's recovery multiplier) covers the slow case, and FlightCapability's
+    // VigorRegenMaxVelCoefficient supplies the velocity scaling on top.
+    constexpr uint32 SPELL_CATEGORY_SKYRIDING_VIGOR = 2391;
+
+    if (!GetFlightCapabilityID())
+        return;
+
+    SpellHistory* history = GetSpellHistory();
+    int32 maxVigor = history->GetMaxCharges(SPELL_CATEGORY_SKYRIDING_VIGOR);
+    if (maxVigor <= 0)
+        return;
+
+    int32 vigor = history->GetChargeCount(SPELL_CATEGORY_SKYRIDING_VIGOR);
+    SetPower(POWER_ALTERNATE_MOUNT, vigor);
+
+    if (!elapsedMs || vigor >= maxVigor)
+        return;
+
+    if (!m_movementInfo.HasExtraMovementFlag2(MOVEMENTFLAG3_ADV_FLYING) || !m_movementInfo.advFlying)
+        return;
+
+    FlightCapabilityEntry const* flightCapability = sFlightCapabilityStore.LookupEntry(GetFlightCapabilityID());
+    if (!flightCapability || flightCapability->VigorRegenMaxVelCoefficient <= 0.0f || flightCapability->MaxVel <= 0.0f)
+        return;
+
+    uint32 powerIndex = GetPowerIndex(POWER_ALTERNATE_MOUNT);
+    if (powerIndex == MAX_POWERS || powerIndex >= MAX_POWERS_PER_CLASS)
+        return;
+
+    // m_powerFraction is free for this power (vigor never regenerates fractional power) - repurpose
+    // it to accumulate the earned bonus recovery, and shift the recharge queue in >=500ms steps so
+    // the SetSpellCharges resyncs stay infrequent.
+    float velocityPct = std::min(m_movementInfo.advFlying->forwardVelocity / flightCapability->MaxVel, 1.0f);
+    m_powerFraction[powerIndex] += float(elapsedMs) * velocityPct * flightCapability->VigorRegenMaxVelCoefficient;
+    if (m_powerFraction[powerIndex] >= 500.0f)
+    {
+        history->ModifyChargeRecoveryTime(SPELL_CATEGORY_SKYRIDING_VIGOR, Milliseconds(-int64(m_powerFraction[powerIndex])));
+        m_powerFraction[powerIndex] = 0.0f;
+    }
 }
 
 void Player::RegenerateHealth()
@@ -26170,6 +26213,42 @@ void Player::SendInitialPacketsBeforeAddToMap()
     // SMSG_SET_PCT_SPELL_MODIFIER
     // SMSG_SET_FLAT_SPELL_MODIFIER
 
+    // Skyriding: the client gates the dynamic-flight UI (C_MountJournal.IsDragonridingUnlocked -
+    // the mount journal's flight-style switch) behind PlayerCondition 106228 -> ModifierTree 282179,
+    // whose only satisfiable leg in this build's data is having completed "Tour the Trading Post"
+    // (66858 Alliance / 66959 Horde) - the aura leg (424143) is the harmful Remix timerunning buff.
+    // The quest's reward spell is a [DND] no-op, it has no reset flags and awards nothing, so
+    // advertising it as completed once the character knows Skyriding (376777) is retail-equivalent
+    // account state. This only sets the client-visible completed bits; the quest log and DB are
+    // untouched. These are ACCOUNT quests, so besides the character quest-completed vector the
+    // account-combined vectors must carry the bit too - the client's completed-quest conditions
+    // for account quests read those.
+    if (HasSpell(376777 /*Skyriding*/))
+    {
+        uint32 skyridingUnlockQuest = GetTeam() == ALLIANCE ? 66858 : 66959;
+        SetQuestCompletedBit(skyridingUnlockQuest, true);
+        if (uint32 questBit = sDB2Manager.GetQuestUniqueBitFlag(skyridingUnlockQuest))
+        {
+            uint32 fieldOffset = (questBit - 1) / QUESTS_COMPLETED_BITS_PER_BLOCK;
+            uint64 flag = UI64LIT(1) << ((questBit - 1) % QUESTS_COMPLETED_BITS_PER_BLOCK);
+            // index 12 = the completed-quest vector the client consults instead of the account one
+            // while a content-tracking mode (ctrOptions & 0x2000) is active
+            for (uint32 vectorIndex : { uint32(PLAYER_DATA_FLAG_ACCOUNT_COMBINED_QUESTS_INDEX), uint32(PLAYER_DATA_FLAG_ACCOUNT_COMBINED_QUEST_REWARDS_INDEX), 12u })
+                SetUpdateFieldFlagValue(m_values
+                    .ModifyValue(&Player::m_activePlayerData)
+                    .ModifyValue(&UF::ActivePlayerData::BitVectors)
+                    .ModifyValue(&UF::BitVectors::Values, vectorIndex)
+                    .ModifyValue(&UF::BitVector::Values, fieldOffset), flag);
+        }
+
+        // The spellbook's "Skyriding Flight Style" toggle (436854 Switch Flight Style,
+        // SkillLineAbility 49875 under Riding) is AcquireMethod=Learned - retail teaches it during
+        // the skyriding intro, which this core has no quest content for, so grant it with the kit.
+        // Learn before SendKnownSpells below so it rides the initial spell list.
+        if (!HasSpell(436854 /*Switch Flight Style*/))
+            LearnSpell(436854, false);
+    }
+
     /// SMSG_TALENTS_INFO
     SendTalentsInfoData();
     /// SMSG_INITIAL_SPELLS
@@ -30072,6 +30151,30 @@ void Player::_LoadTraits(PreparedQueryResult configsResult, PreparedQueryResult 
 
             CreateTraitConfig(traitConfig);
         }
+    }
+
+    // Auto-grant the Skyriding (dynamic-flight) trait config if the character lacks it. The base
+    // Skyriding kit lives in a Generic trait config (TraitSystemID == 1, tree 672). Unlike Combat
+    // configs, retail creates it client-side once Skyriding is unlocked, so boosted / pre-existing
+    // characters never receive it and end up in Skyriding mode with no abilities and no Vigor. Seed
+    // it server-side with the full kit (movement abilities + every Vigor node) so the mode is usable.
+    // The abilities are learned by the generic-config apply pass below (default case) via ApplyTraitConfig.
+    constexpr int32 SKYRIDING_TRAIT_SYSTEM_ID = 1;
+    bool const hasSkyridingConfig = m_activePlayerData->TraitConfigs.FindIf([](UF::TraitConfig const& traitConfig)
+    {
+        return static_cast<TraitConfigType>(*traitConfig.Type) == TraitConfigType::Generic
+            && traitConfig.TraitSystemID == SKYRIDING_TRAIT_SYSTEM_ID;
+    }).first != nullptr;
+
+    if (!hasSkyridingConfig)
+    {
+        WorldPackets::Traits::TraitConfig skyridingConfig;
+        skyridingConfig.Type = TraitConfigType::Generic;
+        skyridingConfig.TraitSystemID = SKYRIDING_TRAIT_SYSTEM_ID;
+        skyridingConfig.Name = "Skyriding";
+        TraitMgr::FillTraitConfigWithSystemKit(skyridingConfig);
+        if (!skyridingConfig.Entries.empty())
+            CreateTraitConfig(skyridingConfig);
     }
 
     UF::TraitConfig const* activeTraitConfig = m_activePlayerData->TraitConfigs.FindIf([&](UF::TraitConfig const& traitConfig)
