@@ -19,6 +19,7 @@
 #include "AreaTrigger.h"
 #include "Account.h"
 #include "QueryPackets.h"
+#include "HousingDefines.h"
 #include "HousingMirrorEntity.h"
 #include "HousingNeighborhoodMirrorEntity.h"
 #include "HousingPlayerHouseEntity.h"
@@ -19293,34 +19294,24 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
         holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_HOUSING_CATALOG)))
         _housings.push_back(std::move(housing));
 
-    // TODO: When the housing tutorial questline is implemented, this brute-force approach
-    // (setting all tutorial bits + injecting closedInfoFramesAccountWide / housingTutorialsEnabled
-    // CVars) must be replaced with proper quest-driven tutorial progression. The client Lua UI
-    // sets FrameTutorialAccount bits (e.g. HousingModesUnlocked=38) individually as the player
-    // completes each tutorial step. At that point, remove the blanket CVar injection below and
-    // let the questline handlers set the appropriate closedInfoFramesAccountWide bits on completion.
+    // The client Lua UI sets FrameTutorialAccount bits individually as the player completes each
+    // tutorial step. We set exactly one of them up front - HousingModesUnlocked (38), which the editor
+    // needs - and leave the rest to the client. An earlier revision set the whole bitfield and forced
+    // housingTutorialsEnabled=0, which unlocked the editor but also told the client the entire housing
+    // tutorial was already done, so first-time buyers were dropped straight into the House Finder.
     //
-    // Mark all tutorials as seen. Retail sniff shows all 256 tutorial bits set to 1 (0xFF bytes).
+    // The 256-bit server tutorial flags are NOT touched here. They used to be blanket-set to all-ones on every
+    // login ("retail sniff shows all 256 bits set" - true of a veteran retail account, not of a fresh one), which
+    // permanently marked every tutorial in the game as already seen for the account. The client owns this state
+    // and reports each step through CMSG_TUTORIAL (WorldSession::HandleTutorialFlag), so letting it drive them is
+    // both correct and self-repairing.
     if (GetSession())
     {
-        bool needsUpdate = false;
-        for (uint8 i = 0; i < MAX_ACCOUNT_TUTORIAL_VALUES; ++i)
-        {
-            if (GetSession()->GetTutorialInt(i) != 0xFFFFFFFF)
-            {
-                GetSession()->SetTutorialInt(i, 0xFFFFFFFF);
-                needsUpdate = true;
-            }
-        }
-        if (needsUpdate)
-            GetSession()->SendTutorialsData();
-
         // The 256-bit server tutorial flags (above) are separate from the client's
         // FrameTutorialAccount UI flags. The client stores those in the CVar bitfield
         // "closedInfoFramesAccountWide" within the GLOBAL_CONFIG_CACHE account data.
         // Without setting bit 38 (HousingModesUnlocked), the housing editor UI keeps
         // expert/cleanup/layout modes locked with "Tutorial Mode" error.
-        // Also disable housing tutorials entirely via housingTutorialsEnabled=0.
         AccountData const* configCache = GetSession()->GetAccountData(GLOBAL_CONFIG_CACHE);
         std::string configData = configCache ? configCache->Data : "";
         bool configModified = false;
@@ -19359,10 +19350,16 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
             }
         };
 
-        // Mark ALL FrameTutorialAccount bits as seen (48 bits = 2 uint32 words, all 1s)
-        ensureCVar("closedInfoFramesAccountWide", "4294967295 4294967295");
-        // Disable housing tutorial gates entirely
-        ensureCVar("housingTutorialsEnabled", "0");
+        // Unlock the housing editor modes and NOTHING else - see HOUSING_MODES_UNLOCKED_CVAR.
+        // housingTutorialsEnabled is deliberately left alone so the client runs the housing tutorial
+        // normally; forcing it to 0 here is what skipped the tutorial and dropped a first-time buyer
+        // straight into the House Finder.
+        ensureCVar("closedInfoFramesAccountWide", HOUSING_MODES_UNLOCKED_CVAR);
+        // Actively restore the client default rather than merely stopping writing it: accounts that
+        // logged in under the old code still carry a persisted housingTutorialsEnabled="0" in their
+        // GLOBAL_CONFIG_CACHE, and leaving it alone would keep the tutorial suppressed forever for
+        // exactly the characters that hit the bug. This repairs our own past write; it is not a gate.
+        ensureCVar("housingTutorialsEnabled", "1");
 
         if (configModified)
         {
