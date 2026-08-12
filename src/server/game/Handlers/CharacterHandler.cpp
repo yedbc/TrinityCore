@@ -483,7 +483,16 @@ void WorldSession::HandleCharEnum(CharacterDatabaseQueryHolder const& holder)
         raceUnlock.HasUnlockedLicense = GetAccountExpansion() >= requirement.second.Expansion;
         raceUnlock.HasUnlockedAchievement = requirement.second.AchievementId != 0
             && (sWorld->getBoolConfig(CONFIG_CHARACTER_CREATING_DISABLE_ALLIED_RACE_ACHIEVEMENT_REQUIREMENT)
-                /* || HasAccountAchievement(requirement.second.AchievementId)*/);
+                || HasRaceUnlockAchievement(requirement.second.AchievementId));
+        // Heritage-armor unlock flag (feature/haranir-allied-race). The client marks the heritage
+        // set claimable at character select once the race's ChrRaces.HeritageArmorAchievementID is
+        // completed account-wide. For Haranir (races 86/91) the heritage achievement is 61942
+        // ("Heritage of the Haranir"). NOTE: HeritageArmorAchievementID is 0 in the shipped
+        // 12.0.7.68887 client DB2 for these races, so this evaluates false until a client build
+        // links it (a chr_races hotfix ships on this branch - see HARANIR_ALLIED_RACE_BLUEPRINT.md).
+        if (ChrRacesEntry const* raceEntry = sChrRacesStore.LookupEntry(requirement.first))
+            raceUnlock.HasHeritageArmorUnlockAchievement = raceEntry->HeritageArmorAchievementID != 0
+                && HasRaceUnlockAchievement(raceEntry->HeritageArmorAchievementID);
         charEnum.RaceUnlockData.push_back(raceUnlock);
     }
 
