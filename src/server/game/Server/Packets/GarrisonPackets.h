@@ -523,6 +523,10 @@ namespace WorldPackets
             std::vector<uint32> CraftableItemIDs;
         };
 
+        // (Order Advancement opens via the generic gossip immersive-interaction path -- GossipNPCOption.db2
+        // GossipNpcOptionID -> PlayerInteractionType::GarrTalent -> GARRISON_TALENT_NPC_OPENED. No dedicated
+        // open-talent packet is needed; see Player::OnGossipSelect.)
+
         // IDA case 4980817 (§8.51): generic byte-block helper. Conservative shape: {u32 NewMinLevel}.
         class GarrisonAutoTroopMinLevelUpdateResult final : public ServerPacket
         {
@@ -561,6 +565,14 @@ namespace WorldPackets
 
             ObjectGuid NpcGUID;
             std::vector<uint64> FollowerDBIDs;
+            // Parallel to FollowerDBIDs: the ally board slot the player dropped each companion into.
+            // Enum GarrAutoBoardIndex (client 12.0.7.68275 reflection, GARRISON_ENUMS_68275.md):
+            // None = -1, AllyLeftBack 0, AllyRightBack 1, AllyLeftFront 2, AllyCenterFront 3,
+            // AllyRightFront 4 (5..12 are the enemy slots). The WoD/Legion mission UIs have no board
+            // and send None; the Shadowlands Adventures UI sends a real slot per follower — it is the
+            // optional third argument of C_Garrison.AddFollowerToMission(missionID, followerID, boardIndex)
+            // (GarrisonInfoDocumentation.lua:11-25, Blizzard_CovenantMissionUI.lua:729).
+            std::vector<int32> FollowerBoardIndexes;
             uint32 MissionRecID = 0;
         };
 
@@ -594,6 +606,11 @@ namespace WorldPackets
             void Read() override;
 
             ObjectGuid NpcGUID;
+            // NOTE: the 68275 client appends a trailing uint8 (GarrFollowerTypeID) after the PackedGuid,
+            // producing a harmless "read stop at 14 from 15" tail warning. We intentionally do NOT read it:
+            // the handler ignores the packet entirely, and adding a field here changed the packet object's
+            // size, which — against a stale opcode-table wrapper — placed the field write on the stack GS
+            // cookie and hard-crashed (FAST_FAIL_STACK_COOKIE_CHECK). Leave the field out.
         };
 
         // ============================================================
@@ -968,7 +985,12 @@ namespace WorldPackets
 
             void Read() override;
 
-            ObjectGuid NpcGUID;
+            // Wire (client 12.0.7 serializer @ RVA 0x6A9BCC): opcode then a single write_uint8 sourced from
+            // request+0x20 - and nothing else. The Lua entry point is C_Garrison.RushHealAllFollowers(followerType),
+            // so the byte is the follower type whose roster to heal. It is emphatically NOT an ObjectGuid: a packed
+            // guid's mask alone is 2 bytes, which is why the old ObjectGuid read threw a ByteBufferException on
+            // every press ("size: 2 ... pos: 4 size: 5") and the packet was skipped before the handler ever ran.
+            uint8 FollowerTypeID = 0;
         };
 
         class GarrisonAddFollowerHealth final : public ClientPacket
@@ -978,9 +1000,11 @@ namespace WorldPackets
 
             void Read() override;
 
-            ObjectGuid NpcGUID;
+            // Wire (client 12.0.7 serializer @ RVA 0x6A9B84): opcode then exactly two write_uint32 calls, sourced
+            // from *(request+0x20) and *(request+0x20)+4 - the low and high halves of the 64-bit follower DbID that
+            // C_Garrison.RushHealFollower(followerID) is handed. No guid and no amount on the wire; the heal is
+            // "rush this follower to full", so the server supplies the amount.
             uint64 FollowerDBID = 0;
-            int32 HealthToAdd = 0;
         };
 
         class GarrisonGetClassSpecCategoryInfo final : public ClientPacket
@@ -1435,7 +1459,12 @@ namespace WorldPackets
 
             void Read() override;
 
+            // Wire (from client serializer CMSG_GARRISON_RESEARCH_TALENT_Write): PackedGuid NpcGUID, u32 GarrTalentID,
+            // u32 GarrTalentRank, Bits<1>. Reading only GarrTalentID (the old code) parsed the guid front as the id.
+            ObjectGuid NpcGUID;
             int32 GarrTalentID = 0;
+            int32 GarrTalentRank = 0;
+            bool Unused = false;
         };
 
         // IDA case 4980750: u32 Result, u8 GarrTypeID, Bits<1> (purpose unknown — observed
@@ -1584,6 +1613,7 @@ namespace WorldPackets
             int32 ShipmentRecID = 0;
             uint64 ShipmentID = 0;
             uint64 AssignedFollowerDBID = 0;
+            uint32 ContainerID = 0;   // sniff-decoded: sits between AssignedFollowerDBID and CreationTime
             Timestamp<> CreationTime;
             int32 ShipmentDuration = 0;
             int32 BuildingTypeID = 0;
@@ -1628,10 +1658,11 @@ namespace WorldPackets
         class OpenShipmentNpcResult final : public ServerPacket
         {
         public:
-            explicit OpenShipmentNpcResult() : ServerPacket(SMSG_OPEN_SHIPMENT_NPC_RESULT, 16 + 4) { }
+            explicit OpenShipmentNpcResult() : ServerPacket(SMSG_OPEN_SHIPMENT_NPC_RESULT, 1 + 16 + 4) { }
 
             WorldPacket const* Write() override;
 
+            bool Success = true;   // leading bit — sniff-verified (0x80): without it the client misaligns the guid read and crashes
             ObjectGuid NpcGUID;
             uint32 CharShipmentContainerID = 0;
         };
@@ -1751,10 +1782,33 @@ namespace WorldPackets
         // Trophy / Monument packets
         // ============================================================
 
-        struct GarrisonTrophyData
+        // One entry of SMSG_GET_TROPHY_LIST_RESPONSE - the client's JamTrophyInfo, a 12-byte struct (its
+        // vector grow/copy helpers step in 0xC, and the deserializer at client RVA 0x60BEC0 does three
+        // ReadUInt32 per entry). Field 0 is the Trophy.db2 row id: C_Trophy.MonumentGetTrophyInfoByIndex
+        // (RVA 0x24A0C20) feeds it to a Trophy.db2 row lookup to get the name it shows.
+        //
+        // Unk1/Unk2 are genuinely unnamed. The client's only consumers are that Lua getter, which returns
+        // them raw as return values #2 and #3 - the UI calls them lock_code and lock_reason, and compares
+        // lock_code against MATCH_CONDITION_SUCCESS (57) / MATCH_CONDITION_WRONG_ACHIEVEMENT (34) - and the
+        // vector copy. No C++ code interprets them, and no JAM reflection descriptor exists for this type,
+        // so the mapping of those two constants onto these two fields is not derivable offline. They are
+        // written as 0 until a sniff names them; see WorldSession::HandleGetTrophyList.
+        struct TrophyInfo
         {
             uint32 TrophyID = 0;
             uint32 Unk1 = 0;
+            uint32 Unk2 = 0;
+        };
+
+        // One entry of SMSG_GARRISON_UPDATE_GARRISON_MONUMENT_SELECTIONS - the client's JamGarrisonTrophy,
+        // 8 bytes. This is a per-monument selection map keyed by TrophyInstanceID, NOT by TrophyTypeID: the
+        // monument tooltip builder (client RVA 0x1CAED30) walks this array comparing entry field 0 against
+        // the monument gameobject's own TrophyInstanceID (its Data1), then looks entry field 1 up in
+        // Trophy.db2 to render the name. So one row per physical monument, not per monument category.
+        struct GarrisonMonumentSelection
+        {
+            uint32 TrophyInstanceID = 0;
+            uint32 TrophyID = 0;
         };
 
         class GetTrophyList final : public ClientPacket
@@ -1775,7 +1829,7 @@ namespace WorldPackets
             WorldPacket const* Write() override;
 
             bool Success = false;
-            std::vector<GarrisonTrophyData> Trophies;
+            std::vector<TrophyInfo> Trophies;
         };
 
         class ReplaceTrophy final : public ClientPacket
@@ -1785,6 +1839,7 @@ namespace WorldPackets
 
             void Read() override;
 
+            ObjectGuid MonumentGUID;
             uint32 TrophyID = 0;
         };
 
@@ -1805,7 +1860,10 @@ namespace WorldPackets
 
             void Read() override;
 
-            uint32 TrophyID = 0;
+            // Not a Trophy.db2 id - C_Trophy.MonumentLoadSelectedTrophyID() takes no argument and the client
+            // fills this from the monument gameobject's named-slot 0, which the client's GO field-index table
+            // maps to Data1 = TrophyInstanceID for type 44. It is asking "what is selected on THIS monument".
+            uint32 TrophyInstanceID = 0;
         };
 
         class GetSelectedTrophyIDResponse final : public ServerPacket
@@ -1826,6 +1884,7 @@ namespace WorldPackets
 
             void Read() override;
 
+            ObjectGuid MonumentGUID;
             uint32 TrophyID = 0;
         };
 
@@ -1834,7 +1893,9 @@ namespace WorldPackets
         public:
             explicit RevertMonumentAppearance(WorldPacket&& packet) : ClientPacket(CMSG_REVERT_MONUMENT_APPEARANCE, std::move(packet)) { }
 
-            void Read() override { }
+            void Read() override;
+
+            ObjectGuid MonumentGUID;
         };
 
         class GarrisonUpdateGarrisonMonumentSelections final : public ServerPacket
@@ -1844,7 +1905,28 @@ namespace WorldPackets
 
             WorldPacket const* Write() override;
 
-            std::vector<GarrisonTrophyData> Trophies;
+            std::vector<GarrisonMonumentSelection> Selections;
+        };
+
+        // Incremental push of the "missions started today" counter, mirroring the
+        // GarrisonInfo::NumMissionsStartedToday field that is otherwise only sent on a full
+        // GetGarrisonInfo round trip.
+        //
+        // Wire, read straight off the 68275 client deserializer for SMSG_UPDATE_DAILY_MISSION_COUNTER
+        // (0x4C0021): one 1-byte read stored at +0, then one 2-byte read stored at +2, i.e.
+        //     { uint8 GarrTypeID; uint16 Count; }
+        // The 16-bit reader is the same one SMSG_QUEST_UPDATE_ADD_CREDIT uses for its Count/Required
+        // pair, whose TrinityCore class is live and known-correct - so the width is confirmed here,
+        // not assumed.
+        class UpdateDailyMissionCounter final : public ServerPacket
+        {
+        public:
+            explicit UpdateDailyMissionCounter() : ServerPacket(SMSG_UPDATE_DAILY_MISSION_COUNTER, 1 + 2) { }
+
+            WorldPacket const* Write() override;
+
+            uint8 GarrTypeID = 0;
+            uint16 Count = 0;
         };
     }
 }

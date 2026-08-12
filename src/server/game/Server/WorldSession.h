@@ -415,6 +415,7 @@ namespace WorldPackets
     namespace Contribution
     {
         class ContributionContribute;
+        class ContributionLastUpdateRequest;
     }
 
     namespace Covenant
@@ -452,7 +453,6 @@ namespace WorldPackets
         class GarrisonCancelConstruction;
         class GarrisonRequestBlueprintAndSpecializationData;
         class GarrisonGetMapData;
-        class GarrisonSocketTalent;
         class GarrisonStartMission;
         class GarrisonCompleteMission;
         class GarrisonMissionBonusRoll;
@@ -2463,6 +2463,7 @@ class TC_GAME_API WorldSession
         void HandleContributionContribute(WorldPackets::Contribution::ContributionContribute& contribute);
         void HandleCloseTraitSystemInteraction(WorldPackets::Misc::CloseTraitSystemInteraction& closeTraitSystemInteraction);
         void HandleCloseRuneforgeInteraction(WorldPackets::Misc::CloseRuneforgeInteraction& closeRuneforgeInteraction);
+        void HandleContributionLastUpdateRequest(WorldPackets::Contribution::ContributionLastUpdateRequest& request);
         void HandleConversationLineStarted(WorldPackets::Misc::ConversationLineStarted& conversationLineStarted);
         void HandleKeyboundOverride(WorldPackets::Spells::KeyboundOverride& keyboundOverride);
         void HandleRequestCrowdControlSpell(WorldPackets::Spells::RequestCrowdControlSpell& requestCrowdControlSpell);

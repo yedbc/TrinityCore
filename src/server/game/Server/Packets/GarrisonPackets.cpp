@@ -128,6 +128,9 @@ ByteBuffer& operator<<(ByteBuffer& data, GarrisonMissionReward const& missionRew
     data << uint32(missionRewardItem.FollowerXP);
     data << uint32(missionRewardItem.GarrMssnBonusAbilityID);
     data << int32(missionRewardItem.ItemFileDataID);
+    // itemInstance = OptionalInit bit + FlushBits. This is the SNIFF-CONFIRMED encoding (ADD_MISSION_RESULT
+    // decoded byte-exact / 0 trailing bytes). The talent socketData is the SAME reflection kind and must match
+    // this (bit), NOT a uint32 count - see operator<<(GarrisonTalent).
     data << OptionalInit(missionRewardItem.ItemInstance);
     data.FlushBits();
 
@@ -192,13 +195,45 @@ ByteBuffer& operator<<(ByteBuffer& data, GarrisonTalentSocketData const& talentS
 
 ByteBuffer& operator<<(ByteBuffer& data, GarrisonTalent const& talent)
 {
+    // Wire order (client JamGarrisonTalent, Ghidra-confirmed via ctor @client 0x729093890): garrTalentID(i32),
+    // garrTalentRank(i32), researchStartTime(i64), flags(i32), socketData(OptionalInit bit + FlushBits).
+    //
+    // The client reads the wire `flags` field with its OWN semantics, which differ from TC's internal
+    // Garrison::Talent::Flags. Bits were pinned by live client testing (the builder that computes these is
+    // control-flow-flattened, so it isn't offline-decompilable):
+    //   client bit 0x4 = "this talent is being researched" — gates whether the Order Advancement UI reads
+    //       researchStartTime and renders the research timer. Verified live: flags=0 kept the client's startTime in
+    //       memory (proven by a server-side diag log + a sentinel injection) but drew the talent idle; setting 0x4
+    //       makes C_Garrison.GetTalentInfo(id).isBeingResearched=true with the real DB2 researchDuration.
+    //   client bit 0x2 = a duration override that forces researchDuration to a fixed 24h; MUST NEVER be set.
+    //   client bit 0x1 = "researched / talent taken". Recovered by static RE of the 12.0.7 client, which also
+    //       proves it is PURELY server-supplied: the complete set of writers to the client-side talent record's
+    //       flags word (+0x40) is three sites - RVA 0x22992A5 and 0x2299395, both verbatim copies of the wire
+    //       struct inside Garrison::SetTalent (RVA 0x2298FF0), and RVA 0x2299448 in Garrison::RemoveTalent,
+    //       which only zeroes it. There is no or/bts against that field anywhere in the image and no
+    //       research-timer expiry that recomputes it, so the client can never derive "researched" on its own.
+    //       Readers gated on the bit: ModifierTree 201/202/317 (evaluator RVA 0x20664B0 - the covenant/taxi
+    //       PlayerCondition path), C_Garrison.GetTalentInfo's `researched` (builder RVA 0x22B95F0 via
+    //       0x228E2F0), GetTalentAvailability (RVA 0x2171390, bit set => availability 2) and
+    //       CanResearchAtThisTier (RVA 0x2298DF0, which early-outs "already taken" only when the bit is set).
+    //       Leaving it clear is why a fully researched sanctum/order-hall talent rendered as un-researched and
+    //       why talent-gated unlocks (e.g. the covenant transport-network taxi nodes) never opened.
+    // TC's internal flags (only GARRISON_TALENT_FLAG_TEMPORARY=0x1 today, an unrelated meaning) are not
+    // wire-compatible, so derive the wire value purely from research state.
+    int32 wireFlags = 0;
+    if (talent.Rank >= 1)
+        wireFlags |= 0x1; // client "researched / taken" bit; every client test pairs it with a rank check
+    if (talent.ResearchStartTime != 0)
+        wireFlags |= 0x4; // client "being researched" bit (never 0x2 = duration override)
     data << int32(talent.GarrTalentID);
     data << int32(talent.Rank);
     data << talent.ResearchStartTime;
-    data << int32(talent.Flags);
+    data << int32(wireFlags);
+    // socketData is the SAME reflection kind (0x80003) as the reward itemInstance, which is sniff-confirmed as
+    // an OptionalInit bit (NOT a uint32 count). The prior uint32 "fix" made each talent 3 bytes too long,
+    // shifting the mission-reward data written right after the Talents block (rewards showed value x 2^16).
     data << OptionalInit(talent.Socket);
     data.FlushBits();
-
     if (talent.Socket)
         data << *talent.Socket;
 
@@ -391,6 +426,11 @@ void GarrisonSocketTalent::Read()
 {
     _worldPacket >> GarrTalentID;
     uint32 count = _worldPacket.read<uint32>();
+    // Sanity cap the client-supplied socket count before resize(): a soulbind/conduit tree has at most a few dozen
+    // sockets, so this is well above any legitimate value while stopping a crafted count (e.g. 0xFFFFFFFF) from
+    // requesting a multi-gigabyte allocation. resize() throws std::bad_alloc, which the opcode dispatcher does not
+    // catch (only ByteBufferException), so an unbounded count would crash the world thread instead of disconnecting.
+    count = std::min<uint32>(count, 64);
     Sockets.resize(count);
     for (GarrisonTalentSocketData& socket : Sockets)
     {
@@ -597,12 +637,24 @@ void GarrisonStartMission::Read()
     _worldPacket >> followerCount;
     _worldPacket >> MissionRecID;
 
+    // Cap before resize(): a client-controlled count can't legitimately exceed the packet's own byte size (each
+    // element is >= 1 byte), so this bounds the allocation to a few KB. resize() throws std::bad_alloc, which the
+    // opcode dispatcher does NOT catch (only ByteBufferException) -> an uncapped count crashes the world thread.
+    followerCount = std::min<uint32>(followerCount, _worldPacket.size());
     FollowerDBIDs.resize(followerCount);
+    FollowerBoardIndexes.resize(followerCount);
     for (uint32 i = 0; i < followerCount; ++i)
     {
         _worldPacket >> FollowerDBIDs[i];
-        _worldPacket.read_skip<int32>();  // BoardIndex (unused, always -1)
-        _worldPacket.read_skip<int32>();  // Health (unused, always 0)
+        // BoardIndex: the ally board slot the player dropped this companion into. This used to be
+        // skipped as "unused, always -1" — true for the boardless WoD/Legion mission UIs, but the
+        // Shadowlands Adventures UI sends a real GarrAutoBoardIndex here (optional third argument of
+        // C_Garrison.AddFollowerToMission) and then expects it echoed back in
+        // SMSG_GARRISON_START_MISSION_RESULT to fill its own follower record. Discarding it is what
+        // left FollowerMissionCompleteInfo.boardIndex at -1 and made the complete screen resolve a
+        // nil follower frame.
+        _worldPacket >> FollowerBoardIndexes[i];
+        _worldPacket.read_skip<int32>();  // Health (client sends 0; the server owns follower health)
         _worldPacket.read_skip<uint8>();  // HasFollowerEntry (unused, always false)
     }
 }
@@ -622,6 +674,7 @@ void GarrisonMissionBonusRoll::Read()
 void OpenMissionNpc::Read()
 {
     _worldPacket >> NpcGUID;
+    // Trailing uint8 (GarrFollowerTypeID) is intentionally left unread — see GarrisonPackets.h.
 }
 
 void GarrisonGetMissionReward::Read()
@@ -906,14 +959,15 @@ void GarrisonGenerateRecruits::Read()
 
 void GarrisonFullyHealAllFollowers::Read()
 {
-    _worldPacket >> NpcGUID;
+    _worldPacket >> FollowerTypeID;
 }
 
 void GarrisonAddFollowerHealth::Read()
 {
-    _worldPacket >> NpcGUID;
-    _worldPacket >> FollowerDBID;
-    _worldPacket >> HealthToAdd;
+    uint32 dbIdLow, dbIdHigh;
+    _worldPacket >> dbIdLow;
+    _worldPacket >> dbIdHigh;
+    FollowerDBID = (uint64(dbIdHigh) << 32) | dbIdLow;
 }
 
 void GarrisonGetClassSpecCategoryInfo::Read()
@@ -1231,7 +1285,10 @@ void GarrisonLearnTalent::Read()
 
 void GarrisonResearchTalent::Read()
 {
+    _worldPacket >> NpcGUID;
     _worldPacket >> GarrTalentID;
+    _worldPacket >> GarrTalentRank;
+    _worldPacket >> Bits<1>(Unused);
 }
 
 // IDA case 4980750: u32 Result, u8 GarrTypeID, Bits<1>+Flush, GarrisonTalent.
@@ -1364,13 +1421,18 @@ WorldPacket const* GetShipmentInfoResponse::Write()
     _worldPacket << int32(PlotInstanceID);
     for (CharacterShipment const& shipment : Shipments)
     {
-        _worldPacket << int32(shipment.ShipmentRecID);
+        // JamCharacterShipment on the wire (binary-verified via the landing-page reader RVA 0x6BCE20; the same JAM
+        // type is shared by both packets, so this MUST match GetLandingPageShipmentsResponse exactly):
+        //   RecID(u32) ShipmentID(u64) AssignedFollowerDBID(u64) CreationTime(i64) BuildingType(u64, high dword=0) GarrType(u8)
+        // = 37 bytes. There is NO ContainerID and NO duration on the wire; the client reads the order duration from
+        // CharShipment.db2 via RecID. The previous layout (extra ContainerID/ShipmentDuration/UnkInt32 fields) over-ran
+        // each element, so with >=2 pending shipments the client parsed the trailing ones past the packet buffer ->
+        // GetPendingShipmentInfo returned a nil duration -> SecondsToTime(nil) in GarrisonCapacitiveDisplayFrame_Update.
+        _worldPacket << uint32(shipment.ShipmentRecID);
         _worldPacket << uint64(shipment.ShipmentID);
         _worldPacket << uint64(shipment.AssignedFollowerDBID);
         _worldPacket << shipment.CreationTime;
-        _worldPacket << int32(shipment.ShipmentDuration);
-        _worldPacket << int32(shipment.BuildingTypeID);
-        _worldPacket << int32(shipment.UnkInt32);
+        _worldPacket << uint64(uint32(shipment.BuildingTypeID));
         _worldPacket << uint8(shipment.GarrTypeID);
     }
 
@@ -1384,6 +1446,8 @@ void OpenShipmentNpc::Read()
 
 WorldPacket const* OpenShipmentNpcResult::Write()
 {
+    _worldPacket.WriteBit(Success);
+    _worldPacket.FlushBits();
     _worldPacket << NpcGUID;
     _worldPacket << uint32(CharShipmentContainerID);
 
@@ -1411,13 +1475,18 @@ WorldPacket const* GetLandingPageShipmentsResponse::Write()
     _worldPacket << uint32(Shipments.size());
     for (CharacterShipment const& shipment : Shipments)
     {
-        _worldPacket << int32(shipment.ShipmentRecID);
+        // Wire layout decoded from the 12.0.7 client binary (per-shipment reader RVA 0x6BCE20 reads
+        // exactly u32, u64, u64, u64, u64, u8 = 37 bytes). The client's C_Garrison.GetLandingPageShipmentInfo
+        // builds creationTime from field D's low dword ORed with field E's HIGH dword, so ANY non-zero value
+        // in field E's high 32 bits corrupts the cooldown (SetCooldownUNIX out of range). There is NO
+        // separate duration on the wire - the landing page reads duration from the client's CharShipment.db2.
+        // Field E is therefore BuildingType as a full u64 (high dword must be zero):
+        //   RecID(u32) ShipmentID(u64) AssignedFollowerDBID(u64) CreationTime(i64) BuildingType(u64) GarrType(u8)
+        _worldPacket << uint32(shipment.ShipmentRecID);
         _worldPacket << uint64(shipment.ShipmentID);
         _worldPacket << uint64(shipment.AssignedFollowerDBID);
         _worldPacket << shipment.CreationTime;
-        _worldPacket << int32(shipment.ShipmentDuration);
-        _worldPacket << int32(shipment.BuildingTypeID);
-        _worldPacket << int32(shipment.UnkInt32);
+        _worldPacket << uint64(uint32(shipment.BuildingTypeID));
         _worldPacket << uint8(shipment.GarrTypeID);
     }
 
@@ -1465,13 +1534,17 @@ void GetTrophyList::Read()
 
 WorldPacket const* GetTrophyListResponse::Write()
 {
+    // THREE uint32 per entry, not two. The client deserializer (RVA 0x60BEC0) does exactly three ReadUInt32
+    // per element into a 12-byte JamTrophyInfo, so writing two desynchronises its read cursor for the rest of
+    // the payload - it consumes 3n words from a 2n-word list. This was a hard break, not a cosmetic omission.
     _worldPacket << Bits<1>(Success);
     _worldPacket.FlushBits();
     _worldPacket << uint32(Trophies.size());
-    for (GarrisonTrophyData const& trophy : Trophies)
+    for (TrophyInfo const& trophy : Trophies)
     {
         _worldPacket << uint32(trophy.TrophyID);
         _worldPacket << uint32(trophy.Unk1);
+        _worldPacket << uint32(trophy.Unk2);
     }
 
     return &_worldPacket;
@@ -1479,6 +1552,9 @@ WorldPacket const* GetTrophyListResponse::Write()
 
 void ReplaceTrophy::Read()
 {
+    // The client serializer (RVA 0x6A9E90) writes a PackedGuid - the monument gameobject being edited -
+    // before the trophy id. Not reading it meant TrophyID was parsed out of the guid's mask bytes.
+    _worldPacket >> MonumentGUID;
     _worldPacket >> TrophyID;
 }
 
@@ -1492,7 +1568,7 @@ WorldPacket const* ReplaceTrophyResponse::Write()
 
 void LoadSelectedTrophy::Read()
 {
-    _worldPacket >> TrophyID;
+    _worldPacket >> TrophyInstanceID;
 }
 
 WorldPacket const* GetSelectedTrophyIDResponse::Write()
@@ -1506,16 +1582,27 @@ WorldPacket const* GetSelectedTrophyIDResponse::Write()
 
 void ChangeMonumentAppearance::Read()
 {
+    _worldPacket >> MonumentGUID;
     _worldPacket >> TrophyID;
+}
+
+void RevertMonumentAppearance::Read()
+{
+    // Client serializer RVA 0x6A9F50: a PackedGuid and nothing else. This used to read nothing at all, so the
+    // payload was left unconsumed.
+    _worldPacket >> MonumentGUID;
 }
 
 WorldPacket const* GarrisonUpdateGarrisonMonumentSelections::Write()
 {
-    _worldPacket << uint32(Trophies.size());
-    for (GarrisonTrophyData const& trophy : Trophies)
+    // TrophyInstanceID FIRST, then the trophy. The names were the other way round: the client's tooltip
+    // builder (RVA 0x1CAED30) scans this array for the entry whose FIRST field equals the monument's own
+    // TrophyInstanceID, and looks the SECOND field up in Trophy.db2 to get the statue's name.
+    _worldPacket << uint32(Selections.size());
+    for (GarrisonMonumentSelection const& selection : Selections)
     {
-        _worldPacket << uint32(trophy.TrophyID);
-        _worldPacket << uint32(trophy.Unk1);
+        _worldPacket << uint32(selection.TrophyInstanceID);
+        _worldPacket << uint32(selection.TrophyID);
     }
 
     return &_worldPacket;
@@ -1541,6 +1628,14 @@ WorldPacket const* DeleteExpiredMissionsResult::Write()
     _worldPacket << Bits<1>(Succeeded);
     _worldPacket << Bits<1>(LegionUnkBit);
     _worldPacket.FlushBits();
+
+    return &_worldPacket;
+}
+
+WorldPacket const* UpdateDailyMissionCounter::Write()
+{
+    _worldPacket << uint8(GarrTypeID);
+    _worldPacket << uint16(Count);
 
     return &_worldPacket;
 }

@@ -777,16 +777,21 @@ struct CharacterLoadoutItemEntry
 
 struct CharShipmentEntry
 {
+    // Field order matches the 12.0.7 client db2 layout 0x91BEA68A (byte-decoded from the client
+    // CharShipment.db2). The tail is physically Flags, GarrFollowerID, MaxShipments - NOT
+    // MaxShipments/.../Flags. The previous order read the Flags bitmask (512/513) into MaxShipments and
+    // MaxShipments (0) into Flags, so the server saw Flags=0 for every shipment and could not tell the
+    // quest/tutorial row (Flags 0x1 set, Duration 0) from the regular row (Duration 14400).
     uint32 ID;
     uint16 ContainerID;
-    int32 TreasureID;
     uint32 DummyItemID;
-    int32 Duration;
+    uint32 TreasureID;
     int32 SpellID;
     uint32 OnCompleteSpellID;
-    uint8 MaxShipments;
-    uint16 GarrFollowerID;
+    int32 Duration;
     int32 Flags;
+    uint16 GarrFollowerID;
+    uint8 MaxShipments;
 };
 
 struct CharShipmentContainerEntry
@@ -2268,20 +2273,30 @@ struct GarrAbilityEffectEntry
     int32 ActionRecordID;
 };
 
+// GarrAutoCombatant.db2, layout 0x6ADAF487 (12.0.7.68275, WoWDBDefs). The statline is a level
+// curve, not a flat block. There is no BoardIndex column here (board position lives on
+// GarrMissionXEncounter) and no back-reference to an encounter (GarrEncounter.AutoCombatantID
+// points this way instead). Role values per the DBD: 0 None, 1 Melee, 2 RangedPhysical,
+// 3 RangedMagic, 4 HealSupport, 5 Tank - see AutoCombatRole.
 struct GarrAutoCombatantEntry
 {
     uint32 ID;
-    int32 Attack;
-    int32 Health;
-    int32 MaxHealth;
-    int32 AutoAttackSpellID;
+    int32 HealthBase;
+    int32 HealthGainPerLevel;
+    int32 AttackBase;
+    int32 AttackGainPerLevel;
+    int32 AttackSpellID;
+    int32 AbilitySpellID;
+    int32 AbilitySpellID2;
+    int32 PassiveSpellID;
     int32 Role;
-    int32 BoardIndex;
-    int32 GarrEncounterID;
-    int32 GarrAutoSpellID;
-    int32 Flags;
 };
 
+// GarrAutoSpell.db2, layout 0x8067D16A (12.0.7.68275, WoWDBDefs). The three trailing columns used to
+// be declared SchoolMask/SpellVisualID/Flags, which is the order of no build: the file order is
+// Flags, SchoolMask, IconFileDataID, so SchoolMask was being read out of Flags. Confirmed against the
+// shipped rows - GarrAutoSpell 4 "Double Strike ... Physical damage" carries 1 in this column,
+// 6 "Blood Explosion ... Shadow damage" carries 32, 10 "Starbranch Crush ... Frost damage" carries 16.
 struct GarrAutoSpellEntry
 {
     uint32 ID;
@@ -2289,20 +2304,27 @@ struct GarrAutoSpellEntry
     LocalizedString Description;
     int32 Cooldown;
     int32 Duration;
-    int32 SchoolMask;
-    int32 SpellVisualID;
     int32 Flags;
+    int32 SchoolMask;
+    int32 IconFileDataID;
 };
 
+// GarrAutoSpellEffect.db2, layout 0xACEA7666 (12.0.7.68275, WoWDBDefs). The middle columns used to be
+// declared EffectType/Targets/Amount/MiscType/MiscValue, one position off the real file order: what
+// was read as "EffectType" is the row's EffectIndex, what was read as "Targets" is the Effect kind,
+// and what was read as "MiscType" is the TargetType mask. Effect values per the DBD: 1 DealAutoDamage,
+// 2 Heal, 3 DealDamage, 4 Heal, 7 Dot, 8 Hot, 10 taunt, 12 damage-dealt multiplier,
+// 14 damage-taken multiplier, 18 increase max health (0/5/6/9/11/13/15..17 undocumented or test-only,
+// and 19/20 occur in the data without a DBD entry at all).
 struct GarrAutoSpellEffectEntry
 {
     uint32 ID;
     int32 GarrAutoSpellID;
-    uint8 EffectType;
-    uint8 Targets;
-    float Amount;
-    uint8 MiscType;
-    int32 MiscValue;
+    uint8 EffectIndex;
+    uint8 Effect;
+    float Points;
+    uint8 TargetType;
+    int32 Flags;
     int32 Period;
 };
 
@@ -2391,17 +2413,18 @@ struct GarrClassSpecPlayerCondEntry
     uint8 Flags;
 };
 
+// GarrEncounter.db2, layout 0x90365AF7 (12.0.7.68275, WoWDBDefs).
 struct GarrEncounterEntry
 {
     uint32 ID;
     LocalizedString Name;
     int32 CreatureID;
-    int32 CreatureDisplayInfoID;
-    uint32 UiAnimHeight;
+    int32 PortraitFileDataID;
+    uint32 UiTextureKitID;
     float UiAnimScale;
-    float UiTextureScale;
-    int32 EnvGarrMechanicTypeID;
-    int32 GarrEncounterSetID;
+    float UiAnimHeight;
+    int32 Flags;
+    int32 AutoCombatantID;
 };
 
 struct GarrEncounterXMechanicEntry
@@ -2471,8 +2494,12 @@ struct GarrFollSupportSpellEntry
 struct GarrFollowerLevelXPEntry
 {
     uint32 ID;
-    int8 FollowerLevel;
-    uint8 GarrFollowerTypeID;
+    // 68275 db2 layout (WoWDBDefs LAYOUT 83953EF8): GarrFollowerTypeID comes BEFORE FollowerLevel.
+    // These were previously declared in the reverse order, so every row loaded with the two bytes
+    // swapped (FollowerLevel held the type value, GarrFollowerTypeID held the level) — GetFollowerLevelXP
+    // then missed for every real (type, level) pair and follower mission XP was silently discarded.
+    int8 GarrFollowerTypeID;
+    uint8 FollowerLevel;
     uint16 XpToNextLevel;
     uint16 ShipmentXP;
 };
@@ -2616,13 +2643,15 @@ struct GarrMissionTextureEntry
     uint16 UiTextureAtlasMemberID;
 };
 
+// GarrMissionXEncounter.db2, layout 0x08428AE4 (12.0.7.68275, WoWDBDefs). BoardIndex is the
+// enemy's slot on the Adventures board (-1 for the pre-Shadowlands rows that have no board).
 struct GarrMissionXEncounterEntry
 {
     uint32 ID;
     uint32 GarrEncounterID;
-    uint32 GarrMissionSetEncounterID;
-    uint8 CombatWeightBase;
-    int8 CombatWeightMax;
+    uint32 GarrEncounterSetID;
+    uint8 OrderIndex;
+    int8 BoardIndex;
     int32 GarrMissionID;
 };
 
@@ -6087,6 +6116,20 @@ struct TransportRotationEntry
     std::array<float, 4> Rot;
     uint32 TimeIndex;
     uint32 GameObjectsID;
+};
+
+// Trophy.db2 (FileDataId 975024, layout 0xA17123C5). The catalogue of garrison monument trophies: the statue
+// appearances a WoD garrison Monument Base (GAMEOBJECT_TYPE_GARRISON_MONUMENT) can be set to display.
+// TrophyTypeID is the same id the monument gameobject carries in its Data0, so it partitions the catalogue by
+// monument - in the 68275 client 3 = Horde/Frostwall, 4 = Alliance/Lunarfall, 0 = NoValue (not displayable).
+// PlayerConditionID is the unlock gate; see WorldSession::HandleGetTrophyList for what it resolves to today.
+struct TrophyEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    uint8 TrophyTypeID;
+    int32 GameObjectDisplayInfoID;
+    uint32 PlayerConditionID;
 };
 
 struct UiMapEntry

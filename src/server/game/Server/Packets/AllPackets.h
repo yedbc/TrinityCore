@@ -94,6 +94,7 @@
 #include "VehiclePackets.h"
 #include "VignettePackets.h"
 #include "WeeklyRewardsPackets.h"
+#include "WarfrontPackets.h"
 #include "WhoPackets.h"
 #include "WorldStatePackets.h"
 

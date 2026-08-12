@@ -371,7 +371,7 @@ NonDefaultConstructible<SpellEffectHandlerFn> SpellEffectHandlers[TOTAL_SPELL_EF
     &Spell::EffectNULL,                                     //269 SPELL_EFFECT_INCREASE_ITEM_BONUS_LIST_GROUP_STEP
     &Spell::EffectNULL,                                     //270 SPELL_EFFECT_270
     &Spell::EffectUnused,                                   //271 SPELL_EFFECT_APPLY_AREA_AURA_PARTY_NONRANDOM
-    &Spell::EffectNULL,                                     //272 SPELL_EFFECT_SET_COVENANT
+    &Spell::EffectSetCovenant,                              //272 SPELL_EFFECT_SET_COVENANT
     &Spell::EffectNULL,                                     //273 SPELL_EFFECT_CRAFT_RUNEFORGE_LEGENDARY
     &Spell::EffectUnused,                                   //274 SPELL_EFFECT_274
     &Spell::EffectUnused,                                   //275 SPELL_EFFECT_275
@@ -380,7 +380,7 @@ NonDefaultConstructible<SpellEffectHandlerFn> SpellEffectHandlers[TOTAL_SPELL_EF
     &Spell::EffectNULL,                                     //278 SPELL_EFFECT_278
     &Spell::EffectLearnGarrTalent,                           //279 SPELL_EFFECT_LEARN_GARR_TALENT
     &Spell::EffectUnused,                                   //280 SPELL_EFFECT_280
-    &Spell::EffectNULL,                                     //281 SPELL_EFFECT_LEARN_SOULBIND_CONDUIT
+    &Spell::EffectLearnSoulbindConduit,                     //281 SPELL_EFFECT_LEARN_SOULBIND_CONDUIT
     &Spell::EffectNULL,                                     //282 SPELL_EFFECT_CONVERT_ITEMS_TO_CURRENCY
     &Spell::EffectSkipCampaign,                             //283 SPELL_EFFECT_COMPLETE_CAMPAIGN
     &Spell::EffectSendChatMessage,                          //284 SPELL_EFFECT_SEND_CHAT_MESSAGE
@@ -5473,7 +5473,14 @@ void Spell::EffectLearnGarrisonBuilding()
     if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison())
+    // Same defect (and same fix) as EffectAddGarrisonFollower above: GetGarrison() resolves the WoD garrison,
+    // so a blueprint belonging to any other garrison type was learned into the wrong (or a missing) garrison.
+    // GarrBuilding.db2 publishes the owning type.
+    GarrisonType garrType = GARRISON_TYPE_GARRISON;
+    if (GarrBuildingEntry const* building = sGarrBuildingStore.LookupEntry(uint32(effectInfo->MiscValue)))
+        garrType = GarrisonType(building->GarrTypeID);
+
+    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison(garrType))
         garrison->LearnBlueprint(effectInfo->MiscValue);
 }
 
@@ -5539,8 +5546,16 @@ void Spell::EffectAddGarrisonFollower()
     if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison())
-        garrison->AddFollower(effectInfo->MiscValue);
+    // Route to the follower's own garrison type. GetGarrison() defaults to the WoD garrison (type 2),
+    // so without this every Legion/BfA/Shadowlands follower-granting spell silently failed with
+    // GARRISON_ERROR_INVALID_GARRISON (follower GarrTypeID != garrison type).
+    uint32 garrFollowerId = effectInfo->MiscValue;
+    GarrisonType garrType = GARRISON_TYPE_GARRISON;
+    if (GarrFollowerEntry const* followerEntry = sGarrFollowerStore.LookupEntry(garrFollowerId))
+        garrType = GarrisonType(followerEntry->GarrTypeID);
+
+    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison(garrType))
+        garrison->AddFollower(garrFollowerId);
 }
 
 void Spell::EffectCreateHeirloomItem()
@@ -6686,7 +6701,9 @@ void Spell::EffectRestoreGarrisonTroopVitality()
     if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison())
+    // Troops are an order-hall concept and the effect carries no discriminator, so restore vitality in every
+    // garrison the character owns instead of only the WoD one (which a class-hall-only owner does not have).
+    for (auto const& [garrType, garrison] : unitTarget->ToPlayer()->GetGarrisons())
         garrison->HealAllFollowers();
 }
 
@@ -6698,7 +6715,13 @@ void Spell::EffectLearnGarrisonSpecialization()
     if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison())
+    // Garrison::LearnSpecialization rejects a specialization whose GarrTypeID does not match the garrison, so
+    // resolving the WoD garrison made this a guaranteed no-op for every non-WoD specialization.
+    GarrisonType garrType = GARRISON_TYPE_GARRISON;
+    if (GarrSpecializationEntry const* spec = sGarrSpecializationStore.LookupEntry(uint32(effectInfo->MiscValue)))
+        garrType = GarrisonType(spec->GarrTypeID);
+
+    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison(garrType))
         garrison->LearnSpecialization(effectInfo->MiscValue);
 }
 
@@ -6710,7 +6733,19 @@ void Spell::EffectCreateShipment()
     if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison())
+    // Resolve the shipment's garrison from the casting NPC, exactly as the CMSG path already does
+    // (ResolveShipmentGarrison in GarrisonHandler.cpp): an NPC registered as a shipment container belongs to the
+    // class order hall, everything else to the WoD garrison. Without this an order-hall work order cast from a
+    // trainer landed in (or silently missed) the WoD garrison.
+    Player* shipmentOwner = unitTarget->ToPlayer();
+    Garrison* garrison = nullptr;
+    if (Creature const* casterNpc = m_caster->ToCreature())
+        if (sGarrisonMgr.GetShipmentContainerForNpc(casterNpc->GetEntry()))
+            garrison = shipmentOwner->GetGarrison(GARRISON_TYPE_CLASS_ORDER);
+    if (!garrison)
+        garrison = shipmentOwner->GetGarrison();
+
+    if (garrison)
         garrison->CreateShipment(m_caster->GetGUID(), effectInfo->MiscValue > 0 ? effectInfo->MiscValue : 1);
 }
 
@@ -6734,7 +6769,13 @@ void Spell::EffectAddGarrisonMission()
     if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison())
+    // Garrison::AddMission announces GarrTypeID = missionEntry->GarrTypeID, so adding a type-111 mission from
+    // the WoD garrison produced a mission the covenant UI could never show. GarrMission.db2 publishes the type.
+    GarrisonType garrType = GARRISON_TYPE_GARRISON;
+    if (GarrMissionEntry const* mission = sGarrMissionStore.LookupEntry(uint32(effectInfo->MiscValue)))
+        garrType = GarrisonType(mission->GarrTypeID);
+
+    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison(garrType))
         garrison->AddMission(effectInfo->MiscValue);
 }
 
@@ -6843,7 +6884,17 @@ void Spell::EffectLearnFollowerAbility()
         return;
 
     Player* player = unitTarget->ToPlayer();
-    Garrison* garrison = player->GetGarrison();
+
+    // GarrAbility.db2 -> GarrFollowerType.db2 gives the garrison type the ability belongs to. Resolving the WoD
+    // garrison meant an order-hall / covenant follower ability was learned onto the wrong roster or nothing.
+    // NOTE: which follower receives it is still "the first one in the map" - a separate, unresolved defect
+    // (the effect carries no follower id); see SANCTUM_INERT_SWEEP_68275.md.
+    GarrisonType garrType = GARRISON_TYPE_GARRISON;
+    if (GarrAbilityEntry const* ability = sGarrAbilityStore.LookupEntry(uint32(effectInfo->MiscValue)))
+        if (GarrFollowerTypeEntry const* followerType = sGarrFollowerTypeStore.LookupEntry(uint32(ability->GarrFollowerTypeID)))
+            garrType = GarrisonType(followerType->GarrTypeID);
+
+    Garrison* garrison = player->GetGarrison(garrType);
     if (!garrison)
         return;
 
@@ -6857,13 +6908,21 @@ void Spell::EffectLearnFollowerAbility()
 
 void Spell::EffectFinishGarrisonMission()
 {
+    // SPELL_EFFECT_FINISH_GARRISON_MISSION (246) force-completes a mission with a GUARANTEED success
+    // (Garrison::FinishMission now pins ResultDetermined + Succeeded) and hands it straight to the reward
+    // path. That is an instant free mission reward, so this effect is intended for GM / script use ONLY -
+    // it must NEVER be attached to a player-castable or lootable spell/item. If you author a spell with
+    // this effect, keep it flagged GM-only (or fire it exclusively from server scripts); a data audit of
+    // the spell/item tables for effect 246 should confirm nothing player-reachable carries it.
     if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
         return;
 
     if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrison())
+    // The mission recID alone identifies the garrison holding it (Player::GetGarrisonWithMission), which is what
+    // the CMSG mission handlers already use. GetGarrison() could only ever finish a WoD mission.
+    if (Garrison* garrison = unitTarget->ToPlayer()->GetGarrisonWithMission(effectInfo->MiscValue))
         garrison->FinishMission(effectInfo->MiscValue);
 }
 
@@ -6875,7 +6934,13 @@ void Spell::EffectAddGarrisonMissionSet()
     if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
         return;
 
-    Garrison* garrison = unitTarget->ToPlayer()->GetGarrison();
+    // GarrMissionSet.db2 publishes the owning garrison type; adding a non-WoD set into the WoD garrison
+    // produced missions the owning UI could never show.
+    GarrisonType garrType = GARRISON_TYPE_GARRISON;
+    if (GarrMissionSetEntry const* missionSet = sGarrMissionSetStore.LookupEntry(uint32(effectInfo->MiscValue)))
+        garrType = GarrisonType(missionSet->GarrTypeID);
+
+    Garrison* garrison = unitTarget->ToPlayer()->GetGarrison(garrType);
     if (!garrison)
         return;
 
@@ -6945,6 +7010,51 @@ void Spell::EffectLearnGarrTalent()
     garrison->LearnTalent(effectInfo->MiscValue, false);
 }
 
+void Spell::EffectSetCovenant()
+{
+    if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
+        return;
+
+    if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
+        return;
+
+    // MiscValue = Covenant.db2 id chosen by the covenant-choice quest's reward spell. Joining a covenant
+    // is the Blizzlike entry point (soulbinds unlock afterwards) - there is no dedicated covenant opcode.
+    //
+    // MiscValue 0 is the RESET, and it is a published mechanism rather than an edge case: spell 338503 "Reset
+    // Covenant" is SPELL_EFFECT_SET_COVENANT with MiscValue 0 followed by SPELL_EFFECT_QUEST_FAIL on all four
+    // covenant-choice quests (56066/56069/56068/56067) and the two phase-refresh effects 170/167 - i.e. "leave
+    // the covenant and re-arm the choice". Player::SetActiveCovenant keeps every covenant's renown, anima,
+    // researched talents, companions and conduits; only the active pledge goes away.
+    int32 covenantId = effectInfo->MiscValue;
+    if (covenantId < 0)
+        return;
+
+    if (covenantId && !sCovenantStore.LookupEntry(uint32(covenantId)))
+        return;
+
+    unitTarget->ToPlayer()->SetActiveCovenant(uint32(covenantId));
+}
+
+void Spell::EffectLearnSoulbindConduit()
+{
+    if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
+        return;
+
+    if (!unitTarget || unitTarget->GetTypeId() != TYPEID_PLAYER)
+        return;
+
+    // MiscValue = SoulbindConduit.db2 id; the rank comes from the spell's base points (MiscValueB is unused
+    // for conduit grants). A negative/zero rank falls back to the conduit's lowest defined rank.
+    int32 conduitId = effectInfo->MiscValue;
+    if (conduitId <= 0)
+        return;
+
+    int32 rankValue = GetEffectValueAsInt();                    // spell base points = 1-based conduit rank (0 when unspecified)
+    int32 rank = rankValue > 0 ? rankValue - 1 : -1;            // CollectConduit wants a 0-based index (<0 = lowest defined rank)
+    unitTarget->ToPlayer()->CollectConduit(uint32(conduitId), rank);
+}
+
 void Spell::EffectSetGarrisonFollowerLevel()
 {
     if (effectHandleMode != SPELL_EFFECT_HANDLE_HIT_TARGET)
@@ -6975,7 +7085,15 @@ void Spell::EffectModifyFollowerItemLevel()
         return;
 
     Player* player = unitTarget->ToPlayer();
-    Garrison* garrison = player->GetGarrison();
+
+    // GarrItemLevelUpgradeData.db2 -> GarrFollowerType.db2 gives the owning garrison type. Same defect and same
+    // caveat as EffectLearnFollowerAbility: the type is now correct, the arbitrary-follower pick is not.
+    GarrisonType garrType = GARRISON_TYPE_GARRISON;
+    if (GarrItemLevelUpgradeDataEntry const* upgrade = sGarrItemLevelUpgradeDataStore.LookupEntry(uint32(effectInfo->MiscValue)))
+        if (GarrFollowerTypeEntry const* followerType = sGarrFollowerTypeStore.LookupEntry(uint32(upgrade->FollowerTypeID)))
+            garrType = GarrisonType(followerType->GarrTypeID);
+
+    Garrison* garrison = player->GetGarrison(garrType);
     if (!garrison)
         return;
 

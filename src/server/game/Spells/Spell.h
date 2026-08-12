@@ -465,6 +465,8 @@ class TC_GAME_API Spell
         void EffectFinishShipment();
         void EffectSetGarrisonCacheSize();
         void EffectLearnGarrTalent();
+        void EffectSetCovenant();
+        void EffectLearnSoulbindConduit();
         void EffectSetGarrisonFollowerLevel();
         void EffectModifyFollowerItemLevel();
         void EffectModifyAuraStacks();
