@@ -179,6 +179,16 @@ namespace WorldPackets
             uint8 Unknown2 = 0;
         };
 
+        // SMSG_CLEAR_RESURRECT (0x420013): empty body; sniff 68275 sends it right after the
+        // MOVE_UPDATE_TELEPORT on instance entry - any pending resurrect offer is void on map change.
+        class ClearResurrect final : public ServerPacket
+        {
+        public:
+            explicit ClearResurrect() : ServerPacket(SMSG_CLEAR_RESURRECT, 0) { }
+
+            WorldPacket const* Write() override { return &_worldPacket; }
+        };
+
         class ViolenceLevel final : public ClientPacket
         {
         public:
