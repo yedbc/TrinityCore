@@ -119,6 +119,7 @@ namespace WorldPackets
     {
         class AdventureJournalOpenQuest;
         class AdventureJournalUpdateSuggestions;
+        class EncounterJournalStartArathiRpe;
     }
 
     namespace AdventureMap
@@ -823,6 +824,9 @@ namespace WorldPackets
         class ConversationLineStarted;
         class RequestLatestSplashScreen;
         class QueryCountdownTimer;
+        class DoCountdown;
+        class GetRemainingGameTime;
+        class SetStopConversation;
         class SetCurrencyFlags;
         class ChromieTimeSelectExpansion;
         class RequestCurrencyDataForAccountCharacters;
@@ -1078,6 +1082,7 @@ namespace WorldPackets
     namespace Talent
     {
         class LearnTalents;
+        class UnlearnSpecialization;
         class LearnPvpTalents;
         class ConfirmRespecWipe;
     }
@@ -1649,6 +1654,10 @@ class TC_GAME_API WorldSession
         void HandleRandomizeCharNameOpcode(WorldPackets::Character::GenerateRandomCharacterName& packet);
         void HandleReorderCharacters(WorldPackets::Character::ReorderCharacters& reorderChars);
         void HandleOpeningCinematic(WorldPackets::Misc::OpeningCinematic& packet);
+        void HandleDoCountdown(WorldPackets::Misc::DoCountdown& doCountdown);
+        void HandleGetRemainingGameTime(WorldPackets::Misc::GetRemainingGameTime& getRemainingGameTime);
+        void HandleSetStopConversation(WorldPackets::Misc::SetStopConversation& setStopConversation);
+        void HandleUnlearnSpecialization(WorldPackets::Talent::UnlearnSpecialization& unlearnSpecialization);
         void HandleGetUndeleteCooldownStatus(WorldPackets::Character::GetUndeleteCharacterCooldownStatus& /*getCooldown*/);
         void HandleUndeleteCooldownStatusCallback(PreparedQueryResult result);
         void HandleCharUndeleteOpcode(WorldPackets::Character::UndeleteCharacter& undeleteInfo);
@@ -2489,6 +2498,7 @@ class TC_GAME_API WorldSession
         // Adventure Journal
         void HandleAdventureJournalOpenQuest(WorldPackets::AdventureJournal::AdventureJournalOpenQuest& openQuest);
         void HandleAdventureJournalUpdateSuggestions(WorldPackets::AdventureJournal::AdventureJournalUpdateSuggestions& updateSuggestions);
+        void HandleEncounterJournalStartArathiRpe(WorldPackets::AdventureJournal::EncounterJournalStartArathiRpe& startArathiRpe);
 
         // Covenant
         void HandleActivateSoulbind(WorldPackets::Covenant::ActivateSoulbind& packet);

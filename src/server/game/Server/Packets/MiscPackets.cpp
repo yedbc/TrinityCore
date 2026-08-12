@@ -170,7 +170,13 @@ WorldPacket const* SetupCurrency::Write()
     return &_worldPacket;
 }
 
+WorldPacket const* ReattachResurrect::Write()
+{
+    _worldPacket << uint8(Unknown1);
+    _worldPacket << uint8(Unknown2);
 
+    return &_worldPacket;
+}
 
 void ViolenceLevel::Read()
 {
@@ -802,6 +808,35 @@ WorldPacket const* StartTimer::Write()
 void QueryCountdownTimer::Read()
 {
     _worldPacket >> As<int32>(TimerType);
+}
+
+void DoCountdown::Read()
+{
+    // Wire (client serializer 0x5DDE90): bit HasType, bit Flag, FlushBits, uint32 TotalTime, [uint8 Type if HasType]
+    bool hasType = _worldPacket.ReadBit();
+    Flag = _worldPacket.ReadBit();
+    _worldPacket >> TotalTime;
+    if (hasType)
+    {
+        uint8 type;
+        _worldPacket >> type;
+        Type = type;
+    }
+}
+
+WorldPacket const* GetRemainingGameTimeResponse::Write()
+{
+    _worldPacket << uint32(SecondsRemaining);
+    _worldPacket << uint32(GameTimeParam);
+    _worldPacket.WriteBit(Unlimited);
+    _worldPacket.FlushBits();
+
+    return &_worldPacket;
+}
+
+void SetStopConversation::Read()
+{
+    _worldPacket >> ConversationGUID;
 }
 
 void ConversationLineStarted::Read()

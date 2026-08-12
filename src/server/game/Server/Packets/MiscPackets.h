@@ -168,6 +168,17 @@ namespace WorldPackets
             std::vector<Record> Data;
         };
 
+        class ReattachResurrect final : public ServerPacket
+        {
+        public:
+            explicit ReattachResurrect() : ServerPacket(SMSG_REATTACH_RESURRECT, 2) { }
+
+            WorldPacket const* Write() override;
+
+            uint8 Unknown1 = 0;
+            uint8 Unknown2 = 0;
+        };
+
         class ViolenceLevel final : public ClientPacket
         {
         public:
@@ -1049,6 +1060,48 @@ namespace WorldPackets
             void Read() override;
 
             CountdownTimerType TimerType = {};
+        };
+
+        class DoCountdown final : public ClientPacket
+        {
+        public:
+            explicit DoCountdown(WorldPacket&& packet) : ClientPacket(CMSG_DO_COUNTDOWN, std::move(packet)) { }
+
+            void Read() override;
+
+            uint32 TotalTime = 0;       // countdown duration in seconds
+            Optional<uint8> Type;       // present only when the client sends a timer type
+            bool Flag = false;
+        };
+
+        class GetRemainingGameTime final : public ClientPacket
+        {
+        public:
+            explicit GetRemainingGameTime(WorldPacket&& packet) : ClientPacket(CMSG_GET_REMAINING_GAME_TIME, std::move(packet)) { }
+
+            void Read() override { }
+        };
+
+        class GetRemainingGameTimeResponse final : public ServerPacket
+        {
+        public:
+            explicit GetRemainingGameTimeResponse() : ServerPacket(SMSG_GET_REMAINING_GAME_TIME_RESPONSE, 4 + 4 + 1) { }
+
+            WorldPacket const* Write() override;
+
+            uint32 SecondsRemaining = 0;
+            uint32 GameTimeParam = 0;
+            bool Unlimited = false;
+        };
+
+        class SetStopConversation final : public ClientPacket
+        {
+        public:
+            explicit SetStopConversation(WorldPacket&& packet) : ClientPacket(CMSG_SET_STOP_CONVERSATION, std::move(packet)) { }
+
+            void Read() override;
+
+            ObjectGuid ConversationGUID;
         };
 
         class ConversationLineStarted final : public ClientPacket
