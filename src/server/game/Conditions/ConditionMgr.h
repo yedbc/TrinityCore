@@ -224,6 +224,15 @@ enum InstanceInfo
     INSTANCE_INFO_DATA64
 };
 
+enum class GroupStatusCondition : uint32
+{
+    NotInGroup              = 0,
+    InGroup                 = 1,
+    InGroupButNotInRaid     = 2,
+    InRaid                  = 3,
+    NotInGroupOrNotInRaid   = 4
+};
+
 enum MaxConditionTargets
 {
     MAX_CONDITION_TARGETS = 3
