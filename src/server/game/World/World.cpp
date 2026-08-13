@@ -718,6 +718,12 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "Housing.EnableCreateCharterNeighborhood"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_CREATE_CHARTER_NEIGHBORHOOD },
         { .Name = "Housing.EnableCreateGuildNeighborhood"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_CREATE_GUILD_NEIGHBORHOOD },
         { .Name = "Housing.TutorialsEnabled"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_TUTORIALS_ENABLED },
+        { .Name = "Shop.Enabled"sv, .DefaultValue = true, .Index = CONFIG_SHOP_ENABLED },
+        { .Name = "Shop.Shop2Enabled"sv, .DefaultValue = false, .Index = CONFIG_SHOP_SHOP2_ENABLED },
+        { .Name = "Shop.PurchaseConfirmation"sv, .DefaultValue = false, .Index = CONFIG_SHOP_PURCHASE_CONFIRMATION },
+        { .Name = "Shop.Entitlements.Enabled"sv, .DefaultValue = false, .Index = CONFIG_SHOP_ENTITLEMENTS_ENABLED },
+        { .Name = "Shop.Entitlements.AssignEnabled"sv, .DefaultValue = false, .Index = CONFIG_SHOP_ENTITLEMENT_ASSIGN_ENABLED },
+        { .Name = "WowToken.Market.Enabled"sv, .DefaultValue = false, .Index = CONFIG_WOW_TOKEN_MARKET_ENABLED },
     } };
 
     static constexpr ConfigOptionLoadDefinitionArray<uint32, INT_CONFIG_VALUE_COUNT> ints =
@@ -1671,7 +1677,10 @@ bool World::SetInitialWorldSettings()
 
     TC_LOG_INFO("server.loading", "Loading in-game Shop (BattlePay) catalog...");
     sBattlePayMgr->Load();
-    sBattlePayMgr->LoadProducts();
+    sBattlePayMgr->LoadCatalog();
+
+    TC_LOG_INFO("server.loading", "Loading WoW Token holdings...");
+    sWowTokenMgr->Load();
 
     TC_LOG_INFO("server.loading", "Loading WoW Token holdings...");
     sWowTokenMgr->Load();
@@ -2249,6 +2258,9 @@ void World::Update(uint32 diff)
         m_timers[WUPDATE_WHO_LIST].Reset();
         sWhoListStorageMgr->Update();
     }
+
+    ///- Rebuild the in-game Shop catalog when an availability-window boundary passes (restart-free rotation).
+    sBattlePayMgr->RebuildIfDue(currentGameTime);
 
     if (IsStopped() || m_timers[WUPDATE_CHANNEL_SAVE].Passed())
     {

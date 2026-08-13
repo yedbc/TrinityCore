@@ -1441,6 +1441,15 @@ void WorldSession::HandlePlayerLoginOpcode(WorldPackets::Character::PlayerLogin&
 
     m_playerLoading = playerLogin.Guid;
 
+    // The Shop catalog is served at most once per catalog generation per session, but the client
+    // throws its store state away when it leaves character select, so the copy it fetched there is
+    // gone by the time the in-game Shop opens. Without this reset the in-world
+    // CMSG_BATTLE_PAY_GET_PRODUCT_LIST is silently swallowed by that throttle and the Shop shows an
+    // empty frame ("bad argument #1 to GetProducts" in Blizzard_StoreUI, because it has no product
+    // groups). Clearing the marker on login gives each context exactly one copy, which is what the
+    // throttle was actually meant to do.
+    _battlePayCatalogGeneration = 0;
+
     TC_LOG_DEBUG("network", "Character {} logging in", playerLogin.Guid.ToString());
 
     if (!IsLegitCharacterForAccount(playerLogin.Guid))
@@ -1541,6 +1550,13 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     SendFeatureSystemStatus();
 
+    // Unblock the in-game Shop panel: the client's StoreFrame_IsLoading gate waits on the distribution
+    // list (HasDistributionList). Retail sends it right after the feature status; we replay the blob.
+    SendBattlePayDistributionList();
+
+    // Hand over anything bought earlier and assigned to this character (see RedeemBattlePayEntitlements).
+    RedeemBattlePayEntitlements();
+
     // Send MOTD
     {
         WorldPackets::System::MOTD motd;
@@ -1550,9 +1566,9 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     SendSetTimeZoneInformation();
 
-    // Retail pushes the single sign-on token once, unprompted, in this post-login burst - there is no
-    // client request opcode for it in 12.0.7. See WOW_TOKEN_RE_68275.md.
-    SendGenerateSsoToken();
+    // Note: SMSG_GENERATE_SSO_TOKEN_RESPONSE is NOT pushed here. It is the strict 1:1 answer to
+    // CMSG_BATTLE_PAY_OPEN_CHECKOUT (proven in all 8 captures: checkout #N -> response #N echoing the
+    // request u32); it is sent from WorldSession::HandleBattlePayOpenCheckout. See COMMERCE_AUDIT C-09.
 
     // Send PVPSeason
     {
@@ -1906,6 +1922,16 @@ void WorldSession::SendFeatureSystemStatus()
     // the captured catalog and drive purchases server-side, so advertise the store as available.
     features.BpayStoreAvailable = true;
     features.CommerceServerEnabled = true;
+
+    // In-game Shop (BattlePay) availability. The client's C_StoreSecure.IsAvailable() gate reads
+    // BpayStoreAvailable; with it false the Shop shows "Store not available" and never sends
+    // CMSG_BATTLE_PAY_GET_PRODUCT_LIST, so our product blob is never requested. Retail sends both
+    // of these true (verified against the 12.0.7 in-game-shop sniff). We answer GetProductList with
+    // the captured catalog and drive purchases server-side, so advertise the store as available.
+    // Gated by the Shop.Enabled worldserver.conf toggle (default on).
+    bool const shopEnabled = sWorld->getBoolConfig(CONFIG_SHOP_ENABLED);
+    features.BpayStoreAvailable = shopEnabled;
+    features.CommerceServerEnabled = shopEnabled;
 
     for (World::GameRule const& gameRule : sWorld->GetGameRules())
     {
