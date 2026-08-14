@@ -604,6 +604,67 @@ namespace WorldPackets
             uint8 ServiceStatus = 0;
             uint8 Unknown = 0;
         };
+
+        // ---- Character boost (VAS service type 1) ---------------------------------------------------
+        //
+        // These four live here rather than in CharacterPackets because the whole flow is the Shop's: a
+        // boost is one of this account's owned entitlements being spent, and the handler hangs off
+        // BattlePayMgr. Only the opcode NAMES belong to the character group.
+
+        // CMSG_CHARACTER_UPGRADE_START (0x4000F4). The client picks the character and the specialization
+        // it wants to come out of the boost as. There is no DistributionID in the body, so the server
+        // chooses which of the account's owned boost entitlements to spend.
+        //
+        // Layout PROVEN from the client's own serializer (0x5D99F0, a straight-line writer, no branches):
+        // after the opcode word it writes a PackedGuid and then a uint32 - entry 0x4000f4 of
+        // c:/dumps/tools/cmsg_sweep/cmsg_layouts_68275.json, `"wire": "pguid u32"`, confidence HIGH.
+        class CharacterUpgradeStart final : public ClientPacket
+        {
+        public:
+            explicit CharacterUpgradeStart(WorldPacket&& packet) : ClientPacket(CMSG_CHARACTER_UPGRADE_START, std::move(packet)) { }
+
+            void Read() override;
+
+            ObjectGuid CharacterGUID;
+            uint32 SpecializationID = 0;    ///< ChrSpecialization.db2 id the boosted character comes out as
+        };
+
+        // The three server answers. Each is a single ObjectGuid - proven from the client's own parsers
+        // (0x420267 -> sub_7FF7290ABAB0, 0x420268 -> sub_7FF7290ABB10, 0x420269 -> sub_7FF7290ABB70),
+        // every one of which reads exactly one guid and nothing else.
+        //
+        // STARTED goes out once the boost has been paid for and is about to be written; COMPLETE only
+        // after it is durably committed; ABORTED whenever it is not going to happen, so the client's
+        // boost UI is never left waiting on a request the server quietly dropped.
+        class CharacterUpgradeStarted final : public ServerPacket
+        {
+        public:
+            explicit CharacterUpgradeStarted() : ServerPacket(SMSG_CHARACTER_UPGRADE_STARTED, 18) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid CharacterGUID;
+        };
+
+        class CharacterUpgradeComplete final : public ServerPacket
+        {
+        public:
+            explicit CharacterUpgradeComplete() : ServerPacket(SMSG_CHARACTER_UPGRADE_COMPLETE, 18) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid CharacterGUID;
+        };
+
+        class CharacterUpgradeAborted final : public ServerPacket
+        {
+        public:
+            explicit CharacterUpgradeAborted() : ServerPacket(SMSG_CHARACTER_UPGRADE_ABORTED, 18) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid CharacterGUID;
+        };
     }
 }
 

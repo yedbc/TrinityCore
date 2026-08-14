@@ -304,4 +304,31 @@ WorldPacket const* VasGetServiceStatusResponse::Write()
 
     return &_worldPacket;
 }
+
+void CharacterUpgradeStart::Read()
+{
+    _worldPacket >> CharacterGUID;
+    _worldPacket >> SpecializationID;
+}
+
+WorldPacket const* CharacterUpgradeStarted::Write()
+{
+    _worldPacket << CharacterGUID;
+
+    return &_worldPacket;
+}
+
+WorldPacket const* CharacterUpgradeComplete::Write()
+{
+    _worldPacket << CharacterGUID;
+
+    return &_worldPacket;
+}
+
+WorldPacket const* CharacterUpgradeAborted::Write()
+{
+    _worldPacket << CharacterGUID;
+
+    return &_worldPacket;
+}
 }
