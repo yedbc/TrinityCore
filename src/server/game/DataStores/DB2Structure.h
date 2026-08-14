@@ -4925,6 +4925,18 @@ struct RenownRewardsEntry
 };
 
 struct RenownRewardsPlunderstormEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    LocalizedString Description;
+    int32 CovenantID;
+    int32 Level;
+    int32 Icon;
+    int32 RewardCategory;        // Field_10_2_6_53840_005
+    int32 UiOrder;
+    int32 SpellID;
+};
+
 struct ResearchBranchEntry
 {
     uint32 ID;
@@ -4948,12 +4960,6 @@ struct ResearchProjectEntry
     uint32 ID;
     LocalizedString Name;
     LocalizedString Description;
-    int32 CovenantID;
-    int32 Level;
-    int32 Icon;
-    int32 RewardCategory;        // Field_10_2_6_53840_005
-    int32 UiOrder;
-    int32 SpellID;
     uint8 Rarity;
     int32 SpellID;
     uint16 ResearchBranchID;

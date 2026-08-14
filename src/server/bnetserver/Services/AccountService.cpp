@@ -112,14 +112,14 @@ uint32 Account::HandleGetRestriction(account::v2::client::GetRestrictionRequest 
     if (accountInfo->IsPermanenetlyBanned)
     {
         account::v2::Restriction* restriction = response->add_restrictions();
-        restriction->set_title_id(ClientBuild::ToFourCC("WoW"sv));
+        restriction->set_title_id(ClientBuild::Program::WoW);
         restriction->set_type(account::v2::RESTRICTION_TYPE_LOGIN_BANNED);
         restriction->set_created_time_ms(accountInfo->BanDate * IN_MILLISECONDS);
     }
     else if (accountInfo->IsBanned)
     {
         account::v2::Restriction* restriction = response->add_restrictions();
-        restriction->set_title_id(ClientBuild::ToFourCC("WoW"sv));
+        restriction->set_title_id(ClientBuild::Program::WoW);
         restriction->set_type(account::v2::RESTRICTION_TYPE_LOGIN_SUSPENDED);
         restriction->set_created_time_ms(accountInfo->BanDate * IN_MILLISECONDS);
         restriction->set_expire_time_ms(accountInfo->UnbanDate * IN_MILLISECONDS);

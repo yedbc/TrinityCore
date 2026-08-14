@@ -6804,6 +6804,23 @@ struct RenownRewardsLoadInfo
 };
 
 struct RenownRewardsPlunderstormLoadInfo
+{
+    static constexpr DB2FieldMeta Fields[9] =
+    {
+        { .IsSigned = false, .Type = FT_INT, .Name = "ID" },
+        { .IsSigned = false, .Type = FT_STRING, .Name = "Name" },
+        { .IsSigned = false, .Type = FT_STRING, .Name = "Description" },
+        { .IsSigned = false, .Type = FT_INT, .Name = "CovenantID" },
+        { .IsSigned = true, .Type = FT_INT, .Name = "Level" },
+        { .IsSigned = true, .Type = FT_INT, .Name = "Icon" },
+        { .IsSigned = true, .Type = FT_INT, .Name = "RewardCategory" },
+        { .IsSigned = true, .Type = FT_INT, .Name = "UiOrder" },
+        { .IsSigned = true, .Type = FT_INT, .Name = "SpellID" },
+    };
+
+    static constexpr DB2LoadInfo Instance{ Fields, 9, &RenownRewardsPlunderstormMeta::Instance, HOTFIX_SEL_RENOWN_REWARDS_PLUNDERSTORM };
+};
+
 struct ResearchBranchLoadInfo
 {
     static constexpr DB2FieldMeta Fields[7] =
@@ -6839,15 +6856,6 @@ struct ResearchProjectLoadInfo
         { .IsSigned = false, .Type = FT_INT, .Name = "ID" },
         { .IsSigned = false, .Type = FT_STRING, .Name = "Name" },
         { .IsSigned = false, .Type = FT_STRING, .Name = "Description" },
-        { .IsSigned = false, .Type = FT_INT, .Name = "CovenantID" },
-        { .IsSigned = true, .Type = FT_INT, .Name = "Level" },
-        { .IsSigned = true, .Type = FT_INT, .Name = "Icon" },
-        { .IsSigned = true, .Type = FT_INT, .Name = "RewardCategory" },
-        { .IsSigned = true, .Type = FT_INT, .Name = "UiOrder" },
-        { .IsSigned = true, .Type = FT_INT, .Name = "SpellID" },
-    };
-
-    static constexpr DB2LoadInfo Instance{ Fields, 9, &RenownRewardsPlunderstormMeta::Instance, HOTFIX_SEL_RENOWN_REWARDS_PLUNDERSTORM };
         { .IsSigned = false, .Type = FT_BYTE, .Name = "Rarity" },
         { .IsSigned = true, .Type = FT_INT, .Name = "SpellID" },
         { .IsSigned = false, .Type = FT_SHORT, .Name = "ResearchBranchID" },
