@@ -227,7 +227,7 @@ namespace WorldPackets
             bool KioskModeEnabled                    = false; // NYI
             bool CompetitiveModeEnabled              = false; // NYI
             bool BoostEnabled                        = false; // classic only
-            bool TrialBoostEnabled                   = false; // NYI
+            bool TrialBoostEnabled                   = false; // set while the account owns an unapplied character boost
             bool RedeemForBalanceAvailable           = false; // NYI
             bool LiveRegionCharacterListEnabled      = false; // NYI
             bool LiveRegionCharacterCopyEnabled      = false; // NYI
@@ -252,8 +252,8 @@ namespace WorldPackets
             uint32 CommercePricePollTimeSeconds      = 0;     // NYI
             int64 RedeemForBalanceAmount             = 0;     // NYI
             int32 MaxCharactersOnThisRealm           = 0;
-            int32 ActiveBoostType                    = 0;     // NYI
-            int32 TrialBoostType                     = 0;     // NYI
+            int32 ActiveBoostType                    = 0;     // Shop.CharacterBoost.BoostType while TrialBoostEnabled
+            int32 TrialBoostType                     = 0;     // same value; the client reads both
             int32 MinimumExpansionLevel              = 0;
             int32 MaximumExpansionLevel              = 0;
             uint32 KioskSessionDurationMinutes       = 0;

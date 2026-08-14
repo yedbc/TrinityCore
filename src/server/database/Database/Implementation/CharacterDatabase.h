@@ -949,6 +949,15 @@ enum CharacterDatabaseStatements : uint32
     CHAR_DEL_CHARACTER_SOULBIND_CONDUITS,
     CHAR_DEL_CHARACTER_SOULBIND_CONDUIT_SOCKETS,
 
+    // In-game Shop character boost (BattlePayMgr / BattlePayHandler). The boost is applied to an
+    // OFFLINE character from the glue screen, so every one of these runs without a Player.
+    CHAR_SEL_SHOP_BOOST_TARGET,
+    CHAR_SEL_SHOP_BOOST_INVENTORY,
+    CHAR_UPD_SHOP_BOOST_CHARACTER,
+    CHAR_REP_SHOP_BOOST,
+    CHAR_DEL_SHOP_BOOST,
+    CHAR_SEL_SHOP_BOOST_ACCOUNT,
+
     MAX_CHARACTERDATABASE_STATEMENTS
 };
 

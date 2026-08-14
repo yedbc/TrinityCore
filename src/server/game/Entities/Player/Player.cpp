@@ -4187,6 +4187,13 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
             stmt->setUInt64(0, guid);
             trans->Append(stmt);
 
+            // In-game Shop boost record. Only on a real delete: an UNLINKed character can be restored,
+            // and it must come back still marked as boosted (or still a class trial), or deleting and
+            // undeleting would launder a spent boost into a fresh one.
+            stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_SHOP_BOOST);
+            stmt->setUInt64(0, guid);
+            trans->Append(stmt);
+
             stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_PLAYER_ACCOUNT_DATA);
             stmt->setUInt64(0, guid);
             trans->Append(stmt);

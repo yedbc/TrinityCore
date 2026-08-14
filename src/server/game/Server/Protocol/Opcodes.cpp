@@ -226,7 +226,13 @@ void OpcodeTable::InitializeClientOpcodes()
     DEFINE_HANDLER(CMSG_BATTLE_PAY_DISTRIBUTION_ASSIGN_VAS,                 STATUS_IGNORED,   PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_GET_PRODUCT_LIST,                        STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayGetProductList);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_GET_PURCHASE_LIST,                       STATUS_AUTHED,     PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayGetPurchaseList);
-    DEFINE_HANDLER(CMSG_BATTLE_PAY_OPEN_CHECKOUT,                           STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayOpenCheckout);
+    // STATUS_AUTHED like every other CMSG_BATTLE_PAY_*: the Shop opens at CHARACTER SELECT too, and
+    // this branch's purchase path has a whole no-player branch for buying there. STATUS_LOGGEDIN meant
+    // pressing Buy on the glue screen was answered with "Received not allowed opcode" and no SSO token,
+    // i.e. the checkout could never start. The handler needs no Player - it echoes the request's
+    // ClientToken back in SMSG_GENERATE_SSO_TOKEN_RESPONSE, which is itself CONNECTION_TYPE_REALM and so
+    // is deliverable at character select.
+    DEFINE_HANDLER(CMSG_BATTLE_PAY_OPEN_CHECKOUT,                           STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayOpenCheckout);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_REQUEST_PRICE_INFO,                      STATUS_IGNORED,   PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_START_PURCHASE,                          STATUS_AUTHED,     PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayStartPurchase);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_START_VAS_PURCHASE,                      STATUS_IGNORED,   PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
@@ -295,7 +301,10 @@ void OpcodeTable::InitializeClientOpcodes()
     DEFINE_HANDLER(CMSG_CHARACTER_CHECK_UPGRADE,                            STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
     DEFINE_HANDLER(CMSG_CHARACTER_RENAME_REQUEST,                           STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleCharRenameOpcode);
     DEFINE_HANDLER(CMSG_CHARACTER_UPGRADE_MANUAL_UNREVOKE_REQUEST,          STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
-    DEFINE_HANDLER(CMSG_CHARACTER_UPGRADE_START,                            STATUS_UNHANDLED, PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
+    // STATUS_AUTHED, not STATUS_LOGGEDIN: a boost is applied from the glue screen, to a character that
+    // is by definition not the one you are playing. The handler refuses it outright if a player IS in
+    // world, because the boost writes that character's rows behind the running Player object's back.
+    DEFINE_HANDLER(CMSG_CHARACTER_UPGRADE_START,                            STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleCharacterUpgradeStart);
     DEFINE_HANDLER(CMSG_CHAR_CUSTOMIZE,                                     STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleCharCustomizeOpcode);
     DEFINE_HANDLER(CMSG_CHAR_DELETE,                                        STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleCharDeleteOpcode);
     DEFINE_HANDLER(CMSG_CHAR_RACE_OR_FACTION_CHANGE,                        STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleCharRaceOrFactionChangeOpcode);
@@ -1299,10 +1308,13 @@ void OpcodeTable::InitializeServerOpcodes()
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_NET_CONNECTION_STATUS,                                 STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_ACK_FAILED,                                        STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_BATTLE_PET_DELIVERED,                              STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_COLLECTION_ITEM_DELIVERED,                         STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_COLLECTION_ITEM_DELIVERED,                         STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_TENDER_GRANTED,                                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_CONFIRM_PURCHASE,                                  STATUS_NEVER,       CONNECTION_TYPE_REALM);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_DELIVERY_ENDED,                                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_DELIVERY_ENDED,                                    STATUS_NEVER,       CONNECTION_TYPE_REALM);
+    // SMSG_BATTLE_PAY_DELIVERY_STARTED stays blocked ON PURPOSE. The 12.0.7 client registers a handler
+    // for it whose entire body is `ret` (rva 0x1D80E0 = the bytes C2 00 00) - see BattlePayPackets.h.
+    // Sending it would be bytes on the wire for a provably inert handler.
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_DELIVERY_STARTED,                                  STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_DISTRIBUTION_ASSIGN_VAS_RESPONSE,                  STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_DISTRIBUTION_UNREVOKED,                            STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
@@ -1310,7 +1322,7 @@ void OpcodeTable::InitializeServerOpcodes()
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_GET_DISTRIBUTION_LIST_RESPONSE,                    STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_GET_PRODUCT_LIST_RESPONSE,                         STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_GET_PURCHASE_LIST_RESPONSE,                        STATUS_NEVER,       CONNECTION_TYPE_REALM);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_MOUNT_DELIVERED,                                   STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_MOUNT_DELIVERED,                                   STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_PURCHASE_UPDATE,                                   STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_START_CHECKOUT,                                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_BATTLE_PAY_START_DISTRIBUTION_ASSIGN_TO_TARGET_RESPONSE,      STATUS_NEVER,       CONNECTION_TYPE_REALM);
@@ -1405,10 +1417,13 @@ void OpcodeTable::InitializeServerOpcodes()
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_LOGIN_FAILED,                                       STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_OBJECT_TEST_RESPONSE,                               STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_RENAME_RESULT,                                      STATUS_NEVER,       CONNECTION_TYPE_REALM);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_UPGRADE_ABORTED,                                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_UPGRADE_COMPLETE,                                   STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+    // STATUS_UNHANDLED on a server opcode is a SEND BLOCK: WorldSession::SendPacket drops the packet
+    // and logs "Prevented sending disabled opcode". These three are the character-boost answers and are
+    // now actually sent, so they have to move to STATUS_NEVER like every other server-only opcode.
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_UPGRADE_ABORTED,                                    STATUS_NEVER,       CONNECTION_TYPE_REALM);
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_UPGRADE_COMPLETE,                                   STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_UPGRADE_MANUAL_UNREVOKE_RESULT,                     STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_UPGRADE_STARTED,                                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHARACTER_UPGRADE_STARTED,                                    STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHAR_CUSTOMIZE_FAILURE,                                       STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHAR_CUSTOMIZE_SUCCESS,                                       STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_CHAR_FACTION_CHANGE_RESULT,                                   STATUS_NEVER,       CONNECTION_TYPE_REALM);
@@ -1455,8 +1470,15 @@ void OpcodeTable::InitializeServerOpcodes()
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMENTATOR_PLAYER_INFO,                 STATUS_NEVER,    CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMENTATOR_STATE_CHANGED,               STATUS_NEVER,    CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_COUNT_RESPONSE,                            STATUS_NEVER,       CONNECTION_TYPE_REALM);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_LOG_RESPONSE,                              STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_MARKET_PRICE_RESPONSE,                     STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
+    // REALM, not INSTANCE. WorldSession::SendPacket routes by the connection index declared here and
+    // DROPS the packet if that socket does not exist, so an INSTANCE-routed answer only ever arrives
+    // for a session that has finished establishing its instance connection. Both of these are 1:1
+    // answers to requests that arrive on the REALM socket, both feed the same account-scoped WoW Token
+    // UI as SMSG_COMMERCE_TOKEN_GET_COUNT_RESPONSE and SMSG_COMMERCE_TOKEN_UPDATE - which are already
+    // REALM - and neither carries anything world- or instance-scoped. They were simply the two members
+    // of the family that were declared inconsistently.
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_LOG_RESPONSE,                              STATUS_NEVER,       CONNECTION_TYPE_REALM);
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_MARKET_PRICE_RESPONSE,                     STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_UPDATE,                                        STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMPLAINT_RESULT,                                             STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMPLETE_SHIPMENT_RESPONSE,              STATUS_NEVER,    CONNECTION_TYPE_REALM);

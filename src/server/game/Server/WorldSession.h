@@ -38,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 class BlackMarketEntry;
 class CollectionMgr;
@@ -139,6 +140,7 @@ namespace WorldPackets
         class OpenCheckout;
         class ConfirmPurchaseResponse;
         class DistributionAssignToTarget;
+        class CharacterUpgradeStart;
     }
 
     namespace AreaTrigger
@@ -1661,6 +1663,9 @@ class TC_GAME_API WorldSession
         void SendAccountStoreFrontUpdate();
 
         void HandleCharEnum(CharacterDatabaseQueryHolder const& holder);
+        // Re-runs the character enumeration and pushes a fresh EnumCharactersResult. Also called after a
+        // character boost, which changes the level, the flags and the look the glue screen is showing.
+        void SendCharacterEnum();
         void HandleCharEnumOpcode(WorldPackets::Character::EnumCharacters& /*enumCharacters*/);
         void HandleCharUndeleteEnumOpcode(WorldPackets::Character::EnumCharacters& /*enumCharacters*/);
         void HandleCharDeleteOpcode(WorldPackets::Character::CharDelete& charDelete);
@@ -2703,6 +2708,9 @@ class TC_GAME_API WorldSession
         void HandleBattlePayConfirmPurchaseResponse(WorldPackets::BattlePay::ConfirmPurchaseResponse& confirmPurchaseResponse);
         void BattlePayProcessPurchase(uint32 productID);
         void SendBattlePayDistributionList();
+        // Purchase delivery notifications: SMSG_BATTLE_PAY_MOUNT_DELIVERED /
+        // SMSG_BATTLE_PAY_COLLECTION_ITEM_DELIVERED per deliverable, then SMSG_BATTLE_PAY_DELIVERY_ENDED.
+        void SendBattlePayDeliveryNotifications(ShopProduct const& product, uint64 purchaseID);
 
         // In-game Shop entitlements ("distributions"): buy now, apply to a character later.
         void HandleBattlePayDistributionAssignToTarget(WorldPackets::BattlePay::DistributionAssignToTarget& assign);
@@ -2712,6 +2720,21 @@ class TC_GAME_API WorldSession
         void SendBattlePayEntitlementSync();
         int32 BattlePayCreateEntitlement(ShopProduct const& product, uint64 purchaseID);
         void RedeemBattlePayEntitlements();
+
+        // In-game Shop character boost (service type 1). Spends one owned boost entitlement on an
+        // OFFLINE character of this account, from the glue screen.
+        void HandleCharacterUpgradeStart(WorldPackets::BattlePay::CharacterUpgradeStart& upgradeStart);
+        // Second half of the boost, run once the target's current level/class/race/inventory have been
+        // read. Claims the entitlement, writes the boost, then answers COMPLETE (or ABORTED).
+        void ApplyBattlePayCharacterBoost(CharacterDatabaseQueryHolder const& queryResult, ObjectGuid target,
+            uint32 specializationId, uint64 distributionId, uint64 purchaseId, uint32 productId);
+        // True once this account holds at least one unapplied character-boost entitlement. Drives the
+        // glue screen's TrialBoostEnabled / ActiveBoostType / TrialBoostType.
+        bool HasBattlePayCharacterBoost() const;
+        // Loaded with the character enumeration: which of this account's characters have been boosted,
+        // and which are class trials awaiting one.
+        bool IsCharacterShopBoosted(ObjectGuid::LowType characterGuid) const { return _shopBoostedCharacters.contains(characterGuid); }
+        bool IsCharacterShopTrial(ObjectGuid::LowType characterGuid) const { return _shopTrialCharacters.contains(characterGuid); }
 
         void SendBattlenetResponse(uint32 serviceHash, uint32 methodId, uint32 token, pb::Message const* response);
         void SendBattlenetResponse(uint32 serviceHash, uint32 methodId, uint32 token, uint32 status);
@@ -2929,6 +2952,17 @@ class TC_GAME_API WorldSession
         // DB at character select and after every change. Cached because the assign handler must decide
         // synchronously whether the id the client named is one this account actually owns.
         std::vector<ShopEntitlement> _battlePayEntitlements;
+
+        // In-game Shop character boost: this account's boosted characters, and the ones created through
+        // "Try New Class" that have not been boosted yet. Filled by the character enumeration (they are
+        // read in the same query holder, so they are always present by the time the enum packet is
+        // built) and kept current by the boost itself. Drive CHARACTER_FLAG_4_USED_MAX_LEVEL_BOOST and
+        // CHARACTER_RESTRICTION_FLAG_TRIAL_BOOST respectively.
+        std::unordered_set<ObjectGuid::LowType> _shopBoostedCharacters;
+        std::unordered_set<ObjectGuid::LowType> _shopTrialCharacters;
+        // Last TrialBoostEnabled we told the glue screen, so a change (a boost bought or spent) can push
+        // a corrected FeatureSystemStatusGlueScreen instead of waiting for a relog.
+        bool _shopBoostAdvertised = false;
 
         std::unique_ptr<BattlePets::BattlePetMgr> _battlePetMgr;
 
