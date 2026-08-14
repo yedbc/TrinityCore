@@ -18,6 +18,7 @@
 #include "WorldSession.h"
 #include "BattlePayMgr.h"
 #include "BattlePayPackets.h"
+#include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
 #include "DBCEnums.h"
@@ -27,12 +28,15 @@
 #include "ItemEnchantmentMgr.h"
 #include "Log.h"
 #include "Mail.h"
+#include "MiscPackets.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "QueryHolder.h"
 #include "RealmList.h"
 #include "World.h"
 #include "WowTokenMgr.h"
 #include <algorithm>
+#include <memory>
 #include <set>
 #include "Timer.h"
 
@@ -634,6 +638,12 @@ namespace
                 break;
             case 5:                                             // service
                 deliverable.Type = first.Id;
+                // A CharacterBoost deliverable also carries a BoostID, and the client compares it with
+                // the ActiveBoostType / TrialBoostType the glue screen was given - a mismatch describes
+                // one boost in the character list and a different one in the Shop. Same source for both
+                // (Shop.CharacterBoost.BoostType) so they cannot drift apart.
+                if (first.Id == SHOP_SERVICE_CHARACTER_BOOST)
+                    deliverable.BoostID = uint32(BattlePayMgr::GetCharacterBoostType());
                 break;
             default:
                 break;
@@ -717,6 +727,14 @@ void WorldSession::LoadBattlePayEntitlements(bool sendList)
             }
             while (result->NextRow());
         }
+
+        // The glue screen's boost UI is driven by FeatureSystemStatusGlueScreen, which has already gone
+        // out by the time the first load finishes - and it goes stale again the moment a boost is bought
+        // or spent. Re-send it whenever what we would advertise no longer matches what we did advertise,
+        // so "Boost a character" appears (and disappears) without a relog. Only at character select: in
+        // world this is the wrong packet entirely.
+        if (!GetPlayer() && HasBattlePayCharacterBoost() != _shopBoostAdvertised)
+            SendFeatureSystemStatusGlueScreen();
 
         if (sendList)
             SendBattlePayDistributionListNow();
@@ -888,6 +906,19 @@ void WorldSession::HandleBattlePayDistributionAssignToTarget(WorldPackets::Battl
         return;
     }
 
+    // A character boost is not delivered by binding it to a character and handing the payload over at
+    // that character's next login - it rewrites the character while it is still logged out, and its own
+    // opcode (CMSG_CHARACTER_UPGRADE_START) carries the specialization the player picked, which this
+    // packet's ProductChoice is only assumed to. Refuse it here rather than binding an entitlement that
+    // the redemption path would then have to hand straight back.
+    if (wanted->ServiceType == SHOP_SERVICE_CHARACTER_BOOST)
+    {
+        TC_LOG_INFO("network", "BattlePay: {} tried to assign character-boost entitlement {}; boosts are applied "
+            "through CMSG_CHARACTER_UPGRADE_START, not through an assign.", GetPlayerInfo(), assign.DistributionID);
+        respond(RESULT_DISTRIBUTION_INVALID_TARGET);
+        return;
+    }
+
     // 2. Is the target really one of this account's characters? _legitCharacters is filled from the
     //    character enumeration, so this also rejects a guid belonging to somebody else entirely.
     if (assign.TargetCharacter.IsEmpty() || !IsLegitCharacterForAccount(assign.TargetCharacter))
@@ -994,9 +1025,11 @@ void WorldSession::RedeemBattlePayEntitlements()
 
             if (serviceType != 0)
             {
-                // A VAS service (boost, rename, faction/race change, transfer). This core implements none
-                // of them, so refuse loudly rather than silently swallowing a paid entitlement - and hand
-                // it straight back so nothing is lost.
+                // A VAS service (rename, faction/race change, transfer) that has no login-time delivery.
+                // The one service this core does perform - the character boost - never reaches here: it
+                // is applied at character select by CMSG_CHARACTER_UPGRADE_START and goes straight from
+                // AVAILABLE to FINISHED, and the assign path refuses to bind one. Anything else is
+                // refused loudly rather than silently swallowed, and handed back so nothing is lost.
                 sBattlePayMgr->TransitionEntitlement(distributionId, SHOP_ENTITLEMENT_FINISHED, 0,
                     SHOP_ENTITLEMENT_AVAILABLE, 0);
                 TC_LOG_ERROR("network", "BattlePay: entitlement {} names VAS service type {}, which this core "
@@ -1046,6 +1079,331 @@ void WorldSession::RedeemBattlePayEntitlements()
         }
         while (result->NextRow());
     }));
+}
+
+// ---- Character boost -------------------------------------------------------------------------------
+//
+// Retail sells a boost as a product, then applies it from the GLUE SCREEN to a character that is not
+// logged in. Everything below is shaped by that one fact: there is no Player to grant anything to, so
+// the boost is a set of writes to the character database, and the client is told about it through
+// CMSG_CHARACTER_UPGRADE_START / SMSG_CHARACTER_UPGRADE_STARTED / _COMPLETE / _ABORTED rather than
+// through the normal delivery notifications.
+//
+// It re-uses the entitlement machinery unchanged: a boost product carries a type-5 deliverable naming
+// service type 1, so NeedsEntitlement() already routes its purchase into an AVAILABLE entitlement, and
+// the compare-and-swap claim already guarantees one entitlement can only ever be spent once. What this
+// adds is the redemption that RedeemBattlePayEntitlements() previously had to refuse.
+
+namespace
+{
+    // Everything about the target that has to be read BEFORE the entitlement is claimed: if the session
+    // goes away between the read and the write, an unclaimed entitlement is still owned, whereas a
+    // claimed one would be stuck.
+    class CharacterBoostQueryHolder : public CharacterDatabaseQueryHolder
+    {
+    public:
+        enum
+        {
+            TARGET,
+            INVENTORY,
+
+            MAX
+        };
+
+        CharacterBoostQueryHolder() { SetSize(MAX); }
+
+        bool Initialize(ObjectGuid::LowType characterGuid)
+        {
+            bool result = true;
+
+            CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_SHOP_BOOST_TARGET);
+            stmt->setUInt64(0, characterGuid);
+            result &= SetPreparedQuery(TARGET, stmt);
+
+            stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_SHOP_BOOST_INVENTORY);
+            stmt->setUInt64(0, characterGuid);
+            result &= SetPreparedQuery(INVENTORY, stmt);
+
+            return result;
+        }
+    };
+}
+
+bool WorldSession::HasBattlePayCharacterBoost() const
+{
+    for (ShopEntitlement const& entitlement : _battlePayEntitlements)
+        if (entitlement.Status == SHOP_ENTITLEMENT_AVAILABLE && entitlement.ServiceType == SHOP_SERVICE_CHARACTER_BOOST)
+            return true;
+
+    return false;
+}
+
+void WorldSession::HandleCharacterUpgradeStart(WorldPackets::BattlePay::CharacterUpgradeStart& upgradeStart)
+{
+    // Diagnostic first, like the assign handler: this opcode has never been seen on our wire either, and
+    // this line is what confirms the (client-serializer-derived) field reading against a real client.
+    TC_LOG_INFO("network", "BattlePay: CharacterUpgradeStart from {}: character={} specialization={}",
+        GetPlayerInfo(), upgradeStart.CharacterGUID.ToString(), upgradeStart.SpecializationID);
+
+    ObjectGuid const target = upgradeStart.CharacterGUID;
+
+    // Told, not dropped. The client's boost UI waits on an answer, and a silent return would leave it
+    // waiting forever - which is exactly the failure mode a stub would have produced.
+    auto abort = [this, target](char const* why)
+    {
+        TC_LOG_INFO("network", "BattlePay: character boost of {} refused - {}.", target.ToString(), why);
+
+        WorldPackets::BattlePay::CharacterUpgradeAborted aborted;
+        aborted.CharacterGUID = target;
+        SendPacket(aborted.Write());
+    };
+
+    if (!sWorld->getBoolConfig(CONFIG_SHOP_ENABLED) || !sWorld->getBoolConfig(CONFIG_SHOP_ENTITLEMENTS_ENABLED))
+    {
+        abort("the Shop or its entitlement model is disabled");
+        return;
+    }
+
+    // Applying an entitlement to a character is gated by the same config as the assign path, for the
+    // same reason: it is the step that actually spends something.
+    if (!sWorld->getBoolConfig(CONFIG_SHOP_ENTITLEMENT_ASSIGN_ENABLED))
+    {
+        abort("Shop.Entitlements.AssignEnabled is off");
+        return;
+    }
+
+    // A boost writes the target's level, inventory and equipment cache straight into the database. If
+    // that character were loaded, the running Player would overwrite all of it at its next save. The
+    // client only sends this from the glue screen, so refusing here costs nothing and closes the hole.
+    if (GetPlayer())
+    {
+        abort("a character is in world; a boost may only be applied from character select");
+        return;
+    }
+
+    // The target must be one of the characters THIS session enumerated - the same check the assign path
+    // makes, and what stops a crafted packet from boosting somebody else's character.
+    if (target.IsEmpty() || !IsLegitCharacterForAccount(target))
+    {
+        abort("it is not a character of this account");
+        return;
+    }
+
+    if (IsCharacterShopBoosted(target.GetCounter()))
+    {
+        abort("it has already been boosted");
+        return;
+    }
+
+    ChrSpecializationEntry const* specialization = sChrSpecializationStore.LookupEntry(upgradeStart.SpecializationID);
+    if (!specialization)
+    {
+        abort("the requested specialization does not exist");
+        return;
+    }
+
+    // Which entitlement pays for it. Oldest first: _battlePayEntitlements is loaded ORDER BY id, so an
+    // account holding several boosts spends the one it has held longest.
+    ShopEntitlement const* boost = nullptr;
+    for (ShopEntitlement const& entitlement : _battlePayEntitlements)
+    {
+        if (entitlement.Status == SHOP_ENTITLEMENT_AVAILABLE && entitlement.ServiceType == SHOP_SERVICE_CHARACTER_BOOST)
+        {
+            boost = &entitlement;
+            break;
+        }
+    }
+
+    if (!boost)
+    {
+        abort("this account owns no unapplied character boost");
+        return;
+    }
+
+    uint64 const distributionId = boost->DistributionID;
+    uint64 const purchaseId = boost->PurchaseID;
+    uint32 const productId = boost->ProductID;
+    uint32 const specializationId = upgradeStart.SpecializationID;
+
+    std::shared_ptr<CharacterBoostQueryHolder> holder = std::make_shared<CharacterBoostQueryHolder>();
+    if (!holder->Initialize(target.GetCounter()))
+    {
+        abort("its character data could not be queried");
+        return;
+    }
+
+    AddQueryHolderCallback(CharacterDatabase.DelayQueryHolder(holder)).AfterComplete(
+        [this, target, specializationId, distributionId, purchaseId, productId](SQLQueryHolderBase const& queryResult)
+    {
+        ApplyBattlePayCharacterBoost(static_cast<CharacterDatabaseQueryHolder const&>(queryResult), target,
+            specializationId, distributionId, purchaseId, productId);
+    });
+}
+
+// Second half of the boost, once the target's current state has been read.
+//
+// ORDERING. The entitlement is claimed (compare-and-swap) only after every validation has passed, and
+// the write is committed only after the claim succeeded. If the commit fails the claim is handed back,
+// so the account keeps what it paid for. The one irreversible moment is the transition to FINISHED
+// after a successful commit: if that fails the character IS boosted and the entitlement is left
+// CLAIMED, which is loud in the log and repairable by hand - the alternative, rolling the entitlement
+// back to AVAILABLE, would hand out a second free boost.
+void WorldSession::ApplyBattlePayCharacterBoost(CharacterDatabaseQueryHolder const& queryResult, ObjectGuid target,
+    uint32 specializationId, uint64 distributionId, uint64 purchaseId, uint32 productId)
+{
+    auto abort = [this, target](char const* why)
+    {
+        TC_LOG_INFO("network", "BattlePay: character boost of {} refused - {}.", target.ToString(), why);
+
+        WorldPackets::BattlePay::CharacterUpgradeAborted aborted;
+        aborted.CharacterGUID = target;
+        SendPacket(aborted.Write());
+    };
+
+    PreparedQueryResult targetResult = queryResult.GetPreparedResult(CharacterBoostQueryHolder::TARGET);
+    if (!targetResult)
+    {
+        abort("it no longer exists");
+        return;
+    }
+
+    ShopBoostTarget boostTarget;
+    boostTarget.Guid = target;
+
+    Field* fields = targetResult->Fetch();
+    boostTarget.AccountId = fields[0].GetUInt32();
+    boostTarget.ClassId = fields[1].GetUInt8();
+    boostTarget.RaceId = fields[2].GetUInt8();
+    boostTarget.Level = fields[3].GetUInt8();
+    boostTarget.BackpackSlots = fields[4].GetUInt8();
+
+    // Re-check ownership against the database, not just against the enumeration cache.
+    if (boostTarget.AccountId != GetAccountId())
+    {
+        abort("it belongs to another account");
+        return;
+    }
+
+    ChrSpecializationEntry const* specialization = sChrSpecializationStore.LookupEntry(specializationId);
+    if (!specialization || specialization->ClassID != boostTarget.ClassId)
+    {
+        abort("the requested specialization is not one of that character's class");
+        return;
+    }
+
+    uint8 const boostLevel = BattlePayMgr::GetCharacterBoostLevel();
+    if (boostTarget.Level >= boostLevel)
+    {
+        abort("it is already at or above the boost level");
+        return;
+    }
+
+    if (PreparedQueryResult inventoryResult = queryResult.GetPreparedResult(CharacterBoostQueryHolder::INVENTORY))
+    {
+        do
+        {
+            Field* slotFields = inventoryResult->Fetch();
+            ShopBoostInventorySlot& occupant = boostTarget.OwnSlots[slotFields[0].GetUInt8()];
+            occupant.ItemGuid = slotFields[1].GetUInt64();
+            occupant.ItemId = slotFields[2].GetUInt32();
+        }
+        while (inventoryResult->NextRow());
+    }
+
+    // Spend the entitlement. This is the only step that may never run twice, and the manager's
+    // compare-and-swap is what guarantees it.
+    uint64 claimToken = 0;
+    ShopEntitlement claimed;
+    int32 claimResult = 0;
+    if (!sBattlePayMgr->ClaimEntitlement(GetAccountId(), distributionId, sRealmList->GetCurrentRealmId().Realm,
+        target.GetCounter(), claimToken, claimed, claimResult))
+    {
+        TC_LOG_INFO("network", "BattlePay: {} could not claim boost entitlement {} (result {}).",
+            GetPlayerInfo(), distributionId, claimResult);
+        abort("its boost entitlement could not be claimed");
+        LoadBattlePayEntitlements(true);                    // resync: our cache was stale
+        return;
+    }
+
+    CharacterDatabaseTransaction trans = sBattlePayMgr->BuildCharacterBoostTransaction(boostTarget,
+        specializationId, distributionId, productId);
+    if (!trans)
+    {
+        // Nothing was written - give the entitlement straight back.
+        sBattlePayMgr->TransitionEntitlement(distributionId, SHOP_ENTITLEMENT_CLAIMED, claimToken,
+            SHOP_ENTITLEMENT_AVAILABLE, 0);
+        abort("the boost could not be prepared; the entitlement was returned to the account");
+        LoadBattlePayEntitlements(true);
+        return;
+    }
+
+    // 1. STARTED - paid for, about to be written.
+    WorldPackets::BattlePay::CharacterUpgradeStarted started;
+    started.CharacterGUID = target;
+    SendPacket(started.Write());
+
+    // 2. DISTRIBUTION_UPDATE - the entitlement is no longer available to spend on anything else.
+    claimed.Status = SHOP_ENTITLEMENT_CLAIMED;
+    claimed.PurchaseID = purchaseId;
+    SendBattlePayDistributionUpdate(claimed);
+
+    AddTransactionCallback(CharacterDatabase.AsyncCommitTransaction(trans)).AfterComplete(
+        [this, target, distributionId, purchaseId, productId, claimToken, boostLevel](bool success)
+    {
+        if (!success)
+        {
+            sBattlePayMgr->TransitionEntitlement(distributionId, SHOP_ENTITLEMENT_CLAIMED, claimToken,
+                SHOP_ENTITLEMENT_AVAILABLE, 0);
+            TC_LOG_ERROR("network", "BattlePay: the boost transaction for {} failed to commit; entitlement {} "
+                "was returned to account {}.", target.ToString(), distributionId, GetAccountId());
+
+            WorldPackets::BattlePay::CharacterUpgradeAborted aborted;
+            aborted.CharacterGUID = target;
+            SendPacket(aborted.Write());
+            LoadBattlePayEntitlements(true);
+            return;
+        }
+
+        if (!sBattlePayMgr->TransitionEntitlement(distributionId, SHOP_ENTITLEMENT_CLAIMED, claimToken,
+            SHOP_ENTITLEMENT_FINISHED, 0))
+        {
+            // The character is boosted; the ledger did not close. Never roll back here - that would let
+            // the same entitlement pay for a second boost. Loud, and repairable by hand.
+            TC_LOG_ERROR("network", "BattlePay: {} was boosted but entitlement {} could not be closed and is "
+                "left CLAIMED (account {}). It must not be returned to the account.",
+                target.ToString(), distributionId, GetAccountId());
+        }
+
+        _shopBoostedCharacters.insert(target.GetCounter());
+        _shopTrialCharacters.erase(target.GetCounter());
+        sCharacterCache->UpdateCharacterLevel(target, boostLevel);
+
+        // 3. COMPLETE - durably written.
+        WorldPackets::BattlePay::CharacterUpgradeComplete complete;
+        complete.CharacterGUID = target;
+        SendPacket(complete.Write());
+
+        // 4. INVALIDATE_PLAYER - everything the client had cached about this character (its level, its
+        //    gear, its model) is now wrong.
+        WorldPackets::Misc::InvalidatePlayer invalidate;
+        invalidate.Guid = target;
+        SendPacket(invalidate.Write());
+
+        ShopEntitlement finished;
+        finished.DistributionID = distributionId;
+        finished.ProductID = productId;
+        finished.ServiceType = SHOP_SERVICE_CHARACTER_BOOST;
+        finished.Status = SHOP_ENTITLEMENT_FINISHED;
+        finished.PurchaseID = purchaseId;
+        SendBattlePayDistributionUpdate(finished);
+
+        TC_LOG_INFO("network", "BattlePay: {} boosted {} to level {} with entitlement {} (product {}).",
+            GetPlayerInfo(), target.ToString(), boostLevel, distributionId, productId);
+
+        // The account's owned set changed, and so did the character list the glue screen is showing.
+        LoadBattlePayEntitlements(true);
+        SendCharacterEnum();
+    });
 }
 
 void WorldSession::HandleBattlePayGetPurchaseList(WorldPackets::BattlePay::GetPurchaseList& /*getPurchaseList*/)
