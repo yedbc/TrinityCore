@@ -23,13 +23,16 @@ Category: commandscripts
 EndScriptData */
 
 #include "ScriptMgr.h"
+#include "ChallengeMode.h"
 #include "ChallengeModeMgr.h"
+#include "ChallengeModePackets.h"
 #include "Chat.h"
 #include "ChatCommand.h"
 #include "DB2Stores.h"
 #include "Item.h"
 #include "ItemDefines.h"
 #include "ItemUpgradeMgr.h"
+#include "Map.h"
 #include "Player.h"
 #include "RBAC.h"
 #include "WorldSession.h"
@@ -48,6 +51,7 @@ public:
             { "keystone",    HandleMythicPlusKeystoneCommand,    rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
             { "affixes",     HandleMythicPlusAffixesCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
             { "upgradeitem", HandleMythicPlusUpgradeItemCommand, rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
+            { "reset",       HandleMythicPlusResetCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
         };
 
         static ChatCommandTable commandTable =
@@ -122,6 +126,47 @@ public:
         }
 
         handler->PSendSysMessage("Upgraded item {} to item level {}.", item->GetEntry(), item->GetItemLevel(player));
+        return true;
+    }
+
+    // .mythicplus reset — abort the active keystone run in the instance the GM is standing in.
+    //
+    // This exists instead of a handler for the client's CMSG_RESET_CHALLENGE_MODE_CHEAT. That opcode's
+    // only behavioural difference from the already-handled CMSG_RESET_CHALLENGE_MODE is that it skips
+    // the keystone-owner check, and that check is deliberate - see WorldSession::HandleResetChallengeMode,
+    // which added it so that a group member (or anyone who wandered in) cannot abort the whole party's
+    // run. Wiring the cheat opcode would reintroduce exactly that hole for any client that sends it, so
+    // the capability is exposed here behind RBAC instead.
+    static bool HandleMythicPlusResetCommand(ChatHandler* handler)
+    {
+        Player* player = handler->GetPlayer();
+        if (!player)
+            return false;
+
+        InstanceMap* instanceMap = player->GetMap()->ToInstanceMap();
+        if (!instanceMap)
+        {
+            handler->SendSysMessage("You must be inside the instance whose Mythic+ run you want to reset.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        ChallengeMode* challenge = instanceMap->GetChallengeMode();
+        if (!challenge || !challenge->IsActive())
+        {
+            handler->SendSysMessage("There is no active Mythic+ run in this instance.");
+            handler->SetSentErrorMessage(true);
+            return false;
+        }
+
+        challenge->Reset();
+
+        // Same notification the normal reset path sends, so the party UI drops the timer.
+        WorldPackets::ChallengeMode::ChallengeModeReset resetPacket;
+        resetPacket.MapID = instanceMap->GetId();
+        instanceMap->SendToPlayers(resetPacket.Write());
+
+        handler->SendSysMessage("Mythic+ run reset.");
         return true;
     }
 
