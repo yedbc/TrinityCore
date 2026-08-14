@@ -1182,8 +1182,12 @@ void WorldSession::HandleCharacterUpgradeStart(WorldPackets::BattlePay::Characte
     }
 
     // The target must be one of the characters THIS session enumerated - the same check the assign path
-    // makes, and what stops a crafted packet from boosting somebody else's character.
-    if (target.IsEmpty() || !IsLegitCharacterForAccount(target))
+    // makes, and what stops a crafted packet from boosting somebody else's character. A class trial is
+    // also accepted: the client creates one and boosts it immediately, which can outrun the
+    // re-enumeration that would have put it in _legitCharacters, and that set only ever holds characters
+    // this session created. Either way the target's `account` column is re-checked below before
+    // anything is claimed or written, so this is a cheap first filter, not the authority.
+    if (target.IsEmpty() || (!IsLegitCharacterForAccount(target) && !IsCharacterShopTrial(target.GetCounter())))
     {
         abort("it is not a character of this account");
         return;

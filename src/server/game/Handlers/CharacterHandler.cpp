@@ -441,13 +441,17 @@ void WorldSession::HandleCharEnum(CharacterDatabaseQueryHolder const& holder)
     }
 
     // In-game Shop: which of this account's characters have been boosted, and which are class trials
-    // still waiting for a boost. The deleted-character enumeration rebuilds these too, and must not:
-    // it would wipe the sets the live list depends on.
+    // still waiting for a boost.
+    //
+    // MERGED, not replaced, and the deleted-character enumeration does not touch them at all. A class
+    // trial is recorded with an asynchronous write the moment the character is created, and the client
+    // re-enumerates immediately afterwards - the two run on different database connections, so the
+    // enumeration can legitimately read the account before that row has landed. Clearing here would
+    // then lose the marking for a character this session knows perfectly well it just created. Entries
+    // are removed where they actually stop being true: the boost erases the trial it consumed, and a
+    // deleted character simply stops appearing in the list.
     if (!charEnum.IsDeletedCharacters)
     {
-        _shopBoostedCharacters.clear();
-        _shopTrialCharacters.clear();
-
         if (PreparedQueryResult boostResult = holder.GetPreparedResult(EnumCharactersQueryHolder::SHOP_BOOSTS))
         {
             do
