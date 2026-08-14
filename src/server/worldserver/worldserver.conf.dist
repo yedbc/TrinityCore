@@ -1185,6 +1185,51 @@ ChallengeMode.Reward.LootId = 0
 ChallengeMode.Vault.LootId = 0
 
 #
+#    ChallengeMode.ScorePerLevel
+#    ChallengeMode.ScorePerAffix
+#    ChallengeMode.ScoreMaxTimeBonus
+#        Description: Mythic+ rating awarded for a timed run. score = keystoneLevel * ScorePerLevel
+#                     + affixCount * ScorePerAffix, plus a time bonus that runs from +ScoreMaxTimeBonus
+#                     for a 40%-under-par clear down to -ScoreMaxTimeBonus at or over par. These
+#                     constants are a server design value - they are not present in the client or in
+#                     DB2 - so they can be tuned to match a live sniff without a rebuild.
+#        Default:     7.5 - ChallengeMode.ScorePerLevel
+#                     5.0 - ChallengeMode.ScorePerAffix
+#                     7.5 - ChallengeMode.ScoreMaxTimeBonus
+#
+
+ChallengeMode.ScorePerLevel = 7.5
+ChallengeMode.ScorePerAffix = 5.0
+ChallengeMode.ScoreMaxTimeBonus = 7.5
+
+#
+#    Housing.EnableBuyHouse
+#    Housing.EnableDeleteHouse
+#    Housing.EnableMoveHouse
+#    Housing.EnableCreateCharterNeighborhood
+#    Housing.EnableCreateGuildNeighborhood
+#        Description: Per-operation gates for the player housing system. Each one gates the matching
+#                     client request; disabling a gate makes the server reject that operation.
+#        Default:     true - (Enabled)
+#                     false - (Disabled)
+#
+
+Housing.EnableBuyHouse = 1
+Housing.EnableDeleteHouse = 1
+Housing.EnableMoveHouse = 1
+Housing.EnableCreateCharterNeighborhood = 1
+Housing.EnableCreateGuildNeighborhood = 1
+
+#
+#    Housing.TutorialsEnabled
+#        Description: Send the housing tutorial/first-run prompts to the client.
+#        Default:     true - (Enabled)
+#                     false - (Disabled)
+#
+
+Housing.TutorialsEnabled = 1
+
+#
 #    Instance.UnloadDelay
 #        Description: Time (in milliseconds) before instance maps are unloaded from memory if no
 #                     characters are inside.
@@ -3032,26 +3077,42 @@ Battleground.Random.ResetHour = 6
 
 #
 #     Battleground.RewardWinnerHonorFirst
-#     Battleground.RewardWinnerConquestFirst
 #     Battleground.RewardWinnerHonorLast
-#     Battleground.RewardWinnerConquestLast
 #     Battleground.RewardLoserHonorFirst
 #     Battleground.RewardLoserHonorLast
-#        Description: Random Battlegrounds / call to the arms rewards.
-#        Default:     30 - Battleground.RewardWinnerHonorFirst
-#                     25 - Battleground.RewardWinnerArenaFirst
-#                     15 - Battleground.RewardWinnerHonorLast
-#                     0  - Battleground.RewardWinnerArenaLast
-#                     5  - Battleground.RewardLoserHonorFirst
-#                     5  - Battleground.RewardLoserHonorLast
+#        Description: Honor paid on completion of a random battleground or a battleground
+#                     currently flagged as Call to Arms. These are FLAT HONOR AMOUNTS, not
+#                     honorable-kill counts - the value is handed to Player::AddHonorXP as-is.
+#                     Normal (non-random, non-holiday) battlegrounds pay no completion honor.
+#                     "First" applies to the first random-battleground win of the day,
+#                     "Last" to every win after that. Rate.Honor still scales the result.
+#        Default:     270 - Battleground.RewardWinnerHonorFirst
+#                     135 - Battleground.RewardWinnerHonorLast
+#                     45  - Battleground.RewardLoserHonorFirst
+#                     35  - Battleground.RewardLoserHonorLast
 #
 
-Battleground.RewardWinnerHonorFirst     = 27000
-Battleground.RewardWinnerConquestFirst  = 10000
-Battleground.RewardWinnerHonorLast      = 13500
-Battleground.RewardWinnerConquestLast   = 5000
-Battleground.RewardLoserHonorFirst      = 4500
-Battleground.RewardLoserHonorLast       = 3500
+Battleground.RewardWinnerHonorFirst     = 270
+Battleground.RewardWinnerHonorLast      = 135
+Battleground.RewardLoserHonorFirst      = 45
+Battleground.RewardLoserHonorLast       = 35
+
+#
+#     Battleground.RewardWinnerConquestFirst / Battleground.RewardWinnerConquestLast
+#        REMOVED. Both keys were declared and parsed but read by no code whatsoever, so they
+#        never awarded anything. They described a Cataclysm mechanic (random battlegrounds
+#        paying Conquest) that retail no longer has: in 12.0.x Conquest comes from rated PvP
+#        only. They were not reinstated because the numbers cannot be sourced honestly:
+#          - Conquest is CurrencyTypes.db2 record 1602, flag _100_Scaler set, so quantities
+#            are stored x100 (the old 10000/5000 above were 100/50 Conquest).
+#          - It has MaxQty = 0 and MaxEarnablePerWeek = 0, and does NOT set
+#            ComputedWeeklyMaximum, so no cap is obtainable from DB2.
+#          - Its real cap is season-driven and server-pushed via world state 29688
+#            ("Conquest - Midnight Season 1 (Currency) - Max quantity"), which is 0 in our
+#            world DB. PvpSeason.db2 carries no cap field either.
+#        Implementing rated-PvP Conquest therefore needs a season/cap source first; until then
+#        a config key here would only promise a reward that nothing pays.
+#
 
 #
 #    Battleground.ReportAFK

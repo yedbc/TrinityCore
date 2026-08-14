@@ -716,8 +716,13 @@ void Battleground::EndBattleground(Team winner)
         player->RemoveAura(SPELL_HONORABLE_DEFENDER_25Y);
         player->RemoveAura(SPELL_HONORABLE_DEFENDER_60Y);
 
-        uint32 winnerKills = player->GetRandomWinner() ? sWorld->getIntConfig(CONFIG_BG_REWARD_WINNER_HONOR_LAST) : sWorld->getIntConfig(CONFIG_BG_REWARD_WINNER_HONOR_FIRST);
-        uint32 loserKills = player->GetRandomWinner() ? sWorld->getIntConfig(CONFIG_BG_REWARD_LOSER_HONOR_LAST) : sWorld->getIntConfig(CONFIG_BG_REWARD_LOSER_HONOR_FIRST);
+        // Battleground.RewardWinnerHonor*/RewardLoserHonor* are flat honor amounts, exactly as their
+        // names say - not honorable-kill counts. They used to be kill counts (30/15/5) and were fed to
+        // GetBonusHonorFromKill(); the 4.3.4 merge ce742dc7a07 rescaled the values to Cataclysm honor
+        // *currency* units (27000 = 270 honor at that era's 100x currency scaler) without changing the
+        // call, so every win paid hk_honor_at_level(80, 27000) = ceil(27000 * 80 * 1.55) ~ 3.35M honor.
+        uint32 winnerHonor = player->GetRandomWinner() ? sWorld->getIntConfig(CONFIG_BG_REWARD_WINNER_HONOR_LAST) : sWorld->getIntConfig(CONFIG_BG_REWARD_WINNER_HONOR_FIRST);
+        uint32 loserHonor = player->GetRandomWinner() ? sWorld->getIntConfig(CONFIG_BG_REWARD_LOSER_HONOR_LAST) : sWorld->getIntConfig(CONFIG_BG_REWARD_LOSER_HONOR_FIRST);
 
         if (isBattleground() && sWorld->getBoolConfig(CONFIG_BATTLEGROUND_STORE_STATISTICS_ENABLE))
         {
@@ -758,7 +763,7 @@ void Battleground::EndBattleground(Team winner)
                     if (!player->GetRandomWinner())
                         source = BattlegroundMgr::IsRandomBattleground(bgPlayer->queueTypeId.BattlemasterListId) ? HonorGainSource::RandomBGCompletion : HonorGainSource::HolidayBGCompletion;
 
-                    UpdatePlayerScore(player, SCORE_BONUS_HONOR, GetBonusHonorFromKill(winnerKills), true, source);
+                    UpdatePlayerScore(player, SCORE_BONUS_HONOR, winnerHonor, true, source);
                     if (!player->GetRandomWinner())
                     {
                         player->SetRandomWinner(true);
@@ -788,7 +793,7 @@ void Battleground::EndBattleground(Team winner)
             {
                 if (BattlegroundMgr::IsRandomBattleground(bgPlayer->queueTypeId.BattlemasterListId)
                     || BattlegroundMgr::IsBGWeekend(BattlegroundTypeId(bgPlayer->queueTypeId.BattlemasterListId)))
-                    UpdatePlayerScore(player, SCORE_BONUS_HONOR, GetBonusHonorFromKill(loserKills), true, HonorGainSource::BGCompletion);
+                    UpdatePlayerScore(player, SCORE_BONUS_HONOR, loserHonor, true, HonorGainSource::BGCompletion);
             }
         }
 
