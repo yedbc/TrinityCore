@@ -120,7 +120,9 @@ enum ConditionTypes
     CONDITION_STRING_ID                = 58,
     CONDITION_LABEL                    = 59,                   // Label                  0              0                  true if creature/gameobject has specified Label in CreatureLabel.db2/GameObjectLabel.db2
     CONDITION_CHROMIE_TIME             = 60,                   // expansionId            0              0                  true if player has selected Chromie Time expansion (0 = any)
-    // Do NOT renumber 61/62 without also updating
+    // 60 is CONDITION_CHROMIE_TIME upstream (origin/integration carries it; this branch predates that merge).
+    // Reserved so the ConditionTypeInfo table below stays index-aligned with these values and so a merge
+    // into an assembly that has Chromie Time does not collide. Do NOT renumber 61/62 without also updating
     // sql/updates/world/master/2026_08_07_30_covenant_choice_conditions.sql, which encodes CONDITION_COVENANT.
     CONDITION_GROUP_STATUS             = 61,                   // GroupStatus            0              0                  true if player group status is (0 = not in group, 1 = in group, 2 = in group but not in raid, 3 = in raid group, 4 = not in group or not in raid)
     // ConditionValue2 is a MINIMUM RENOWN LEVEL and is optional (0 = membership test only, the original meaning).

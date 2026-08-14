@@ -36,7 +36,10 @@
 #include "ItemBonusMgr.h"
 #include "LanguageMgr.h"
 #include "Log.h"
+#include "ChallengeMode.h"
+#include "ChallengeModeMgr.h"
 #include "Map.h"
+#include "MythicPlusData.h"
 #include "MapManager.h"
 #include "MapUtils.h"
 #include "ObjectMgr.h"
@@ -581,13 +584,6 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::SellItemsToVendors:
         case CriteriaType::ReachMaxLevel:
         case CriteriaType::LearnTaxiNode:
-        // --- housing
-        case CriteriaType::PlaceDecor:
-        case CriteriaType::RemoveDecor:
-        case CriteriaType::CollectUniqueDecor:
-        // --- crafting orders
-        case CriteriaType::FulfillAnyCraftingOrder:
-        case CriteriaType::FulfillCraftingOrderType:
         // --- garrison (all four live garrison types: WoD 2 / Order Hall 3 / War Campaign 9 / Covenant 111)
         case CriteriaType::PlaceAnyGarrisonBuilding:
         case CriteriaType::AcquireGarrison:
@@ -604,6 +600,26 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::StartResearchAnyGarrisonTalent:
         case CriteriaType::CompleteResearchAnyGarrisonTalent:
         case CriteriaType::SocketAnySoulbindConduit:
+        // --- mythic keystone: one tick per completed run
+        case CriteriaType::MythicPlusCompleted:
+        case CriteriaType::CompleteAnyChallengeMode:
+        // --- housing
+        case CriteriaType::PlaceDecor:
+        case CriteriaType::RemoveDecor:
+        case CriteriaType::CollectUniqueDecor:
+        // --- collections
+        case CriteriaType::LearnAnyToy:
+        case CriteriaType::LearnAnyTransmogIllusion:
+        // --- crafting orders
+        case CriteriaType::FulfillAnyCraftingOrder:
+        case CriteriaType::FulfillCraftingOrderType:
+        // --- guild
+        case CriteriaType::GuildTabardCreated:
+        // --- quests
+        case CriteriaType::CompleteAnyWorldQuest:
+        case CriteriaType::CompleteTrackingQuest:
+        // --- reputation
+        case CriteriaType::ParagonLevelIncreaseWithFaction:
             SetCriteriaProgress(criteria, 1, referencePlayer, PROGRESS_ACCUMULATE);
             break;
         // std case: increment at miscValue1
@@ -624,6 +640,11 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::EarnArtifactXPForAzeriteItem:
         case CriteriaType::GainLevels:
         case CriteriaType::EarnArtifactXP:
+        // guild-bank copper spent on repairs, guild achievement points
+        case CriteriaType::MoneySpentOnGuildRepair:
+        case CriteriaType::EarnGuildAchievementPoints:
+        // honor actually awarded (Player::RewardHonor)
+        case CriteriaType::PlayerHasEarnedHonor:
             SetCriteriaProgress(criteria, miscValue1, referencePlayer, PROGRESS_ACCUMULATE);
             break;
         case CriteriaType::KillCreature:
@@ -632,6 +653,8 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::AcquireItem:
         case CriteriaType::LootItem:
         case CriteriaType::CurrencyGained:
+        // miscValue1 = FactionID (matched in RequirementsSatisfied), miscValue2 = the reputation GAINED
+        case CriteriaType::ReputationAmountGained:
             SetCriteriaProgress(criteria, miscValue2, referencePlayer, PROGRESS_ACCUMULATE);
             break;
         // std case: high value at miscValue1
@@ -643,6 +666,8 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::HighestHealReceived:
         case CriteriaType::AnyArtifactPowerRankPurchased:
         case CriteriaType::AzeriteLevelReached:
+        // overall Mythic+ rating (sum of best runs); the required score lives in the CriteriaTree Amount
+        case CriteriaType::MythicPlusRatingAttained:
             SetCriteriaProgress(criteria, miscValue1, referencePlayer, PROGRESS_HIGHEST);
             break;
         case CriteriaType::ReachRenownLevel:
@@ -745,10 +770,17 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::StartResearchGarrisonTalent:
         case CriteriaType::CompleteResearchGarrisonTalent:
         case CriteriaType::SocketGarrisonTalent:
+        case CriteriaType::CompleteChallengeMode:
+        case CriteriaType::LearnToy:
+        case CriteriaType::LearnTransmog:
             SetCriteriaProgress(criteria, 1, referencePlayer);
             break;
         case CriteriaType::BankSlotsPurchased:
             SetCriteriaProgress(criteria, referencePlayer->GetBankBagSlotCount(), referencePlayer);
+            break;
+        case CriteriaType::GuildBankTabsPurchased:
+            // miscValue1 = the guild's purchased bank tab count after the purchase (running total)
+            SetCriteriaProgress(criteria, miscValue1, referencePlayer);
             break;
         case CriteriaType::ReputationGained:
         {
@@ -855,14 +887,10 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::RunInstance:
         case CriteriaType::EarnTeamArenaRating:
         case CriteriaType::EarnTitle:
-        case CriteriaType::MoneySpentOnGuildRepair:
         case CriteriaType::CreatedItemsByCastingSpell:
         case CriteriaType::FishInAnyPool:
-        case CriteriaType::GuildBankTabsPurchased:
-        case CriteriaType::EarnGuildAchievementPoints:
         case CriteriaType::WinAnyBattleground:
         case CriteriaType::EarnBattlegroundRating:
-        case CriteriaType::GuildTabardCreated:
         case CriteriaType::CompleteQuestsCountForGuild:
         case CriteriaType::HonorableKillsForGuild:
         case CriteriaType::KillAnyCreatureForGuild:
@@ -875,14 +903,10 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::KickVoterInLFRDungeon:
         case CriteriaType::KickTargetInLFRDungeon:
         case CriteriaType::GroupedTankLeftEarlyInLFRDungeon:
-        case CriteriaType::LearnToy:
-        case CriteriaType::LearnAnyToy:
         case CriteriaType::FindResearchObject:
         case CriteriaType::ExhaustAnyResearchSite:
         case CriteriaType::CompleteInternalCriteria:
-        case CriteriaType::CompleteAnyChallengeMode:
         case CriteriaType::KilledAllUnitsInSpawnRegion:
-        case CriteriaType::CompleteChallengeMode:
         case CriteriaType::CreatedItemsByCastingSpellWithLimit:
         case CriteriaType::BattlePetAchievementPointsEarned:
         case CriteriaType::ReleasedSpirit:
@@ -892,15 +916,10 @@ void CriteriaHandler::UpdateCriteria(Criteria const* criteria, uint64 miscValue1
         case CriteriaType::KickTargetInLFGDungeon:
         case CriteriaType::AbandonedLFGDungeon:
         case CriteriaType::GroupedTankLeftEarlyInLFGDungeon:
-        case CriteriaType::CompleteAnyWorldQuest:
-        case CriteriaType::ParagonLevelIncreaseWithFaction:
-        case CriteriaType::PlayerHasEarnedHonor:
         case CriteriaType::ChooseRelicTalent:
         case CriteriaType::AccountHonorLevelReached:
-        case CriteriaType::MythicPlusCompleted:
         case CriteriaType::ObtainAnyItemWithCurrencyValue:
         case CriteriaType::EarnExpansionLevel:
-        case CriteriaType::LearnTransmog:
         default:
             break;                          // Not implemented yet :(
     }
@@ -1579,6 +1598,7 @@ bool CriteriaHandler::RequirementsSatisfied(Criteria const* criteria, uint64 mis
         case CriteriaType::LootItem:
         case CriteriaType::EquipItem:
         case CriteriaType::LearnHeirloom:
+        case CriteriaType::LearnToy:
             if (!miscValue1 || uint32(criteria->Entry->Asset.ItemID )!= miscValue1)
                 return false;
             break;
@@ -1746,6 +1766,23 @@ bool CriteriaHandler::RequirementsSatisfied(Criteria const* criteria, uint64 mis
             if (miscValue1 != uint32(criteria->Entry->Asset.TaxiNodesID))
                 return false;
             break;
+        case CriteriaType::CompleteChallengeMode:
+            // Asset = MapID of the keystone dungeon; miscValue1 = the map that was completed.
+            if (!miscValue1 || miscValue1 != uint32(criteria->Entry->Asset.MapID))
+                return false;
+            break;
+        case CriteriaType::ParagonLevelIncreaseWithFaction:
+        case CriteriaType::ReputationAmountGained:
+            // Asset = FactionID. ReputationAmountGained accumulates miscValue2 (the gain), so it must be > 0.
+            if (!miscValue1 || miscValue1 != uint32(criteria->Entry->Asset.FactionID))
+                return false;
+            if (CriteriaType(criteria->Entry->Type) == CriteriaType::ReputationAmountGained && !miscValue2)
+                return false;
+            break;
+        case CriteriaType::LearnTransmog:
+            if (!miscValue1 || miscValue1 != uint32(criteria->Entry->Asset.ItemModifiedAppearanceID))
+                return false;
+            break;
         case CriteriaType::FulfillCraftingOrderType:
             // Asset = {CraftingOrderType} (0 public / 1 guild / 2 personal / 3 npc) == CraftingOrders::OrderType.
             if (uint32(miscValue1) != uint32(criteria->Entry->Asset.ID))
@@ -1800,10 +1837,25 @@ bool CriteriaHandler::RequirementsSatisfied(Criteria const* criteria, uint64 mis
         case CriteriaType::StartResearchAnyGarrisonTalent:
         case CriteriaType::CompleteResearchAnyGarrisonTalent:
         case CriteriaType::SocketAnySoulbindConduit:
+            // No asset - the ModifierTree does the discriminating, but it needs a real subject id in
+            // miscValue1 (GarrFollower / GarrTalent / SoulbindConduit / GarrBuilding).
+        case CriteriaType::MythicPlusCompleted:
+        case CriteriaType::CompleteAnyChallengeMode:
+        case CriteriaType::MythicPlusRatingAttained:
+        // No asset - the ModifierTree discriminates, but it needs a real HouseDecor entry in miscValue1.
         case CriteriaType::PlaceDecor:
         case CriteriaType::RemoveDecor:
         case CriteriaType::CollectUniqueDecor:
+        case CriteriaType::LearnAnyToy:
+        case CriteriaType::LearnAnyTransmogIllusion:
         case CriteriaType::FulfillAnyCraftingOrder:
+        case CriteriaType::MoneySpentOnGuildRepair:
+        case CriteriaType::EarnGuildAchievementPoints:
+        case CriteriaType::GuildBankTabsPurchased:
+        case CriteriaType::GuildTabardCreated:
+        case CriteriaType::CompleteAnyWorldQuest:
+        case CriteriaType::CompleteTrackingQuest:
+        case CriteriaType::PlayerHasEarnedHonor:
             if (!miscValue1)
                 return false;
             break;
@@ -3394,8 +3446,11 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
                 return false;
             break;
         }
-        case ModifierTreeType::PlayerCreatedCharacterLessThanHoursAgoRealTime: // 204 NYI
-            return false;
+        case ModifierTreeType::PlayerCreatedCharacterLessThanHoursAgoRealTime: // 204
+            // Wall-clock age of the character, as opposed to the played-time variant below.
+            if (referencePlayer->GetCharacterCreateTime() + int64(Hours(reqValue).count()) * int64(HOUR) <= GameTime::GetGameTime())
+                return false;
+            break;
         case ModifierTreeType::PlayerCreatedCharacterLessThanHoursAgoGameTime: // 205
             if (Hours(reqValue) >= Seconds(referencePlayer->GetTotalPlayedTime()))
                 return false;
@@ -3708,12 +3763,45 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
             if (!referencePlayer->CanEnableWarModeInArea())
                 return false;
             break;
-        case ModifierTreeType::MythicPlusKeystoneLevelEqualOrGreaterThan: // 247 NYI
-        case ModifierTreeType::MythicPlusCompletedInTime: // 248 NYI
-        case ModifierTreeType::MythicPlusMapChallengeMode: // 249 NYI
+        case ModifierTreeType::MythicPlusKeystoneLevelEqualOrGreaterThan: // 247
+        {
+            InstanceMap* instanceMap = referencePlayer->GetMap()->ToInstanceMap();
+            ChallengeMode* challenge = instanceMap ? instanceMap->GetChallengeMode() : nullptr;
+            if (!challenge || (!challenge->IsActive() && !challenge->IsCompleted()) || challenge->GetKeystoneLevel() < reqValue)
+                return false;
+            break;
+        }
+        case ModifierTreeType::MythicPlusCompletedInTime: // 248
+        {
+            InstanceMap* instanceMap = referencePlayer->GetMap()->ToInstanceMap();
+            ChallengeMode* challenge = instanceMap ? instanceMap->GetChallengeMode() : nullptr;
+            // "In time" only means anything for a run that has actually finished - an active run that
+            // is merely still under par has not completed in time yet.
+            if (!challenge || !challenge->IsCompleted())
+                return false;
+            if (!challenge->GetTimeLimitMs() || challenge->GetEffectiveTimeMs() > challenge->GetTimeLimitMs())
+                return false;
+            break;
+        }
+        case ModifierTreeType::MythicPlusMapChallengeMode: // 249
+        {
+            InstanceMap* instanceMap = referencePlayer->GetMap()->ToInstanceMap();
+            ChallengeMode* challenge = instanceMap ? instanceMap->GetChallengeMode() : nullptr;
+            if (!challenge || challenge->GetMapChallengeModeId() != reqValue)
+                return false;
+            break;
+        }
         case ModifierTreeType::MythicPlusDisplaySeason: // 250 NYI
-        case ModifierTreeType::MythicPlusMilestoneSeason: // 251 NYI
+            // Needs DisplaySeason.db2, which this core does not load; the active MythicPlusSeason id uses a
+            // different numbering. Guessing the mapping would silently mis-gate every seasonal achievement.
             return false;
+        case ModifierTreeType::MythicPlusMilestoneSeason: // 251
+        {
+            MythicPlusSeasonEntry const* season = sChallengeModeMgr.GetActiveSeason();
+            if (!season || season->MilestoneSeason != int32(reqValue))
+                return false;
+            break;
+        }
         case ModifierTreeType::PlayerVisibleRace: // 252
         {
             CreatureDisplayInfoEntry const* creatureDisplayInfo = sCreatureDisplayInfoStore.LookupEntry(referencePlayer->GetDisplayId());
@@ -4145,9 +4233,21 @@ bool CriteriaHandler::ModifierSatisfied(ModifierTreeEntry const* modifier, uint6
         case ModifierTreeType::CurrencySpentOnGarrisonTalentResearchEqualOrGreaterThan: // 318 NYI
         case ModifierTreeType::RenownCatchupActive: // 319 NYI
         case ModifierTreeType::RapidRenownCatchupActive: // 320 NYI
-        case ModifierTreeType::PlayerMythicPlusRatingEqualOrGreaterThan: // 321 NYI
-        case ModifierTreeType::PlayerMythicPlusRunCountInCurrentExpansionEqualOrGreaterThan: // 322 NYI
             return false;
+        case ModifierTreeType::PlayerMythicPlusRatingEqualOrGreaterThan: // 321
+        {
+            MythicPlusData* mythicPlus = referencePlayer->GetMythicPlusData();
+            if (!mythicPlus || mythicPlus->GetOverallScore() < float(reqValue))
+                return false;
+            break;
+        }
+        case ModifierTreeType::PlayerMythicPlusRunCountInCurrentExpansionEqualOrGreaterThan: // 322
+        {
+            MythicPlusData* mythicPlus = referencePlayer->GetMythicPlusData();
+            if (!mythicPlus || mythicPlus->GetBestRuns().size() < reqValue)
+                return false;
+            break;
+        }
         case ModifierTreeType::PlayerHasCustomizationChoice: // 323
         {
             int32 customizationChoiceIndex = referencePlayer->m_playerData->Customizations.FindIndexIf([reqValue](UF::ChrCustomizationChoice const& choice)
@@ -5413,27 +5513,27 @@ std::span<CriteriaType const> CriteriaMgr::GetRetroactivelyUpdateableCriteriaTyp
         //CriteriaType::AccountKnownPet,  /*NYI*/
         CriteriaType::LearnTradeskillSkillLine,
         CriteriaType::HonorableKills,
-        //CriteriaType::GuildBankTabsPurchased, /*NYI*/
-        //CriteriaType::EarnGuildAchievementPoints, /*NYI*/
+        //CriteriaType::GuildBankTabsPurchased, // implemented, but event-driven only (Guild::HandleBuyBankTab)
+        //CriteriaType::EarnGuildAchievementPoints, // implemented, but event-driven only (GuildAchievementMgr::CompletedAchievement)
         //CriteriaType::EarnBattlegroundRating, /*NYI*/
-        //CriteriaType::GuildTabardCreated, /*NYI*/
+        //CriteriaType::GuildTabardCreated, // implemented, but event-driven only (Guild::HandleSetEmblem)
         CriteriaType::LearnedNewPet,
         CriteriaType::UniquePetsOwned,
         //CriteriaType::UpgradeGarrison, // implemented, but event-driven only (Garrison::Upgrade)
         //CriteriaType::AcquireGarrison, // implemented, but event-driven only (Garrison::Create)
         //CriteriaType::LearnGarrisonBlueprint, // implemented, but event-driven only (Garrison::LearnBlueprint)
         //CriteriaType::LearnGarrisonSpecialization, // implemented, but event-driven only (Garrison::LearnSpecialization)
-        //CriteriaType::LearnToy, /*NYI*/ // Learn Toy "{Item}"
-        //CriteriaType::LearnAnyToy, /*NYI*/ // Learn Any Toy
-        //CriteriaType::LearnTransmog, /*NYI*/
+        //CriteriaType::LearnToy, // implemented, but event-driven only (CollectionMgr::AddToy)
+        //CriteriaType::LearnAnyToy, // implemented, but event-driven only (CollectionMgr::AddToy)
+        //CriteriaType::LearnTransmog, // implemented, but event-driven only (CollectionMgr::AddItemAppearance)
         CriteriaType::HonorLevelIncrease,
         //CriteriaType::AccountHonorLevelReached, /*NYI*/
         CriteriaType::ReachMaxLevel,
         //CriteriaType::MemorizeSpell, /*NYI*/
         //CriteriaType::LearnTransmogIllusion, /*NYI*/
-        //CriteriaType::MythicPlusRatingAttained, /*NYI*/
+        //CriteriaType::MythicPlusRatingAttained, // implemented, but event-driven only (ChallengeMode::Complete)
         //CriteriaType::MythicPlusDisplaySeasonEnded, /*NYI*/
-        //CriteriaType::CompleteTrackingQuest, /*NYI*/
+        //CriteriaType::CompleteTrackingQuest, // implemented, but event-driven only (Player::RewardQuest)
         CriteriaType::BankTabPurchased,
         CriteriaType::LearnTaxiNode,
 

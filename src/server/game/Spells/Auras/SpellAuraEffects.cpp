@@ -6017,7 +6017,11 @@ void AuraEffect::HandlePeriodicManaLeechAuraTick(Unit* target, Unit* caster) con
 
 void AuraEffect::HandleObsModPowerAuraTick(Unit* target, Unit* caster) const
 {
-    Powers powerType = Powers(GetMiscValue());
+    Powers powerType;
+    if (GetMiscValue() == POWER_ALL)
+        powerType = target->GetPowerType();
+    else
+        powerType = Powers(GetMiscValue());
 
     if (!target->IsAlive() || !target->GetMaxPower(powerType))
         return;

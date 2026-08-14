@@ -19,6 +19,7 @@
 #include "AccountMgr.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
+#include "BnetBlockListMgr.h"
 #include "Chat.h"
 #include "ChatPackets.h"
 #include "Common.h"
@@ -141,6 +142,15 @@ void WorldSession::HandleChatMessageChannelOpcode(WorldPackets::Chat::ChatMessag
 void WorldSession::HandleChatMessageEmoteOpcode(WorldPackets::Chat::ChatMessageEmote& chatMessageEmote)
 {
     HandleChatMessage(CHAT_MSG_EMOTE, LANG_UNIVERSAL, chatMessageEmote.Text);
+}
+
+// Tells the client that the group channel it addressed does not exist for it right now. The single
+// retail sample carries the requested chat type verbatim (CHAT_MSG_PARTY), which is what the client
+// needs to know which chat frame to complain about.
+void WorldSession::SendChatNotInParty(ChatMsg type)
+{
+    WorldPackets::Chat::ChatNotInParty chatNotInParty(type);
+    SendPacket(chatNotInParty.Write());
 }
 
 ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, std::string msg, std::string target /*= ""*/, Optional<ObjectGuid> targetGuid /*= {}*/)
@@ -322,6 +332,15 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
                 return ChatMessageResult::NoWhisperTarget;
             }
 
+            // block_list.v1 is account scope, one level above PlayerSocial's per-character ignore:
+            // blocking a battlenet account silences every character behind it, in both directions.
+            // The sender is told the same thing retail tells them - the target is not there.
+            if (sBnetBlockListMgr->IsBlockedEitherWay(GetBattlenetAccountId(), receiver->GetSession()->GetBattlenetAccountId()))
+            {
+                SendChatPlayerNotfoundNotice(target);
+                return ChatMessageResult::NoWhisperTarget;
+            }
+
             // Apply checks only if receiver is not already in whitelist and if receiver is not a GM with ".whisper on"
             if (!receiver->IsInWhisperWhiteList(sender->GetGUID()) && !receiver->IsGameMasterAcceptingWhispers())
             {
@@ -362,7 +381,10 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
             {
                 group = sender->GetGroup();
                 if (!group || group->isBGGroup())
+                {
+                    SendChatNotInParty(type);
                     return ChatMessageResult::NotInGroup;
+                }
             }
 
             type = group->IsLeader(sender->GetGUID()) ? CHAT_MSG_PARTY_LEADER : CHAT_MSG_PARTY;
@@ -416,7 +438,10 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
         {
             Group* group = GetPlayer()->GetGroup();
             if (!group || !group->isRaidGroup() || group->isBGGroup())
+            {
+                SendChatNotInParty(type);
                 return ChatMessageResult::NotInGroup;
+            }
 
             if (group->IsLeader(GetPlayer()->GetGUID()))
                 type = CHAT_MSG_RAID_LEADER;
@@ -435,7 +460,10 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
         {
             Group* group = GetPlayer()->GetGroup();
             if (!group)
+            {
+                SendChatNotInParty(type);
                 return ChatMessageResult::NotInGroup;
+            }
 
             if (group->isRaidGroup())
             {
@@ -482,7 +510,10 @@ ChatMessageResult WorldSession::HandleChatMessage(ChatMsg type, Language lang, s
         {
             Group* group = GetPlayer()->GetGroup();
             if (!group)
+            {
+                SendChatNotInParty(type);
                 return ChatMessageResult::NotInGroup;
+            }
 
             if (group->IsLeader(GetPlayer()->GetGUID()))
                 type = CHAT_MSG_INSTANCE_CHAT_LEADER;
@@ -601,7 +632,12 @@ void WorldSession::HandleChatAddonMessage(ChatMsg type, std::string prefix, std:
             {
                 group = sender->GetGroup();
                 if (!group)
+                {
+                    // this is the case retail was observed answering: an addon kept talking to PARTY
+                    // after the group broke up, and got told the channel is not available
+                    SendChatNotInParty(type);
                     break;
+                }
 
                 if (type == CHAT_MSG_PARTY)
                     subGroup = sender->GetSubGroup();

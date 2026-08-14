@@ -134,6 +134,14 @@ WorldPacket const* GossipMessage::Write()
     return &_worldPacket;
 }
 
+WorldPacket const* GossipQuestUpdate::Write()
+{
+    _worldPacket << GossipGUID;
+    _worldPacket << TextData;
+
+    return &_worldPacket;
+}
+
 ByteBuffer& operator<<(ByteBuffer& data, VendorItem const& item)
 {
     data << uint64(item.Price);
@@ -273,5 +281,11 @@ void SetPetSlot::Read()
     _worldPacket >> PetNumber;
     _worldPacket >> DestSlot;
     _worldPacket >> StableMaster;
+}
+
+void SetPetFavorite::Read()
+{
+    _worldPacket >> SlotID;                 // raw uint8 stable slot (client serializer 0x6A51C0)
+    IsFavorite = _worldPacket.ReadBit();
 }
 }

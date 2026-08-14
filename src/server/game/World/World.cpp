@@ -32,9 +32,14 @@
 #include "PetBattleMgr.h"
 #include "BattlefieldMgr.h"
 #include "DelveMgr.h"
+#include "DelvesRewards.h"
 #include "BattlegroundMgr.h"
 #include "BattlenetRpcErrorCodes.h"
 #include "BlackMarketMgr.h"
+#include "BnetFriendsMgr.h"
+#include "BnetBlockListMgr.h"
+#include "BnetPresenceMgr.h"
+#include "NotificationService.h"
 #include "CalendarMgr.h"
 #include "ChannelMgr.h"
 #include "CharacterCache.h"
@@ -58,6 +63,8 @@
 #include "GameTables.h"
 #include "GameTime.h"
 #include "ChallengeModeMgr.h"
+#include "ItemConversionMgr.h"
+#include "ItemUpgradeMgr.h"
 #include "Garrison.h"
 #include "GarrisonMgr.h"
 #include "GitRevision.h"
@@ -73,6 +80,7 @@
 #include "ContributionMgr.h"
 #include "CraftingOrderMgr.h"
 #include "ClubFinderMgr.h"
+#include "ClubStreamHistoryMgr.h"
 #include "LFGListMgr.h"
 #include "LFGMgr.h"
 #include "Language.h"
@@ -85,6 +93,7 @@
 #include "MMapManager.h"
 #include "Map.h"
 #include "MapManager.h"
+#include "MajorFactionMgr.h"
 #include "MapUtils.h"
 #include "Metric.h"
 #include "MiscPackets.h"
@@ -127,6 +136,7 @@
 #include "PlayerbotV2.h"
 #endif
 #include "WowTokenMgr.h"
+#include "PreyMgr.h"
 #include <zlib.h>
 
 TC_GAME_API std::atomic<bool> World::m_stopEvent(false);
@@ -408,12 +418,21 @@ void World::AddSession_(WorldSession* s)
                 decrease_session = false;
             // not remove replaced session form queue if listed
             Trinity::Containers::MultimapErasePair(m_sessionsByBnetGuid, old->second->GetBattlenetAccountGUID(), old->second);
+            // Battle.net presence / block list / notification subscriptions are keyed by game account
+            // id, so the replaced session's entries must go before the id is handed to the new session.
+            sBnetPresenceMgr->OnSessionOffline(old->second);
+            sBnetBlockListMgr->OnSessionClosed(old->second);
+            Battlenet::Services::NotificationServiceV1::OnSessionClosed(old->second);
             delete old->second;
         }
     }
 
     m_sessions[s->GetAccountId()] = s;
     m_sessionsByBnetGuid.emplace(s->GetBattlenetAccountGUID(), s);
+
+    // The battlenet account is reachable from here on, even while the player is still at character
+    // select, which is exactly the state presence.v1/v2 subscribers are told about.
+    sBnetPresenceMgr->OnSessionOnline(s);
 
     uint32 Sessions = GetActiveAndQueuedSessionCount();
     uint32 pLimit = GetPlayerAmountLimit();
@@ -666,6 +685,7 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "Battleground.QueueAnnouncer.Enable"sv, .DefaultValue = false, .Index = CONFIG_BATTLEGROUND_QUEUE_ANNOUNCER_ENABLE },
         { .Name = "Battleground.QueueAnnouncer.PlayerOnly"sv, .DefaultValue = false, .Index = CONFIG_BATTLEGROUND_QUEUE_ANNOUNCER_PLAYERONLY },
         { .Name = "Battleground.StoreStatistics.Enable"sv, .DefaultValue = false, .Index = CONFIG_BATTLEGROUND_STORE_STATISTICS_ENABLE },
+        { .Name = "Brawl.Enabled"sv, .DefaultValue = true, .Index = CONFIG_BRAWL_ENABLED },
         { .Name = "Battleground.GiveXPForKills"sv, .DefaultValue = false, .Index = CONFIG_BG_XP_FOR_KILL },
         { .Name = "Arena.QueueAnnouncer.Enable"sv, .DefaultValue = false, .Index = CONFIG_ARENA_QUEUE_ANNOUNCER_ENABLE },
         { .Name = "Arena.ArenaSeason.InProgress"sv, .DefaultValue = false, .Index = CONFIG_ARENA_SEASON_IN_PROGRESS },
@@ -685,6 +705,12 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "ShowMuteInWorld"sv, .DefaultValue = false, .Index = CONFIG_SHOW_MUTE_IN_WORLD },
         { .Name = "ShowBanInWorld"sv, .DefaultValue = false, .Index = CONFIG_SHOW_BAN_IN_WORLD },
         { .Name = "FeatureSystem.CharacterUndelete.Enabled"sv, .DefaultValue = false, .Index = CONFIG_FEATURE_SYSTEM_CHARACTER_UNDELETE_ENABLED },
+        // Recruit A Friend. The full 5-CMSG/4-SMSG surface is implemented in ReferAFriendHandler.cpp; these two bits
+        // are what the client's C_RecruitAFriend.IsEnabled() / IsRecruitingEnabled() read to un-grey the RAF panel.
+        { .Name = "FeatureSystem.RecruitAFriend.Enabled"sv, .DefaultValue = true, .Index = CONFIG_FEATURE_RAF_ENABLED },
+        { .Name = "FeatureSystem.RecruitAFriend.RecruitingEnabled"sv, .DefaultValue = true, .Index = CONFIG_FEATURE_RAF_RECRUITING_ENABLED },
+        // War games. Backed by HandleStartWarGame / HandleAcceptWargameInvite + BattlegroundQueue::AddWargameSide.
+        { .Name = "FeatureSystem.WarGames.Enabled"sv, .DefaultValue = true, .Index = CONFIG_FEATURE_WARGAMES_ENABLED },
         { .Name = "DBC.EnforceItemAttributes"sv, .DefaultValue = true, .Index = CONFIG_DBC_ENFORCE_ITEM_ATTRIBUTES },
         { .Name = "InstancesResetAnnounce"sv, .DefaultValue = false, .Index = CONFIG_INSTANCES_RESET_ANNOUNCE },
         { .Name = "AutoBroadcast.On"sv, .DefaultValue = false, .Index = CONFIG_AUTOBROADCAST },
@@ -712,12 +738,6 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "AllowLoggingIPAddressesInDatabase"sv, .DefaultValue = true, .Index = CONFIG_ALLOW_LOGGING_IP_ADDRESSES_IN_DATABASE },
         { .Name = "Loot.EnableAELoot"sv, .DefaultValue = true, .Index = CONFIG_ENABLE_AE_LOOT },
         { .Name = "Load.Locales"sv, .DefaultValue = true, .Index = CONFIG_LOAD_LOCALES },
-        { .Name = "Housing.EnableBuyHouse"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_BUY_HOUSE },
-        { .Name = "Housing.EnableDeleteHouse"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_DELETE_HOUSE },
-        { .Name = "Housing.EnableMoveHouse"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_MOVE_HOUSE },
-        { .Name = "Housing.EnableCreateCharterNeighborhood"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_CREATE_CHARTER_NEIGHBORHOOD },
-        { .Name = "Housing.EnableCreateGuildNeighborhood"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_CREATE_GUILD_NEIGHBORHOOD },
-        { .Name = "Housing.TutorialsEnabled"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_TUTORIALS_ENABLED },
         { .Name = "Shop.Enabled"sv, .DefaultValue = true, .Index = CONFIG_SHOP_ENABLED },
         { .Name = "Shop.Shop2Enabled"sv, .DefaultValue = false, .Index = CONFIG_SHOP_SHOP2_ENABLED },
         // Defaults ON, because the client cannot finish a purchase without it: Blizzard_Shared_StoreUISecure
@@ -728,6 +748,12 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "Shop.Entitlements.Enabled"sv, .DefaultValue = false, .Index = CONFIG_SHOP_ENTITLEMENTS_ENABLED },
         { .Name = "Shop.Entitlements.AssignEnabled"sv, .DefaultValue = false, .Index = CONFIG_SHOP_ENTITLEMENT_ASSIGN_ENABLED },
         { .Name = "WowToken.Market.Enabled"sv, .DefaultValue = false, .Index = CONFIG_WOW_TOKEN_MARKET_ENABLED },
+        { .Name = "Housing.EnableBuyHouse"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_BUY_HOUSE },
+        { .Name = "Housing.EnableDeleteHouse"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_DELETE_HOUSE },
+        { .Name = "Housing.EnableMoveHouse"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_MOVE_HOUSE },
+        { .Name = "Housing.EnableCreateCharterNeighborhood"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_CREATE_CHARTER_NEIGHBORHOOD },
+        { .Name = "Housing.EnableCreateGuildNeighborhood"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_ENABLE_CREATE_GUILD_NEIGHBORHOOD },
+        { .Name = "Housing.TutorialsEnabled"sv, .DefaultValue = true, .Index = CONFIG_HOUSING_TUTORIALS_ENABLED },
     } };
 
     static constexpr ConfigOptionLoadDefinitionArray<uint32, INT_CONFIG_VALUE_COUNT> ints =
@@ -856,6 +882,9 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "Battleground.ReportAFK"sv, .DefaultValue = 3, .Index = CONFIG_BATTLEGROUND_REPORT_AFK, .Min = 1, .Max = 9 },
         { .Name = "Battleground.InvitationType"sv, .DefaultValue = 0, .Index = CONFIG_BATTLEGROUND_INVITATION_TYPE },
         { .Name = "BattlegroundBlitz.HealersPerTeam"sv, .DefaultValue = 2, .Index = CONFIG_BATTLEGROUND_BLITZ_HEALERS_PER_TEAM, .Min = 0, .Max = 8 },
+        // PvpBrawl.db2 row 11 "Brawl: Deep Six" -> BattlemasterList 879 (BATTLEGROUND_BRAWL_DS).
+        { .Name = "Brawl.PvpBrawlID"sv, .DefaultValue = 11, .Index = CONFIG_BRAWL_PVP_BRAWL_ID },
+        { .Name = "Brawl.BattlemasterListID"sv, .DefaultValue = BATTLEGROUND_BRAWL_DS, .Index = CONFIG_BRAWL_BATTLEMASTER_LIST_ID },
         { .Name = "Battleground.PrematureFinishTimer"sv, .DefaultValue = 5 * MINUTE * IN_MILLISECONDS, .Index = CONFIG_BATTLEGROUND_PREMATURE_FINISH_TIMER },
         { .Name = "Battleground.PremadeGroupWaitForMatch"sv, .DefaultValue = 30 * MINUTE * IN_MILLISECONDS, .Index = CONFIG_BATTLEGROUND_PREMADE_GROUP_WAIT_FOR_MATCH },
         { .Name = "Arena.MaxRatingDifference"sv, .DefaultValue = 150, .Index = CONFIG_ARENA_MAX_RATING_DIFFERENCE },
@@ -870,6 +899,9 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "Guild.NewsLogRecordsCount"sv, .DefaultValue = GUILD_NEWSLOG_MAX_RECORDS, .Index = CONFIG_GUILD_NEWS_LOG_COUNT, .Max = GUILD_NEWSLOG_MAX_RECORDS },
         { .Name = "Guild.EventLogRecordsCount"sv, .DefaultValue = GUILD_EVENTLOG_MAX_RECORDS, .Index = CONFIG_GUILD_EVENT_LOG_COUNT, .Max = GUILD_EVENTLOG_MAX_RECORDS },
         { .Name = "Guild.BankEventLogRecordsCount"sv, .DefaultValue = GUILD_BANKLOG_MAX_RECORDS, .Index = CONFIG_GUILD_BANK_EVENT_LOG_COUNT, .Max = GUILD_BANKLOG_MAX_RECORDS },
+        // Club (guild/officer) chat scrollback retention. 0 messages disables history entirely; 0 days disables age based pruning.
+        { .Name = "Club.StreamHistory.MaxMessages"sv, .DefaultValue = 200, .Index = CONFIG_CLUB_STREAM_HISTORY_MAX_MESSAGES, .Max = 2000 },
+        { .Name = "Club.StreamHistory.MaxDays"sv, .DefaultValue = 30, .Index = CONFIG_CLUB_STREAM_HISTORY_MAX_DAYS },
         { .Name = "Visibility.Notify.Period.OnContinents"sv, .DefaultValue = DEFAULT_VISIBILITY_NOTIFY_PERIOD, .Index = CONFIG_VISIBILITY_NOTIFY_PERIOD_CONTINENT },
         { .Name = "Visibility.Notify.Period.InInstances"sv, .DefaultValue = DEFAULT_VISIBILITY_NOTIFY_PERIOD, .Index = CONFIG_VISIBILITY_NOTIFY_PERIOD_INSTANCE },
         { .Name = "Visibility.Notify.Period.InBG"sv, .DefaultValue = DEFAULT_VISIBILITY_NOTIFY_PERIOD, .Index = CONFIG_VISIBILITY_NOTIFY_PERIOD_BATTLEGROUND },
@@ -900,6 +932,11 @@ void World::LoadConfigSettings(bool reload)
         { .Name = "Command.LookupMaxResults"sv, .DefaultValue = 0, .Index = CONFIG_MAX_RESULTS_LOOKUP_COMMANDS },
         { .Name = "FeatureSystem.CharacterUndelete.Cooldown"sv, .DefaultValue = 2592000, .Index = CONFIG_FEATURE_SYSTEM_CHARACTER_UNDELETE_COOLDOWN },
         { .Name = "DungeonFinder.OptionsMask"sv, .DefaultValue = 1, .Index = CONFIG_LFG_OPTIONSMASK },
+        // Recruit A Friend tuning, mirroring retail RAF 3.0 (RewardsVersion 2).
+        { .Name = "FeatureSystem.RecruitAFriend.MaxRecruits"sv, .DefaultValue = 10, .Index = CONFIG_RAF_MAX_RECRUITS },
+        { .Name = "FeatureSystem.RecruitAFriend.MaxRecruitMonths"sv, .DefaultValue = 12, .Index = CONFIG_RAF_MAX_RECRUIT_MONTHS },
+        { .Name = "FeatureSystem.RecruitAFriend.MaxRecruitmentUses"sv, .DefaultValue = 10, .Index = CONFIG_RAF_MAX_RECRUITMENT_USES },
+        { .Name = "FeatureSystem.RecruitAFriend.DaysInCycle"sv, .DefaultValue = 30, .Index = CONFIG_RAF_DAYS_IN_CYCLE },
         { .Name = "Account.PasswordChangeSecurity"sv, .DefaultValue = 0, .Index = CONFIG_ACC_PASSCHANGESEC },
         { .Name = "Battleground.RewardWinnerHonorFirst"sv, .DefaultValue = 27000, .Index = CONFIG_BG_REWARD_WINNER_HONOR_FIRST },
         { .Name = "Battleground.RewardWinnerConquestFirst"sv, .DefaultValue = 10000, .Index = CONFIG_BG_REWARD_WINNER_CONQUEST_FIRST },
@@ -1359,6 +1396,11 @@ bool World::SetInitialWorldSettings()
     sDB2Manager.LoadHotfixOptionalData(m_availableDbcLocaleMask);
     TC_LOG_INFO("server.loading", "Indexing loaded data stores...");
     sDB2Manager.IndexLoadedStores();
+
+    ///- Index Major Factions (Phase 10) - depends on Faction, Covenant, RenownRewards, ParagonReputation
+    TC_LOG_INFO("server.loading", "Indexing Major Factions...");
+    sMajorFactionMgr->Load();
+
     ///- Load M2 fly by cameras
     LoadM2Cameras(m_dataPath);
     ///- Load GameTables
@@ -1571,6 +1613,9 @@ bool World::SetInitialWorldSettings()
     TC_LOG_INFO("server.loading", "Loading Warband Reputation Factions...");
     sObjectMgr->LoadWarbandReputationFactions();
 
+    TC_LOG_INFO("server.loading", "Loading Major Faction Configurations...");
+    sMajorFactionMgr->LoadWorldData();
+
     TC_LOG_INFO("server.loading", "Loading Points Of Interest Data...");
     sObjectMgr->LoadPointsOfInterest();
 
@@ -1655,12 +1700,6 @@ bool World::SetInitialWorldSettings()
     TC_LOG_INFO("server.loading", "Loading Quest Pooling Data...");
     sQuestPoolMgr->LoadFromDB();                                // must be after quest templates
 
-    TC_LOG_INFO("server.loading", "Loading World Quests...");
-    sWorldQuestMgr->LoadFromDB();                               // must be after quest templates
-
-    TC_LOG_INFO("server.loading", "Loading Area POIs...");
-    sAreaPoiMgr->LoadFromDB();
-
     TC_LOG_INFO("server.loading", "Loading World State templates...");
     WorldStateMgr::LoadFromDB();                               // must be loaded before battleground, outdoor PvP, game events and conditions
 
@@ -1673,11 +1712,22 @@ bool World::SetInitialWorldSettings()
     TC_LOG_INFO("server.loading", "Initializing Warfronts...");
     sWarfrontMgr->Initialize();                               // BfA warfront cycle owner; after world states are restored and the contribution bars exist
 
+    TC_LOG_INFO("server.loading", "Loading World Quests...");
+    sWorldQuestMgr->LoadFromDB();                               // must be after quest templates and world states (registers activation worldstates)
+
+    TC_LOG_INFO("server.loading", "Loading Area POIs...");
+    sAreaPoiMgr->LoadFromDB();                                  // must be after world states (registers activation worldstates)
+    TC_LOG_INFO("server.loading", "Loading Prey hunt templates...");
+    sPreyMgr->LoadFromDB();                                    // Midnight S1 Prey/Voidforge — realm-safe no-op if table absent
+
     TC_LOG_INFO("server.loading", "Loading Game Event Data...");               // must be after loading pools fully
     sGameEventMgr->LoadFromDB();
 
     TC_LOG_INFO("server.loading", "Loading club finder postings...");
     sClubFinderMgr->Load();
+
+    TC_LOG_INFO("server.loading", "Loading club stream history...");           // guild/officer chat scrollback + per member read markers
+    sClubStreamHistoryMgr->Load();
 
     TC_LOG_INFO("server.loading", "Loading in-game Shop (BattlePay) catalog...");
     sBattlePayMgr->Load();
@@ -1686,8 +1736,10 @@ bool World::SetInitialWorldSettings()
     TC_LOG_INFO("server.loading", "Loading WoW Token holdings...");
     sWowTokenMgr->Load();
 
-    TC_LOG_INFO("server.loading", "Loading WoW Token holdings...");
-    sWowTokenMgr->Load();
+    TC_LOG_INFO("server.loading", "Loading Battle.net friend graph...");
+    sBnetFriendsMgr->Load();                                    // must be after the auth database is up; backs friends.v2
+    sBnetBlockListMgr->Load();                                  // account-scope block list, backs block_list.v1
+    sBnetPresenceMgr->Load();                                   // presence tracking, backs presence.v1/v2
 
     TC_LOG_INFO("server.loading", "Loading creature summoned data...");
     sObjectMgr->LoadCreatureSummonedData();                     // must be after LoadCreatureTemplates() and LoadQuests()
@@ -1984,6 +2036,12 @@ bool World::SetInitialWorldSettings()
 
     TC_LOG_INFO("server.loading", "Loading Mythic+ (Challenge Mode) data...");
     sChallengeModeMgr.Initialize();
+
+    TC_LOG_INFO("server.loading", "Loading item conversions (Matrix Catalyst)...");
+    sItemConversionMgr.Initialize();
+
+    TC_LOG_INFO("server.loading", "Loading item upgrade tracks...");
+    sItemUpgradeMgr.Initialize();
 
     ///- Handle outdated emails (delete/return)
     TC_LOG_INFO("server.loading", "Returning old mails...");
@@ -2468,12 +2526,13 @@ void World::Update(uint32 diff)
         sBattlefieldMgr->Update(diff);
     }
 
-    sInitiativeManager.Update(diff);
-    sNeighborhoodMgr.Update(diff);
     {
         TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Update warfronts"));
         sWarfrontMgr->Update(diff);
     }
+
+    sInitiativeManager.Update(diff);
+    sNeighborhoodMgr.Update(diff);
 
     ///- Delete all characters which have been deleted X days before
     if (m_timers[WUPDATE_DELETECHARS].Passed())
@@ -2567,6 +2626,8 @@ void World::Update(uint32 diff)
     }
 
     WorldStateMgr::Update();
+
+    sPreyMgr->Update(diff);
 
     {
         TC_METRIC_TIMER("world_update_time", TC_METRIC_TAG("type", "Process cli commands"));
@@ -3125,6 +3186,9 @@ void World::UpdateSessions(uint32 diff)
             RemoveQueuedPlayer(pSession);
             m_sessions.erase(itr);
             Trinity::Containers::MultimapErasePair(m_sessionsByBnetGuid, pSession->GetBattlenetAccountGUID(), pSession);
+            sBnetPresenceMgr->OnSessionOffline(pSession);
+            sBnetBlockListMgr->OnSessionClosed(pSession);
+            Battlenet::Services::NotificationServiceV1::OnSessionClosed(pSession);
             delete pSession;
         }
     }
@@ -3271,6 +3335,13 @@ void World::ResetWeeklyQuests()
     // reset all saved quest status
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_RESET_CHARACTER_QUESTSTATUS_WEEKLY);
     CharacterDatabase.Execute(stmt);
+
+    // Reset account-wide weekly Delves progress (weeklyCompletions / highest-this-week / bountiful / coffer shards).
+    // Delve progress is DB-authoritative - loaded on demand, never cached in memory - so one UPDATE across all rows
+    // resets every account. Without this, DelvesRewards::ResetWeeklyProgress had no caller and the weekly delve
+    // counters (which drive the Great Vault slots and the coffer-shard cap) never reset.
+    CharacterDatabase.Execute(CharacterDatabase.GetPreparedStatement(CHAR_UPD_RESET_DELVE_PROGRESS_WEEKLY));
+
     // reset all quest status in memory
     for (SessionMap::const_iterator itr = m_sessions.begin(); itr != m_sessions.end(); ++itr)
         if (Player* player = itr->second->GetPlayer())
@@ -3278,6 +3349,9 @@ void World::ResetWeeklyQuests()
 
     // reselect pools
     sQuestPoolMgr->ChangeWeeklyQuests();
+
+    // Delves: weekly completion counters roll over with the weekly reset.
+    Delves::DelvesRewards::ResetAllWeeklyProgress();
 
     // Update faction balance
     UpdateWarModeRewardValues();
@@ -3289,6 +3363,10 @@ void World::ResetWeeklyQuests()
 
     m_NextWeeklyQuestReset = next;
     SetPersistentWorldVariable(NextWeeklyQuestResetTimeVarId, uint64(next));
+
+    // Mythic+ weekly rollover. Must run AFTER m_NextWeeklyQuestReset has advanced: every piece of Mythic+ weekly
+    // state (vault run history, vault claim, keystone adjustment, affix week index) is keyed on that boundary.
+    sChallengeModeMgr.OnWeeklyReset();
 
     TC_LOG_INFO("misc", "Weekly quests for all characters have been reset.");
 }
@@ -3542,6 +3620,22 @@ bool World::IsBattlePetJournalLockAcquired(ObjectGuid battlenetAccountGuid)
     for (auto&& sessionForBnet : Trinity::Containers::MapEqualRange(m_sessionsByBnetGuid, battlenetAccountGuid))
         if (sessionForBnet.second->GetBattlePetMgr()->HasJournalLock())
             return true;
+
+    return false;
+}
+
+bool World::IsAccountInventoryLockAcquired(ObjectGuid battlenetAccountGuid, WorldSession const* exclude)
+{
+    for (auto&& sessionForBnet : Trinity::Containers::MapEqualRange(m_sessionsByBnetGuid, battlenetAccountGuid))
+    {
+        WorldSession const* session = sessionForBnet.second;
+        if (session == exclude)
+            continue;
+
+        Player const* other = session->GetPlayer();
+        if (other && other->HasPlayerLocalFlag(PLAYER_LOCAL_FLAG_HAS_ACCOUNT_BANK_LOCK))
+            return true;
+    }
 
     return false;
 }

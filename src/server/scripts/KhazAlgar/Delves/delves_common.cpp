@@ -16,6 +16,7 @@
  */
 
 #include "delves_common.h"
+#include "Creature.h"
 #include "DelveMgr.h"
 #include "Log.h"
 #include "Map.h"
@@ -66,7 +67,7 @@ void DelveInstanceScript::OnPlayerEnter(Player* player)
 
     // Re-send the WorldStates so the in-delve HUD reflects the active tier.
     player->SendUpdateWorldState(WS_DELVE_TIER, tier);
-    player->SendUpdateWorldState(WS_DELVE_IN_DELVE_FLAG, 2);
+    player->SendUpdateWorldState(WS_DELVE_IN_DELVE_FLAG, 1);
     player->SendUpdateWorldState(WS_DELVE_MAP_ID, instance->GetId());
     player->SendUpdateWorldState(WS_DELVE_TIER_SPELL, GetTierSpellId(tier));
     if (DelveTemplate const* tmpl = _delveInstance->GetTemplate())
@@ -111,6 +112,40 @@ void DelveInstanceScript::OnPlayerDeath(Player* player)
 {
     if (_delveInstance)
         _delveInstance->OnPlayerDeath(player);
+}
+
+void DelveInstanceScript::OnUnitDeath(Unit* unit)
+{
+    InstanceScript::OnUnitDeath(unit);
+
+    if (!_delveInstance || !unit)
+        return;
+
+    // Player death: decrement the shared revive pool; at 0 the run fails (rewards become unreachable and
+    // subclasses may despawn objectives via OnDelveFailed). This override is what actually connects the
+    // death-limit machinery — Unit::setDeathState routes every death in the instance through here.
+    if (Player* player = unit->ToPlayer())
+    {
+        if (_delveInstance->GetState() != DelveState::InProgress)
+            return;
+
+        _delveInstance->OnPlayerDeath(player);
+        if (_delveInstance->GetState() == DelveState::Failed)
+        {
+            TC_LOG_DEBUG("delves", "Delve instance {} (map {}) failed: revive pool exhausted.",
+                instance->GetInstanceId(), instance->GetId());
+            OnDelveFailed();
+        }
+        return;
+    }
+
+    // Final-boss death completes the delve (delve_template.finalBossEntry, world content) — the pragmatic
+    // completion trigger until scenario-step progression is wired.
+    if (Creature const* creature = unit->ToCreature())
+        if (DelveTemplate const* tmpl = _delveInstance->GetTemplate())
+            if (tmpl->FinalBossEntry && creature->GetEntry() == tmpl->FinalBossEntry
+                && _delveInstance->GetState() == DelveState::InProgress)
+                OnScenarioComplete();
 }
 
 } // namespace Delves

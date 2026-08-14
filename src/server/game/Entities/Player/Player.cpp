@@ -36,6 +36,7 @@
 #include "BattlegroundMgr.h"
 #include "BattlegroundPackets.h"
 #include "BattlegroundScore.h"
+#include "BnetPresenceMgr.h"
 #include "BattlePetMgr.h"
 #include "CellImpl.h"
 #include "Channel.h"
@@ -64,6 +65,7 @@
 #include "DelvesRewards.h"
 #include "DisableMgr.h"
 #include "DuelPackets.h"
+#include "ElapsedTimerMgr.h"
 #include "EquipmentSetPackets.h"
 #include "Formulas.h"
 #include "GameEventMgr.h"
@@ -71,8 +73,9 @@
 #include "GameObjectAI.h"
 #include "Garrison.h"
 #include "GarrisonMgr.h"
-#include "MythicPlusData.h"
 #include "GarrisonPackets.h"
+#include "MythicPlusData.h"
+#include "MythicPlusPacketsCommon.h"
 #include "GitRevision.h"
 #include "HouseInteriorMap.h"
 #include "Housing.h"
@@ -126,6 +129,7 @@
 #include "PetitionMgr.h"
 #include "PhasingHandler.h"
 #include "PlayerChoice.h"
+#include "PreyMgr.h"
 #include "QueryCallback.h"
 #include "QueryHolder.h"
 #include "QueryResultStructured.h"
@@ -405,6 +409,10 @@ void Player::CleanupsBeforeDelete(bool finalCleanup)
 {
     TradeCancel(false);
     DuelComplete(DUEL_INTERRUPTED);
+
+    // Elapsed timers are per-session bookkeeping keyed by player GUID; drop ours so the manager
+    // does not accumulate entries for characters that are gone.
+    sElapsedTimerMgr->RemoveAllTimers(GetGUID());
 
     Unit::CleanupsBeforeDelete(finalCleanup);
 }
@@ -7152,6 +7160,13 @@ bool Player::RewardHonor(Unit* victim, uint32 groupsize, int32 honor, HonorGainS
 
     AddHonorXP(honor);
 
+    // CriteriaType::PlayerHasEarnedHonor (207) - no asset; the real Criteria rows accumulate an honor total
+    // ("Earn 1500 Honor in the 3v3 bracket") and gate the bracket through ModifierTree
+    // (PlayerInArenaWithTeamSize 24 / PlayerInRankedArenaMatch 60 / PlayerInRatedBattleground 63), so
+    // miscValue1 must be the honor amount actually awarded.
+    if (honor > 0)
+        UpdateCriteria(CriteriaType::PlayerHasEarnedHonor, uint32(honor));
+
     if (InBattleground() && honor > 0)
     {
         if (Battleground* bg = GetBattleground())
@@ -7910,6 +7925,11 @@ void Player::UpdateArea(uint32 newArea)
         UpdateCriteria(CriteriaType::EnterArea, newArea);
         UpdateCriteria(CriteriaType::LeaveArea, oldArea);
     }
+
+    // Battle.net presence: zone changes are one of the four events presence.v1/v2 subscribers are
+    // pushed on. UpdateArea covers both a subzone change and the tail of a full UpdateZone, and it is
+    // reached even when the zone id has no AreaTable entry, unlike UpdateZone's own body.
+    sBnetPresenceMgr->OnZoneChanged(this, m_zoneUpdateId, newArea);
 }
 
 void Player::UpdateZone(uint32 newZone, uint32 newArea)
@@ -9945,6 +9965,122 @@ std::vector<Item*> Player::GetCraftingReagentItemsToDeposit()
     return itemList;
 }
 
+std::vector<Item*> Player::GetWarboundItemsToDeposit()
+{
+    std::vector<Item*> itemList;
+    ForEachItem(ItemSearchLocation::Inventory, [&itemList](Item* item)
+    {
+        // Only deposit warbound/BoA items, not character-soulbound
+        if (item->IsAccountBound() || !item->IsSoulBound())
+        {
+            // Skip quest items and bags
+            if (item->GetTemplate()->GetClass() != ITEM_CLASS_QUEST && !item->IsNotEmptyBag())
+                itemList.push_back(item);
+        }
+
+        return ItemSearchCallbackResult::Continue;
+    });
+
+    return itemList;
+}
+
+BagSlotFlags Player::GetItemAutoDepositCategory(Item const* item)
+{
+    ItemTemplate const* proto = item->GetTemplate();
+    if (!proto)
+        return BagSlotFlags::None;
+
+    // Junk takes precedence (ITEM_QUALITY_POOR is grey items the user wants to vendor)
+    if (proto->GetQuality() == ITEM_QUALITY_POOR)
+        return BagSlotFlags::PriorityJunk;
+
+    // Crafting reagents (items flagged USED_IN_A_TRADESKILL) get their own bin
+    if (proto->IsCraftingReagent())
+        return BagSlotFlags::PriorityReagents;
+
+    switch (proto->GetClass())
+    {
+        case ITEM_CLASS_WEAPON:
+        case ITEM_CLASS_ARMOR:
+            return BagSlotFlags::PriorityEquipment;
+        case ITEM_CLASS_CONSUMABLE:
+            return BagSlotFlags::PriorityConsumables;
+        case ITEM_CLASS_TRADE_GOODS:
+            return BagSlotFlags::PriorityTradeGoods;
+        case ITEM_CLASS_QUEST:
+            return BagSlotFlags::PriorityQuestItems;
+        default:
+            return BagSlotFlags::None;
+    }
+}
+
+int8 Player::PickAutoDepositTab(::BankType bank, Item const* item) const
+{
+    static constexpr BagSlotFlags AllPriorityFlags =
+        BagSlotFlags::PriorityEquipment   | BagSlotFlags::PriorityConsumables |
+        BagSlotFlags::PriorityTradeGoods  | BagSlotFlags::PriorityJunk        |
+        BagSlotFlags::PriorityQuestItems  | BagSlotFlags::PriorityReagents;
+
+    BagSlotFlags itemCategory = GetItemAutoDepositCategory(item);
+
+    auto pick = [&](auto const& tabs) -> int8
+    {
+        int8 fallback = -1;
+        for (std::size_t i = 0; i < tabs.size(); ++i)
+        {
+            BagSlotFlags flags = static_cast<BagSlotFlags>(int32(*tabs[i].DepositFlags));
+
+            // "Cleanup: Ignore this tab" — opt out of auto-deposit entirely
+            if ((flags & BagSlotFlags::DisableAutoSort) != BagSlotFlags::None)
+                continue;
+
+            // First match on the item's specific category wins
+            if (itemCategory != BagSlotFlags::None && (flags & itemCategory) != BagSlotFlags::None)
+                return int8(i);
+
+            // Remember the first tab with no priority filters as a generic fallback
+            if (fallback < 0 && (flags & AllPriorityFlags) == BagSlotFlags::None)
+                fallback = int8(i);
+        }
+        return fallback;
+    };
+
+    return (bank == ::BankType::Account)
+        ? pick(m_activePlayerData->AccountBankTabSettings)
+        : pick(m_activePlayerData->CharacterBankTabSettings);
+}
+
+std::vector<Item*> Player::GetItemsForBankAutoDeposit(::BankType bank, bool includeReagents) const
+{
+    std::vector<Item*> itemList;
+    ForEachItem(ItemSearchLocation::Inventory, [&itemList, bank, includeReagents](Item* item)
+    {
+        ItemTemplate const* proto = item->GetTemplate();
+        if (!proto)
+            return ItemSearchCallbackResult::Continue;
+
+        // Quest items and non-empty bags never auto-deposit
+        if (proto->GetClass() == ITEM_CLASS_QUEST || item->IsNotEmptyBag())
+            return ItemSearchCallbackResult::Continue;
+
+        if (bank == ::BankType::Account)
+        {
+            // Account bank rejects character-soulbound items (only warbound / BoA / unbound allowed)
+            if (item->IsSoulBound() && !item->IsAccountBound())
+                return ItemSearchCallbackResult::Continue;
+
+            // The "Include tradeable reagents" checkbox in the warband bank UI
+            if (!includeReagents && proto->IsCraftingReagent())
+                return ItemSearchCallbackResult::Continue;
+        }
+
+        itemList.push_back(item);
+        return ItemSearchCallbackResult::Continue;
+    });
+
+    return itemList;
+}
+
 Item* Player::GetItemByGuid(ObjectGuid guid) const
 {
     Item* result = nullptr;
@@ -9994,7 +10130,8 @@ Bag* Player::GetBagByPos(uint8 bag) const
 {
     if ((bag >= INVENTORY_SLOT_BAG_START && bag < INVENTORY_SLOT_BAG_END)
         || (bag >= BANK_SLOT_BAG_START && bag < BANK_SLOT_BAG_END)
-        || (bag >= REAGENT_BAG_SLOT_START && bag < REAGENT_BAG_SLOT_END))
+        || (bag >= REAGENT_BAG_SLOT_START && bag < REAGENT_BAG_SLOT_END)
+        || (bag >= ACCOUNT_BANK_SLOT_BAG_START && bag < ACCOUNT_BANK_SLOT_BAG_END))
         if (Item* item = GetItemByPos(INVENTORY_SLOT_BAG_0, bag))
             return item->ToBag();
     return nullptr;
@@ -10124,6 +10261,8 @@ bool Player::IsBagPos(uint16 pos)
         return true;
     if (bag == INVENTORY_SLOT_BAG_0 && (slot >= REAGENT_BAG_SLOT_START && slot < REAGENT_BAG_SLOT_END))
         return true;
+    if (bag == INVENTORY_SLOT_BAG_0 && (slot >= ACCOUNT_BANK_SLOT_BAG_START && slot < ACCOUNT_BANK_SLOT_BAG_END))
+        return true;
     return false;
 }
 
@@ -10132,9 +10271,11 @@ bool Player::IsChildEquipmentPos(uint8 bag, uint8 slot)
     return bag == INVENTORY_SLOT_BAG_0 && (slot >= CHILD_EQUIPMENT_SLOT_START && slot < CHILD_EQUIPMENT_SLOT_END);
 }
 
-bool Player::IsAccountBankPos(uint8 bag, uint8 /*slot*/)
+bool Player::IsAccountBankPos(uint8 bag, uint8 slot)
 {
     if (bag >= ACCOUNT_BANK_SLOT_BAG_START && bag < ACCOUNT_BANK_SLOT_BAG_END)
+        return true;
+    if (bag == INVENTORY_SLOT_BAG_0 && slot >= ACCOUNT_BANK_SLOT_BAG_START && slot < ACCOUNT_BANK_SLOT_BAG_END)
         return true;
     return false;
 }
@@ -10175,11 +10316,16 @@ bool Player::IsValidPos(uint8 bag, uint8 slot, bool explicit_pos) const
         if (slot >= BANK_SLOT_BAG_START && slot < BANK_SLOT_BAG_END)
             return true;
 
+        // account bank bag slots
+        if (slot >= ACCOUNT_BANK_SLOT_BAG_START && slot < ACCOUNT_BANK_SLOT_BAG_END)
+            return true;
+
         return false;
     }
 
     // bag content slots
     // bank bag content slots
+    // account bank bag content slots
     if (Bag* pBag = GetBagByPos(bag))
     {
         // any post selected
@@ -11547,6 +11693,93 @@ InventoryResult Player::CanBankItem(uint8 bag, uint8 slot, ItemPosCountVec& dest
     return reagentBankOnly ? EQUIP_ERR_REAGENT_BANK_FULL : EQUIP_ERR_BANK_FULL;
 }
 
+InventoryResult Player::CanAccountBankItem(uint8 bag, uint8 slot, ItemPosCountVec& dest, Item* pItem, bool swap) const
+{
+    if (!pItem)
+        return swap ? EQUIP_ERR_CANT_SWAP : EQUIP_ERR_ITEM_NOT_FOUND;
+
+    // Check: no character-soulbound items allowed (only warbound/BoA/unbound)
+    if (pItem->IsSoulBound() && !pItem->IsAccountBound())
+        return EQUIP_ERR_NO_SOULBOUND_ITEM_IN_ACCOUNT_BANK;
+
+    // Check: no quest items in account bank
+    if (pItem->GetTemplate()->GetClass() == ITEM_CLASS_QUEST)
+        return EQUIP_ERR_CANT_SWAP;
+
+    uint32 count = pItem->GetCount();
+    ItemTemplate const* pProto = pItem->GetTemplate();
+
+    // Specific slot requested
+    if (bag != NULL_BAG && slot != NULL_SLOT)
+    {
+        if (bag >= ACCOUNT_BANK_SLOT_BAG_START && bag < ACCOUNT_BANK_SLOT_BAG_END)
+        {
+            InventoryResult res = CanStoreItem_InSpecificSlot(bag, slot, dest, pProto, count, swap, pItem);
+            if (res != EQUIP_ERR_OK)
+                return res;
+
+            if (count == 0)
+                return EQUIP_ERR_OK;
+        }
+        return EQUIP_ERR_BANK_FULL;
+    }
+
+    // Specific bag requested
+    if (bag != NULL_BAG && slot == NULL_SLOT)
+    {
+        if (bag >= ACCOUNT_BANK_SLOT_BAG_START && bag < ACCOUNT_BANK_SLOT_BAG_END)
+        {
+            // Account bank tab bags are generic ITEM_SUBCLASS_CONTAINER bags, so
+            // both passes run with non_specialized=true (matching CanBankItem).
+            // First merge with existing stacks (only meaningful for stackables).
+            if (pProto->GetMaxStackSize() != 1)
+            {
+                InventoryResult res = CanStoreItem_InBag(bag, dest, pProto, count, true, true, pItem, NULL_BAG, NULL_SLOT);
+                if (res != EQUIP_ERR_OK)
+                    return res;
+
+                if (count == 0)
+                    return EQUIP_ERR_OK;
+            }
+
+            // Then try empty slots — this must run even when the merge pass returned
+            // EQUIP_ERR_OK without fully placing the stack (no matching stacks found).
+            InventoryResult res = CanStoreItem_InBag(bag, dest, pProto, count, false, true, pItem, NULL_BAG, NULL_SLOT);
+            if (res != EQUIP_ERR_OK)
+                return res;
+
+            if (count == 0)
+                return EQUIP_ERR_OK;
+        }
+        return EQUIP_ERR_BANK_FULL;
+    }
+
+    // No specific bag/slot: search all account bank bags
+    // First pass: try to merge with existing stacks (non_specialized=true — see above)
+    for (uint8 i = ACCOUNT_BANK_SLOT_BAG_START; i < ACCOUNT_BANK_SLOT_BAG_END; i++)
+    {
+        InventoryResult res = CanStoreItem_InBag(i, dest, pProto, count, true, true, pItem, bag, slot);
+        if (res != EQUIP_ERR_OK)
+            continue;
+
+        if (count == 0)
+            return EQUIP_ERR_OK;
+    }
+
+    // Second pass: try empty slots
+    for (uint8 i = ACCOUNT_BANK_SLOT_BAG_START; i < ACCOUNT_BANK_SLOT_BAG_END; i++)
+    {
+        InventoryResult res = CanStoreItem_InBag(i, dest, pProto, count, false, true, pItem, bag, slot);
+        if (res != EQUIP_ERR_OK)
+            continue;
+
+        if (count == 0)
+            return EQUIP_ERR_OK;
+    }
+
+    return EQUIP_ERR_BANK_FULL;
+}
+
 InventoryResult Player::CanUseItem(Item* pItem, bool not_loading) const
 {
     if (pItem)
@@ -11844,6 +12077,9 @@ Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool
 
         if (pItem->GetBonding() == BIND_ON_ACQUIRE ||
             pItem->GetBonding() == BIND_QUEST ||
+            pItem->GetBonding() == BIND_WOW_ACCOUNT ||
+            pItem->GetBonding() == BIND_BNET_ACCOUNT ||
+            pItem->GetBonding() == BIND_BNET_ACCOUNT_UNTIL_EQUIPPED ||
             (pItem->GetBonding() == BIND_ON_EQUIP && IsBagPos(pos)))
             pItem->SetBinding(true);
 
@@ -11883,6 +12119,9 @@ Item* Player::_StoreItem(uint16 pos, Item* pItem, uint32 count, bool clone, bool
     {
         if (pItem2->GetBonding() == BIND_ON_ACQUIRE ||
             pItem2->GetBonding() == BIND_QUEST ||
+            pItem2->GetBonding() == BIND_WOW_ACCOUNT ||
+            pItem2->GetBonding() == BIND_BNET_ACCOUNT ||
+            pItem2->GetBonding() == BIND_BNET_ACCOUNT_UNTIL_EQUIPPED ||
             (pItem2->GetBonding() == BIND_ON_EQUIP && IsBagPos(pos)))
             pItem2->SetBinding(true);
 
@@ -12305,9 +12544,13 @@ void Player::VisualizeItem(uint8 slot, Item* pItem)
         return;
 
     // check also  BIND_ON_ACQUIRE and BIND_QUEST for .additem or .additemset case by GM (not binded at adding to inventory)
-    if (pItem->GetBonding() == BIND_ON_EQUIP || pItem->GetBonding() == BIND_ON_ACQUIRE || pItem->GetBonding() == BIND_QUEST)
+    if (pItem->GetBonding() == BIND_ON_EQUIP || pItem->GetBonding() == BIND_ON_ACQUIRE || pItem->GetBonding() == BIND_QUEST
+        || pItem->GetBonding() == BIND_WOW_ACCOUNT || pItem->GetBonding() == BIND_BNET_ACCOUNT
+        || pItem->GetBonding() == BIND_BNET_ACCOUNT_UNTIL_EQUIPPED)
     {
         pItem->SetBinding(true);
+        if (pItem->GetBonding() == BIND_BNET_ACCOUNT_UNTIL_EQUIPPED)
+            pItem->ConvertToSoulbound();
         if (IsInWorld())
             GetSession()->GetCollectionMgr()->AddItemAppearance(pItem);
     }
@@ -13105,7 +13348,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
 
             RemoveItem(srcbag, srcslot, true);
             StoreItem(dest, pSrcItem, true);
-            if (IsBankPos(src))
+            if (IsBankPos(src) || IsAccountBankPos(src))
                 ItemAddedQuestCheck(pSrcItem->GetEntry(), pSrcItem->GetCount());
         }
         else if (IsBankPos(dst))
@@ -13121,6 +13364,21 @@ void Player::SwapItem(uint16 src, uint16 dst)
             RemoveItem(srcbag, srcslot, true);
             BankItem(dest, pSrcItem, true);
             ItemRemovedQuestCheck(pSrcItem->GetEntry(), pSrcItem->GetCount());
+        }
+        else if (IsAccountBankPos(dst))
+        {
+            ItemPosCountVec dest;
+            InventoryResult msg = CanAccountBankItem(dstbag, dstslot, dest, pSrcItem, false);
+            if (msg != EQUIP_ERR_OK)
+            {
+                SendEquipError(msg, pSrcItem, nullptr);
+                return;
+            }
+
+            RemoveItem(srcbag, srcslot, true);
+            BankItem(dest, pSrcItem, true);
+            if (!IsBankPos(src) && !IsAccountBankPos(src))
+                ItemRemovedQuestCheck(pSrcItem->GetEntry(), pSrcItem->GetCount());
         }
         else if (IsEquipmentPos(dst))
         {
@@ -13150,6 +13408,8 @@ void Player::SwapItem(uint16 src, uint16 dst)
             msg = CanStoreItem(dstbag, dstslot, sDest, pSrcItem, false);
         else if (IsBankPos(dst))
             msg = CanBankItem(dstbag, dstslot, sDest, pSrcItem, false);
+        else if (IsAccountBankPos(dst))
+            msg = CanAccountBankItem(dstbag, dstslot, sDest, pSrcItem, false);
         else if (IsEquipmentPos(dst))
             msg = CanEquipItem(dstslot, eDest, pSrcItem, false);
         else
@@ -13167,7 +13427,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
 
                 if (IsInventoryPos(dst))
                     StoreItem(sDest, pSrcItem, true);
-                else if (IsBankPos(dst))
+                else if (IsBankPos(dst) || IsAccountBankPos(dst))
                     BankItem(sDest, pSrcItem, true);
                 else if (IsEquipmentPos(dst))
                 {
@@ -13205,6 +13465,8 @@ void Player::SwapItem(uint16 src, uint16 dst)
         msg = CanStoreItem(dstbag, dstslot, sDest, pSrcItem, true);
     else if (IsBankPos(dst))
         msg = CanBankItem(dstbag, dstslot, sDest, pSrcItem, true);
+    else if (IsAccountBankPos(dst))
+        msg = CanAccountBankItem(dstbag, dstslot, sDest, pSrcItem, true);
     else if (IsEquipmentPos(dst))
     {
         msg = CanEquipItem(dstslot, eDest, pSrcItem, true);
@@ -13225,6 +13487,8 @@ void Player::SwapItem(uint16 src, uint16 dst)
         msg = CanStoreItem(srcbag, srcslot, sDest2, pDstItem, true);
     else if (IsBankPos(src))
         msg = CanBankItem(srcbag, srcslot, sDest2, pDstItem, true);
+    else if (IsAccountBankPos(src))
+        msg = CanAccountBankItem(srcbag, srcslot, sDest2, pDstItem, true);
     else if (IsEquipmentPos(src))
     {
         msg = CanEquipItem(srcslot, eDest2, pDstItem, true);
@@ -13315,7 +13579,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
     // add to dest
     if (IsInventoryPos(dst))
         StoreItem(sDest, pSrcItem, true);
-    else if (IsBankPos(dst))
+    else if (IsBankPos(dst) || IsAccountBankPos(dst))
         BankItem(sDest, pSrcItem, true);
     else if (IsEquipmentPos(dst))
     {
@@ -13327,7 +13591,7 @@ void Player::SwapItem(uint16 src, uint16 dst)
     // add to src
     if (IsInventoryPos(src))
         StoreItem(sDest2, pDstItem, true);
-    else if (IsBankPos(src))
+    else if (IsBankPos(src) || IsAccountBankPos(src))
         BankItem(sDest2, pDstItem, true);
     else if (IsEquipmentPos(src))
         EquipItem(eDest2, pDstItem, true);
@@ -14582,6 +14846,28 @@ void Player::OnGossipSelect(WorldObject* source, int32 gossipOptionId, uint32 me
             PlayerTalkClass->SendCloseGossip();
             SendRespecWipeConfirm(guid, 0, SPEC_RESET_GLYPHS);
             break;
+        case GossipOptionNpc::GarrisonMissionNpc:
+            // WoD Command Table. Fall through to the !handled branch, which sends the RETAIL trigger
+            // SMSG_GOSSIP_OPTION_NPC_INTERACTION{GossipNpcOptionID=30323}. The client resolves 30323 via
+            // GossipNPCOption.db2 (type GarrisonMissionNpc) and enters PlayerInteractionType::GarrMission(32).
+            // That interaction alone does NOT open the frame — the client fires the legacy
+            // GARRISON_MISSION_NPC_OPENED(1) (-> GarrisonMissionFrame) from its SMSG_DELETE_EXPIRED_MISSIONS_RESULT
+            // handler while interaction 32 is active, gated on Result==0 && wire bit6(LegionUnkBit)==0
+            // (see Garrison::SendDeleteExpiredMissionsResult). (Do NOT send SMSG_NPC_INTERACTION_OPEN_RESULT{32};
+            // that routes into the modern PlayerInteractionManager which has no GarrMission frame and dead-ends.)
+            // Precondition: the gossip_menu_option row must have GossipNpcOptionID = 30323.
+            handled = false;
+            break;
+        case GossipOptionNpc::ShipmentCrafter:
+            // WoD work-order NPC (e.g. the Tannery's "Work Orders" clerk). Retail 12.0.7 flow (sniff-verified):
+            // selecting this option -> SMSG_GOSSIP_OPTION_NPC_INTERACTION{GossipNpcOptionID} establishes
+            // PlayerInteractionType::ShipmentCrafter -> the client then sends CMSG_GARRISON_OPEN_SHIPMENT_NPC
+            // (HandleOpenShipmentNpc), which resolves the NPC's building and returns its shipment container ->
+            // client opens GarrisonCapacitiveDisplayFrame. So just fall through to the !handled interaction
+            // path (identical to GarrisonMissionNpc). The gossip_menu_option MUST carry a real ShipmentCrafter
+            // GossipNpcOptionID (a NULL one crashes the client, ERROR #132).
+            handled = false;
+            break;
         case GossipOptionNpc::GarrisonTradeskillNpc: // NYI
             break;
         case GossipOptionNpc::GarrisonRecruitment:
@@ -14649,6 +14935,12 @@ void Player::OnGossipSelect(WorldObject* source, int32 gossipOptionId, uint32 me
             break;
         }
         case GossipOptionNpc::ChromieTimeNpc:
+            // Fall through to the generic !handled branch, which sends
+            // SMSG_GOSSIP_OPTION_NPC_INTERACTION{GossipNpcOptionID}; the client resolves that through
+            // GossipNPCOption.db2 into PlayerInteractionType::ChromieTime (45) and raises the timeline
+            // picker. Consuming the option here (the old "// NYI" stub) swallowed it and nothing opened.
+            // This matches feature/chromie-time, which owns this handler - integration kept its stub
+            // through the merge even though the branch had already changed this line.
             handled = false;
             break;
         case GossipOptionNpc::RuneforgeLegendaryCrafting: // NYI
@@ -15597,6 +15889,10 @@ void Player::RewardQuest(Quest const* quest, LootItemType rewardType, uint32 rew
 
     SetQuestCompletedBit(quest_id, true);
 
+    // Phase 10F - if this quest is a Campaign.Completed marker, auto-grant the
+    // Campaign.RewardQuestID to the player (retail behavior).
+    QuestMgr::OnQuestCompletedHandleCampaignReward(this, quest_id);
+
     for (QuestObjective const& obj : quest->GetObjectives())
     {
         switch (obj.Type)
@@ -15793,6 +16089,15 @@ void Player::RewardQuest(Quest const* quest, LootItemType rewardType, uint32 rew
     UpdateCriteria(CriteriaType::CompleteQuestsCount);
     UpdateCriteria(CriteriaType::CompleteQuest, quest->GetQuestId());
     UpdateCriteria(CriteriaType::CompleteAnyReplayQuest, 1);
+    // CriteriaType::CompleteAnyWorldQuest (203). No asset - every real Criteria row gates on
+    // ModifierTreeType::QuestHasQuestInfoId (206), which resolves miscValue1 as the quest id, so the quest
+    // id is what must be passed.
+    if (quest->IsWorldQuest())
+        UpdateCriteria(CriteriaType::CompleteAnyWorldQuest, quest->GetQuestId());
+    // CriteriaType::CompleteTrackingQuest (250). Tracking quests (QUEST_FLAGS_TRACKING_EVENT) are the hidden,
+    // auto-rewarded progress markers; they are rewarded through this same path.
+    if (quest->HasFlag(QUEST_FLAGS_TRACKING_EVENT))
+        UpdateCriteria(CriteriaType::CompleteTrackingQuest, quest->GetQuestId());
 
     // Grant any garrison/war-campaign champions (GarrFollower) mapped to this quest turn-in.
     // Retail encodes several of these as the quest's RewardSpell (SPELL_EFFECT_ADD_GARRISON_FOLLOWER),
@@ -19352,11 +19657,16 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
     // must be before inventory (some items required reputation check)
     m_reputationMgr->LoadFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_REPUTATION));
     m_reputationMgr->LoadAccountWideFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_REPUTATION));
+    m_reputationMgr->LoadRenownRewardsGrantedFromDB(
+        holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_CHAR_RENOWN_REWARDS_GRANTED),
+        holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_WARBAND_RENOWN_REWARDS_GRANTED));
 
     if (PreparedQueryResult maxLevelResult = holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_WARBAND_MAX_LEVEL_COUNT))
         _warbandMaxLevelCharCount = std::min((*maxLevelResult)[0].GetUInt64(), uint64(5));
 
     _LoadCharacterBankTabSettings(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_BANK_TAB_SETTINGS));
+    _LoadAccountBankTabSettings(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_TAB_SETTINGS));
+    _LoadAccountBankCoinage(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_COINAGE));
 
     _LoadCovenantSoulbinds(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_COVENANT_SOULBINDS));
     _LoadCovenant(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_COVENANT));
@@ -19373,6 +19683,8 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
         holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_AZERITE_UNLOCKED_ESSENCES),
         holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_AZERITE_EMPOWERED),
         time_diff);
+
+    _LoadAccountBankItems(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_ITEMS), time_diff);
 
     // update items with duration and realtime
     UpdateItemDuration(time_diff, true);
@@ -19554,35 +19866,14 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
         } while (garrisonResult->NextRow());
     }
 
-    // Safety net for characters that joined a covenant before the sanctum garrison existed (or whose creation was
-    // lost): give them the GarrType 111 garrison now. Same pattern as the war-campaign create in RewardQuest.
-    // No SQL migration is needed - the row is written by the next SaveToDB. Must run after both _LoadCovenant and
-    // the garrison load loop above.
-    if (m_activeCovenantId && !GetGarrison(GARRISON_TYPE_COVENANT))
-        CreateGarrison(GARR_SITE_COVENANT_SANCTUM);
-
-    // Re-apply GarrTalentRank.PerkSpellID for every already-researched talent. Permanently learned perks are
-    // idempotent here; the soulbind trait perks are auras and genuinely need re-casting, and this is the first
-    // point where both the garrisons and the covenant/soulbind state (_LoadCovenant, above) are loaded.
-    for (auto const& [garrType, garrison] : GetGarrisons())
-        garrison->ApplyAllTalentPerks();
-
-    // ...and take back the ones belonging to a covenant this character is no longer serving. ApplyAllTalentPerks
-    // only ever adds, so without this a character that switched covenants would keep the abilities, sanctum perks
-    // and soulbind traits of the covenant it left for as long as it kept logging in. Repairs characters that
-    // switched before this existed, and is a no-op for everybody else.
-    if (Garrison* sanctum = GetGarrison(GARRISON_TYPE_COVENANT))
-        sanctum->RefreshCovenantTalentPerks();
-
-    // Roll the calling board forward over every daily reset that passed while the character was offline. The
-    // board is stored as timestamps, so this is pure catch-up arithmetic and produces the same result whether
-    // the character was away for an hour or a month.
-    UpdateCovenantCallings();
-
     _mythicPlusData = std::make_unique<MythicPlusData>(this);
     _mythicPlusData->LoadFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MYTHIC_PLUS));
-    _mythicPlusData->LoadWeeklyFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MYTHIC_PLUS_WEEKLY));
+    // The vault row must load BEFORE the weekly runs: loading the runs prunes a week that has already reset,
+    // and that prune both reads the stored claim/keystone boundaries and rewrites the row with the previous
+    // week's captured summary. Loading it afterwards would clobber the capture with the pre-reset values.
     _mythicPlusData->LoadVaultFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MYTHIC_PLUS_VAULT));
+    _mythicPlusData->LoadWeeklyFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MYTHIC_PLUS_WEEKLY));
+    UpdateDungeonScore();
 
     std::unique_ptr<Housing> housing = std::make_unique<Housing>(this);
     if (housing->LoadFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_HOUSING),
@@ -19988,6 +20279,30 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
             }
         }
     }
+    // Safety net for characters that joined a covenant before the sanctum garrison existed (or whose creation was
+    // lost): give them the GarrType 111 garrison now. Same pattern as the war-campaign create in RewardQuest.
+    // No SQL migration is needed - the row is written by the next SaveToDB. Must run after both _LoadCovenant and
+    // the garrison load loop above.
+    if (m_activeCovenantId && !GetGarrison(GARRISON_TYPE_COVENANT))
+        CreateGarrison(GARR_SITE_COVENANT_SANCTUM);
+
+    // Re-apply GarrTalentRank.PerkSpellID for every already-researched talent. Permanently learned perks are
+    // idempotent here; the soulbind trait perks are auras and genuinely need re-casting, and this is the first
+    // point where both the garrisons and the covenant/soulbind state (_LoadCovenant, above) are loaded.
+    for (auto const& [garrType, garrison] : GetGarrisons())
+        garrison->ApplyAllTalentPerks();
+
+    // ...and take back the ones belonging to a covenant this character is no longer serving. ApplyAllTalentPerks
+    // only ever adds, so without this a character that switched covenants would keep the abilities, sanctum perks
+    // and soulbind traits of the covenant it left for as long as it kept logging in. Repairs characters that
+    // switched before this existed, and is a no-op for everybody else.
+    if (Garrison* sanctum = GetGarrison(GARRISON_TYPE_COVENANT))
+        sanctum->RefreshCovenantTalentPerks();
+
+    // Roll the calling board forward over every daily reset that passed while the character was offline. The
+    // board is stored as timestamps, so this is pure catch-up arithmetic and produces the same result whether
+    // the character was away for an hour or a month.
+    UpdateCovenantCallings();
 
     _InitHonorLevelOnLoadFromDB(fields.honor, fields.honorLevel);
 
@@ -20011,6 +20326,8 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
 
     m_achievementMgr->CheckAllAchievementCriteria(this);
     m_questObjectiveCriteriaMgr->CheckAllQuestObjectiveCriteria(this);
+
+    sPreyMgr->OnPlayerLogin(this);          // Midnight S1 Prey/Voidforge — restore hunt/Journey state (no-op until content lands)
 
     PushQuests();
 
@@ -21631,6 +21948,156 @@ void Player::_LoadCovenant(PreparedQueryResult result)
     ApplyCovenantSkillLines();
 }
 
+void Player::_LoadAccountBankTabSettings(PreparedQueryResult result)
+{
+    uint8 tabCount = 0;
+
+    if (result)
+    {
+        do
+        {
+            DEFINE_FIELD_ACCESSOR_CACHE_ANONYMOUS(PreparedResultSet, (tabId)(name)(icon)(description)(depositFlags)) fields { *result };
+
+            uint8 tabId = fields.tabId().GetUInt8();
+            if (tabId >= (ACCOUNT_BANK_SLOT_BAG_END - ACCOUNT_BANK_SLOT_BAG_START))
+                continue;
+
+            SetAccountBankTabSettings(tabId, fields.name().GetString(), fields.icon().GetString(),
+                fields.description().GetString(), static_cast<BagSlotFlags>(fields.depositFlags().GetUInt32()));
+
+            if (tabId >= tabCount)
+                tabCount = tabId + 1;
+
+        } while (result->NextRow());
+    }
+
+    // Derive tab count from the rows loaded
+    SetAccountBankTabCount(tabCount);
+
+    while (m_activePlayerData->AccountBankTabSettings.size() < *m_activePlayerData->NumAccountBankTabs)
+        AddDynamicUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::AccountBankTabSettings));
+}
+
+void Player::_LoadAccountBankCoinage(PreparedQueryResult result)
+{
+    if (result)
+        SetAccountBankCoinage((*result)[0].GetUInt64());
+    else
+        SetAccountBankCoinage(0);
+}
+
+void Player::ModifyAccountBankCoinage(int64 delta)
+{
+    int64 current = int64(GetAccountBankCoinage());
+    int64 next = current + delta;
+    if (next < 0)
+        next = 0;
+    if (uint64(next) > MAX_MONEY_AMOUNT)
+        next = int64(MAX_MONEY_AMOUNT);
+    SetAccountBankCoinage(uint64(next));
+}
+
+void Player::_LoadAccountBankItems(PreparedQueryResult result, uint32 timeDiff)
+{
+    //  Same field layout as character_inventory load, but with bag/slot from account_bank_item at the end
+    //  Fields 0-51: item_instance fields (same as _LoadInventory)
+    //  Field 52: abi.bag (tab index 0-4)
+    //  Field 53: abi.slot (slot within tab 0-97)
+
+    // First, ensure all account bank tabs have their bag objects created
+    // This fixes the issue where empty tabs appear but have no slots
+    for (uint8 tabIndex = 0; tabIndex < GetAccountBankTabCount(); ++tabIndex)
+    {
+        uint8 bagSlot = ACCOUNT_BANK_SLOT_BAG_START + tabIndex;
+        Bag* bag = GetBagByPos(bagSlot);
+        if (!bag)
+        {
+            // Create the bag item for this tab if it doesn't exist yet
+            if (Item* bagItem = Item::CreateItem(ITEM_ACCOUNT_BANK_TAB_BAG, 1, ItemContext::NONE, this))
+            {
+                uint16 bagPos = (INVENTORY_SLOT_BAG_0 << 8) | bagSlot;
+                bagItem->SetContainer(nullptr);
+                bagItem->SetSlot(bagSlot);
+                StoreItem(ItemPosCountVec(1, ItemPosCount(bagPos, 1)), bagItem, true);
+                bagItem->SetState(ITEM_UNCHANGED, this);
+                bag = bagItem->ToBag();
+
+                TC_LOG_DEBUG("entities.player", "Player::_LoadAccountBankItems: Created account bank bag for tab {} at slot {}", tabIndex, bagSlot);
+            }
+
+            if (!bag)
+            {
+                TC_LOG_ERROR("entities.player", "Player::_LoadAccountBankItems: Player '{}' ({}) failed to create account bank bag for tab {}.",
+                    GetName(), GetGUID().ToString(), tabIndex);
+                continue;
+            }
+        }
+    }
+
+    if (!result)
+        return;
+
+    uint32 zoneId = GetZoneId();
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+    m_itemUpdateQueueBlocked = true;
+    do
+    {
+        Field* fields = result->Fetch();
+        if (Item* item = _LoadItem(trans, zoneId, timeDiff, fields))
+        {
+            uint8 tabIndex = fields[52].GetUInt8();
+            uint8 slot = fields[53].GetUInt8();
+
+            if (tabIndex >= GetAccountBankTabCount())
+            {
+                TC_LOG_ERROR("entities.player", "Player::_LoadAccountBankItems: Player '{}' ({}) has account bank item ({}, entry: {}) in tab {} which exceeds tab count {}. Skipping.",
+                    GetName(), GetGUID().ToString(), item->GetGUID().ToString(), item->GetEntry(), tabIndex, GetAccountBankTabCount());
+                item->DeleteFromDB(trans);
+                delete item;
+                continue;
+            }
+
+            uint8 bagSlot = ACCOUNT_BANK_SLOT_BAG_START + tabIndex;
+
+            // Bag should already exist from the pre-creation loop above
+            Bag* bag = GetBagByPos(bagSlot);
+            if (!bag)
+            {
+                TC_LOG_ERROR("entities.player", "Player::_LoadAccountBankItems: Player '{}' ({}) failed to get account bank bag for tab {} after pre-creation.",
+                    GetName(), GetGUID().ToString(), tabIndex);
+                item->DeleteFromDB(trans);
+                delete item;
+                continue;
+            }
+
+            GetSession()->GetCollectionMgr()->CheckHeirloomUpgrades(item);
+            GetSession()->GetCollectionMgr()->AddItemAppearance(item);
+
+            ItemPosCountVec dest;
+            InventoryResult err = CanStoreItem(bagSlot, slot, dest, item);
+            if (err == EQUIP_ERR_OK)
+            {
+                item = StoreItem(dest, item, true);
+                item->SetState(ITEM_UNCHANGED, this);
+            }
+            else
+            {
+                TC_LOG_ERROR("entities.player", "Player::_LoadAccountBankItems: Player '{}' ({}) has account bank item ({}, entry: {}) which can't be loaded (tab {}, slot {}) by reason {}. Item will be sent by mail.",
+                    GetName(), GetGUID().ToString(), item->GetGUID().ToString(), item->GetEntry(), tabIndex, slot, uint32(err));
+                item->DeleteFromInventoryDB(trans);
+
+                MailDraft draft(GetSession()->GetTrinityString(LANG_NOT_EQUIPPED_ITEM), "There were problems with equipping item(s).");
+                draft.AddItem(item);
+                draft.SendMailTo(trans, this, MailSender(this, MAIL_STATIONERY_GM), MAIL_CHECK_MASK_COPIED);
+            }
+        }
+    } while (result->NextRow());
+
+    m_itemUpdateQueueBlocked = false;
+    CharacterDatabase.CommitTransaction(trans);
+}
+
 void Player::_LoadCovenantSoulbinds(PreparedQueryResult result)
 {
     if (!result)
@@ -22701,6 +23168,28 @@ bool Player::CollectConduit(uint32 conduitId, int32 rankIndex /*= -1*/)
     stmt->setUInt32(1, conduitId);
     stmt->setUInt32(2, uint32(rankIndex));
     CharacterDatabase.Execute(stmt);
+
+    // If this conduit is currently socketed in the active soulbind tree, refresh the applied conduit spells so the
+    // upgraded rank takes effect immediately. Without this the player keeps the OLD-rank spell until the next
+    // soulbind switch or relog. Guard on IsInWorld(): during character load conduits are applied once after the
+    // active soulbind is known (ApplyConduitSpells in the load path), so refreshing here would double-apply.
+    if (IsInWorld())
+    {
+        bool socketed = false;
+        for (auto const& [garrTalentId, socket] : m_soulbindConduitSockets)
+        {
+            if (socket.first == conduitId)
+            {
+                socketed = true;
+                break;
+            }
+        }
+        if (socketed)
+        {
+            RemoveConduitSpells();
+            ApplyConduitSpells();
+        }
+    }
     return true;
 }
 
@@ -23246,8 +23735,8 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
     _SaveStoredAuraTeleportLocations(trans);
     m_achievementMgr->SaveAccountWideToDB(trans);
     m_achievementMgr->SaveToDB(trans);
-    m_reputationMgr->SaveToDB(trans);
     m_reputationMgr->SaveAccountWideToDB(trans);
+    m_reputationMgr->SaveToDB(trans);
     m_questObjectiveCriteriaMgr->SaveToDB(trans);
     m_perksActivityMgr->SaveToDB(trans);
     _SaveEquipmentSets(trans);
@@ -23278,6 +23767,9 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
         taxiStmt->setString(1, ss.str());
         trans->Append(taxiStmt);
     }
+    _SaveAccountBankTabSettings(trans);
+    _SaveAccountBankItems(trans);
+    _SaveAccountBankCoinage(trans);
 
     // check if stats should only be saved on logout
     // save stats can be out of transaction
@@ -23591,21 +24083,34 @@ void Player::_SaveInventory(CharacterDatabaseTransaction trans)
             }
         }
 
+        // Items stored INSIDE an account bank tab bag are persisted per-Bnet in
+        // _SaveAccountBankItems, so skip the per-character inventory position write
+        // for them. The tab bag itself (sitting in INVENTORY_SLOT_BAG_0 at slots
+        // ACCOUNT_BANK_SLOT_BAG_START..END) is per-character and MUST go through
+        // the normal character_inventory save path so it can be restored on relog.
+        bool isAccountBankItem = container && IsAccountBankPos(INVENTORY_SLOT_BAG_0, container->GetSlot());
+
         switch (item->GetState())
         {
             case ITEM_NEW:
             case ITEM_CHANGED:
-                stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_INVENTORY_ITEM);
-                stmt->setUInt64(0, GetGUID().GetCounter());
-                stmt->setUInt64(1, container ? container->GetGUID().GetCounter() : UI64LIT(0));
-                stmt->setUInt8 (2, item->GetSlot());
-                stmt->setUInt64(3, item->GetGUID().GetCounter());
-                trans->Append(stmt);
+                if (!isAccountBankItem)
+                {
+                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_INVENTORY_ITEM);
+                    stmt->setUInt64(0, GetGUID().GetCounter());
+                    stmt->setUInt64(1, container ? container->GetGUID().GetCounter() : UI64LIT(0));
+                    stmt->setUInt8 (2, item->GetSlot());
+                    stmt->setUInt64(3, item->GetGUID().GetCounter());
+                    trans->Append(stmt);
+                }
                 break;
             case ITEM_REMOVED:
-                stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_INVENTORY_BY_ITEM);
-                stmt->setUInt64(0, item->GetGUID().GetCounter());
-                trans->Append(stmt);
+                if (!isAccountBankItem)
+                {
+                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_INVENTORY_BY_ITEM);
+                    stmt->setUInt64(0, item->GetGUID().GetCounter());
+                    trans->Append(stmt);
+                }
                 break;
             case ITEM_UNCHANGED:
                 break;
@@ -24222,6 +24727,73 @@ void Player::_SaveCharacterBankTabSettings(CharacterDatabaseTransaction trans) c
     }
 }
 
+void Player::_SaveAccountBankTabSettings(CharacterDatabaseTransaction trans) const
+{
+    uint32 bnetAccountId = GetSession()->GetBattlenetAccountId();
+
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ACCOUNT_BANK_TAB_SETTINGS);
+    stmt->setUInt32(0, bnetAccountId);
+    trans->Append(stmt);
+
+    for (std::size_t i = 0; i < m_activePlayerData->AccountBankTabSettings.size(); ++i)
+    {
+        UF::BankTabSettings const& tabSetting = m_activePlayerData->AccountBankTabSettings[i];
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_ACCOUNT_BANK_TAB_SETTINGS);
+        stmt->setUInt32(0, bnetAccountId);
+        stmt->setUInt8(1, i);
+        stmt->setString(2, *tabSetting.Name);
+        stmt->setString(3, *tabSetting.Icon);
+        stmt->setString(4, *tabSetting.Description);
+        stmt->setInt32(5, *tabSetting.DepositFlags);
+        trans->Append(stmt);
+    }
+}
+
+void Player::_SaveAccountBankCoinage(CharacterDatabaseTransaction trans) const
+{
+    uint32 bnetAccountId = GetSession()->GetBattlenetAccountId();
+    if (!bnetAccountId)
+        return;
+
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_ACCOUNT_BANK_COINAGE);
+    stmt->setUInt32(0, bnetAccountId);
+    stmt->setUInt64(1, GetAccountBankCoinage());
+    trans->Append(stmt);
+}
+
+void Player::_SaveAccountBankItems(CharacterDatabaseTransaction trans)
+{
+    uint32 bnetAccountId = GetSession()->GetBattlenetAccountId();
+
+    // Delete all account bank item positions — they will be re-inserted below
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ACCOUNT_BANK_ITEMS_BY_BNET);
+    stmt->setUInt32(0, bnetAccountId);
+    trans->Append(stmt);
+
+    // Re-insert current positions
+    for (uint8 tabIndex = 0; tabIndex < GetAccountBankTabCount(); ++tabIndex)
+    {
+        uint8 bagSlot = ACCOUNT_BANK_SLOT_BAG_START + tabIndex;
+        Bag* bag = GetBagByPos(bagSlot);
+        if (!bag)
+            continue;
+
+        for (uint32 slot = 0; slot < bag->GetBagSize(); ++slot)
+        {
+            Item* item = bag->GetItemByPos(slot);
+            if (!item)
+                continue;
+
+            stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_ACCOUNT_BANK_ITEM);
+            stmt->setUInt32(0, bnetAccountId);
+            stmt->setUInt8(1, tabIndex);
+            stmt->setUInt8(2, slot);
+            stmt->setUInt64(3, item->GetGUID().GetCounter());
+            trans->Append(stmt);
+        }
+    }
+}
+
 void Player::outDebugValues() const
 {
     Log* log = sLog;
@@ -24646,6 +25218,40 @@ void Player::RemovePet(Pet* pet, PetSaveMode mode, bool returnreagent)
 
         if (GetGroup())
             SetGroupUpdateFlag(GROUP_UPDATE_FLAG_PET);
+    }
+}
+
+void Player::SetPetFavorite(uint32 petNumber, bool favorite)
+{
+    if (!m_petStable || favorite == m_petStable->IsFavorite(petNumber))
+        return;
+
+    if (favorite)
+        m_petStable->FavoritePetNumbers.insert(petNumber);
+    else
+        m_petStable->FavoritePetNumbers.erase(petNumber);
+
+    // Persist in the dedicated favorites table (keyed by pet number, so it survives the pet-row
+    // delete+reinsert that happens on every pet save).
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(favorite ? CHAR_INS_PET_FAVORITE : CHAR_DEL_PET_FAVORITE);
+    stmt->setUInt64(0, GetGUID().GetCounter());
+    stmt->setUInt32(1, petNumber);
+    CharacterDatabase.Execute(stmt);
+
+    // Reflect the favorite star in the stable UI (StablePetInfo::PetFlags).
+    if (m_activePlayerData->PetStable.has_value())
+    {
+        int32 ufIndex = m_activePlayerData->PetStable->Pets.FindIndexIf([petNumber](UF::StablePetInfo const& p) { return p.PetNumber == petNumber; });
+        if (ufIndex >= 0)
+        {
+            auto petSetter = m_values.ModifyValue(&Player::m_activePlayerData)
+                .ModifyValue(&UF::ActivePlayerData::PetStable, 0)
+                .ModifyValue(&UF::StableInfo::Pets, ufIndex);
+            if (favorite)
+                SetUpdateFieldFlagValue(petSetter.ModifyValue(&UF::StablePetInfo::PetFlags), PET_STABLE_FAVORITE);
+            else
+                RemoveUpdateFieldFlagValue(petSetter.ModifyValue(&UF::StablePetInfo::PetFlags), PET_STABLE_FAVORITE);
+        }
     }
 }
 
@@ -27247,6 +27853,7 @@ void Player::SendInitialVisiblePackets(WorldObject* target) const
     if (Unit* targetUnit = target->ToUnit())
     {
         SendAurasForTarget(targetUnit);
+        targetUnit->SendResumeCastTo(this);
         if (targetUnit->IsAlive())
         {
             if (targetUnit->HasUnitState(UNIT_STATE_MELEE_ATTACKING) && targetUnit->GetVictim())
@@ -27440,7 +28047,24 @@ void Player::SetGroup(Group* group, int8 subgroup)
         m_group.setSubGroup((uint8)subgroup);
     }
 
+    // the incremental party state baseline only means anything to the group it was broadcast in
+    ResetPartyMemberState();
+
     UpdateObjectVisibility(false);
+}
+
+WorldPackets::Party::PartyMemberStatsSnapshot& Player::GetPartyMemberStateSnapshot()
+{
+    if (!m_partyMemberState)
+        m_partyMemberState = std::make_unique<WorldPackets::Party::PartyMemberStatsSnapshot>();
+
+    return *m_partyMemberState;
+}
+
+void Player::ResetPartyMemberState()
+{
+    m_partyMemberState.reset();
+    m_partyMemberStateRecipients.clear();
 }
 
 void Player::SendInitialPacketsBeforeAddToMap()
@@ -27633,6 +28257,7 @@ void Player::SendInitialPacketsBeforeAddToMap()
     SendDirectMessage(heirloomUpdate.Write());
 
     GetSession()->GetCollectionMgr()->SendFavoriteAppearances();
+    GetSession()->GetCollectionMgr()->SendFavoriteTransmogSets();
 
     // SMSG_ACCOUNT_WARBAND_SCENE_UPDATE
     WorldPackets::Misc::AccountWarbandSceneUpdate warbandSceneUpdate;
@@ -27650,6 +28275,12 @@ void Player::SendInitialPacketsBeforeAddToMap()
     // ([ (0,0,0,[]), current ] - A rec 721 / B 485 / C 469, audit m2).
     WorldPackets::Misc::CTROptionsBlock emptyPrevious;
     SendCtrOptions(&emptyPrevious);
+
+    // Account-wide bank lock: grant to this session if no other session for the same
+    // Bnet account already holds it. Without this flag the client shows the
+    // "The bank is being used by another member of your Warband" prompt.
+    if (!sWorld->IsAccountInventoryLockAcquired(GetSession()->GetBattlenetAccountGUID(), GetSession()))
+        SetPlayerLocalFlag(PLAYER_LOCAL_FLAG_HAS_ACCOUNT_BANK_LOCK);
 
     SetMovedUnit(this);
 }
@@ -27862,6 +28493,11 @@ void Player::SendInitialPacketsAfterAddToMap()
 
     // Push the account-wide store front (catalogue + per-item ownership) once the player is in the world.
     GetSession()->SendAccountStoreFrontUpdate();
+    // Resynchronise the client's world elapsed timers for the map we just entered. This is what
+    // makes a mid-run zone-in (or a relog inside a running Mythic+ instance) show the dungeon timer
+    // at the correct elapsed value - previously the timer was only ever pushed once, at run start,
+    // so anyone who was not present at that moment saw nothing.
+    sElapsedTimerMgr->SendActiveTimers(this);
 }
 
 void Player::SendUpdateToOutOfRangeGroupMembers()
@@ -32956,6 +33592,16 @@ void Player::_LoadPetStable(uint32 summonedPetNumber, PreparedQueryResult result
 
     m_petStable = std::make_unique<PetStable>();
 
+    // Load which stable pets the player pinned as favorites (kept in its own table, keyed by pet number).
+    {
+        CharacterDatabasePreparedStatement* favStmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_PET_FAVORITES);
+        favStmt->setUInt64(0, GetGUID().GetCounter());
+        if (PreparedQueryResult favResult = CharacterDatabase.Query(favStmt))
+            do
+                m_petStable->FavoritePetNumbers.insert((*favResult)[0].GetUInt32());
+            while (favResult->NextRow());
+    }
+
     //         0      1        2      3    4           5     6     7        8          9       10      11        12              13       14              15
     // SELECT id, entry, modelid, level, exp, Reactstate, slot, name, renamed, curhealth, curmana, abdata, savetime, CreatedBySpell, PetType, specialization FROM character_pet WHERE owner = ?
     if (result)
@@ -32986,14 +33632,16 @@ void Player::_LoadPetStable(uint32 summonedPetNumber, PreparedQueryResult result
                 m_petStable->ActivePets[slot] = std::move(petInfo);
 
                 if (m_petStable->ActivePets[slot]->Type == HUNTER_PET)
-                    AddPetToUpdateFields(*m_petStable->ActivePets[slot], slot, PET_STABLE_ACTIVE);
+                    AddPetToUpdateFields(*m_petStable->ActivePets[slot], slot,
+                        PetStableFlags(PET_STABLE_ACTIVE | (m_petStable->IsFavorite(m_petStable->ActivePets[slot]->PetNumber) ? PET_STABLE_FAVORITE : 0)));
             }
             else if (slot >= PET_SAVE_FIRST_STABLE_SLOT && slot < PET_SAVE_LAST_STABLE_SLOT)
             {
                 m_petStable->StabledPets[slot - PET_SAVE_FIRST_STABLE_SLOT] = std::move(petInfo);
 
                 if (m_petStable->StabledPets[slot - PET_SAVE_FIRST_STABLE_SLOT]->Type == HUNTER_PET)
-                    AddPetToUpdateFields(*m_petStable->StabledPets[slot - PET_SAVE_FIRST_STABLE_SLOT], slot, PET_STABLE_INACTIVE);
+                    AddPetToUpdateFields(*m_petStable->StabledPets[slot - PET_SAVE_FIRST_STABLE_SLOT], slot,
+                        PetStableFlags(PET_STABLE_INACTIVE | (m_petStable->IsFavorite(m_petStable->StabledPets[slot - PET_SAVE_FIRST_STABLE_SLOT]->PetNumber) ? PET_STABLE_FAVORITE : 0)));
             }
             else if (slot == PET_SAVE_NOT_IN_SLOT)
                 m_petStable->UnslottedPets.push_back(std::move(petInfo));
@@ -33036,6 +33684,15 @@ Garrison* Player::GetGarrison(GarrisonType type) const
     auto itr = _garrisons.find(type);
     if (itr != _garrisons.end())
         return itr->second.get();
+
+    return nullptr;
+}
+
+Garrison* Player::GetGarrisonWithMission(uint32 missionRecID) const
+{
+    for (auto const& [type, garrison] : _garrisons)
+        if (garrison->GetMissionByRecID(missionRecID))
+            return garrison.get();
 
     return nullptr;
 }
@@ -33270,13 +33927,25 @@ void Player::UpdateInitiativeFavor(uint32 favor)
     }
 }
 
-Garrison* Player::GetGarrisonWithMission(uint32 missionRecID) const
+void Player::UpdateDungeonScore()
 {
-    for (auto const& [type, garrison] : _garrisons)
-        if (garrison->GetMissionByRecID(missionRecID))
-            return garrison.get();
+    // The client renders Mythic+ rating purely from these two update fields: the public roster summary
+    // (party frames / inspect) and the owner's full per-season score tree (the Mythic+ UI, score colors).
+    WorldPackets::MythicPlus::DungeonScoreSummary summary;
+    WorldPackets::MythicPlus::DungeonScoreData data;
+    if (MythicPlusData* mythicPlus = GetMythicPlusData())
+    {
+        mythicPlus->BuildDungeonScoreSummary(summary);
+        mythicPlus->BuildDungeonScoreData(data);
+    }
 
-    return nullptr;
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData).ModifyValue(&UF::PlayerData::DungeonScore), std::move(summary));
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::DungeonScore), std::move(data));
+}
+
+void Player::SetItemUpgradeWatermark(uint32 slot, float itemLevel)
+{
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::ItemUpgradeHighWatermark, slot), itemLevel);
 }
 
 Garrison* Player::GetGarrisonWithFollower(uint64 followerDbID) const
@@ -34921,7 +35590,9 @@ bool Player::ProcessItemCast(SpellCastRequest& castRequest, SpellCastTargets con
     }
 
     // check also  BIND_ON_ACQUIRE and BIND_QUEST for .additem or .additemset case by GM (not binded at adding to inventory)
-    if (item->GetBonding() == BIND_ON_USE || item->GetBonding() == BIND_ON_ACQUIRE || item->GetBonding() == BIND_QUEST)
+    if (item->GetBonding() == BIND_ON_USE || item->GetBonding() == BIND_ON_ACQUIRE || item->GetBonding() == BIND_QUEST
+        || item->GetBonding() == BIND_WOW_ACCOUNT || item->GetBonding() == BIND_BNET_ACCOUNT
+        || item->GetBonding() == BIND_BNET_ACCOUNT_UNTIL_EQUIPPED)
     {
         if (!item->IsSoulBound())
         {

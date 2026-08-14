@@ -29,6 +29,8 @@
 #include "CharacterPackets.h"
 #include "ChatPackets.h"
 #include "ClientConfigPackets.h"
+#include "BnetPresenceMgr.h"
+#include "ClubStreamHistoryMgr.h"
 #include "Containers.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
@@ -335,6 +337,15 @@ void WorldSession::AddInstanceConnection(WorldSession* session, std::weak_ptr<Wo
 
     socket->SetWorldSession(session);
     session->m_Socket[CONNECTION_TYPE_INSTANCE] = std::move(socket);
+
+    // Opens the suspend window that HandleContinuePlayerLogin closes with SMSG_RESUME_COMMS one call
+    // below. The captures put SMSG_SUSPEND_COMMS exactly here: on the instance connection, right
+    // after CMSG_ENTER_ENCRYPTED_MODE_ACK, which is the call that lands us in this function.
+    WorldPackets::Auth::SuspendComms suspendComms(CONNECTION_TYPE_INSTANCE);
+    suspendComms.SerialNumber = SPECIAL_SUSPEND_COMMS_TIME_SYNC_COUNTER;
+    session->SendPacket(suspendComms.Write());
+    session->RegisterTimeSync(SPECIAL_SUSPEND_COMMS_TIME_SYNC_COUNTER);
+
     session->HandleContinuePlayerLogin();
 }
 
@@ -598,9 +609,19 @@ void WorldSession::LogoutPlayer(bool save)
 
     if (_player)
     {
-        // Remove any premade group finder listing this player owns.
+        // Remove any premade group finder listing this player owns, and any outstanding applications.
         sLFGListMgr.RemoveListingsBy(_player->GetGUID());
+        sLFGListMgr.RemoveApplicationsBy(_player->GetGUID());
         sLFGListMgr.UnregisterSearch(_player->GetGUID());
+
+        // Drop the live club stream subscriptions and focus. A disconnect never sends UnsubscribeStream,
+        // so without this a stale focus would keep marking a stream read for a player who is gone.
+        sClubStreamHistoryMgr->ClearSessionState(_player->GetGUID());
+
+        // Battle.net presence: the account stays connected but is no longer on a character. Pushed to
+        // presence.v1/v2 subscribers here rather than in World::UpdateSessions, which only sees the
+        // whole session going away.
+        sBnetPresenceMgr->OnCharacterLogout(_player);
 
         if (!_player->GetLootGUID().IsEmpty())
             DoLootReleaseAll();
@@ -671,6 +692,10 @@ void WorldSession::LogoutPlayer(bool save)
         ///- Release battle pet journal lock (after battle cleanup so XP award has journal access)
         if (_battlePetMgr->HasJournalLock())
             _battlePetMgr->ToggleJournalLock(false);
+
+        ///- Release account-wide bank inventory lock
+        if (_player->HasPlayerLocalFlag(PLAYER_LOCAL_FLAG_HAS_ACCOUNT_BANK_LOCK))
+            _player->RemovePlayerLocalFlag(PLAYER_LOCAL_FLAG_HAS_ACCOUNT_BANK_LOCK);
 
         ///- Clear whisper whitelist
         _player->ClearWhisperWhiteList();
@@ -1367,6 +1392,7 @@ public:
         MOUNTS,
         ITEM_APPEARANCES,
         ITEM_FAVORITE_APPEARANCES,
+        ITEM_FAVORITE_TRANSMOG_SETS,
         TRANSMOG_ILLUSIONS,
         TRANSMOG_OUTFITS,
         WARBAND_SCENES,
@@ -1429,6 +1455,10 @@ public:
         stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_BNET_ITEM_FAVORITE_APPEARANCES);
         stmt->setUInt32(0, battlenetAccountId);
         ok = SetPreparedQuery(ITEM_FAVORITE_APPEARANCES, stmt) && ok;
+
+        stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_BNET_ITEM_FAVORITE_TRANSMOG_SETS);
+        stmt->setUInt32(0, battlenetAccountId);
+        ok = SetPreparedQuery(ITEM_FAVORITE_TRANSMOG_SETS, stmt) && ok;
 
         stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_BNET_TRANSMOG_ILLUSIONS);
         stmt->setUInt32(0, battlenetAccountId);
@@ -1512,6 +1542,7 @@ void WorldSession::InitializeSessionCallback(LoginDatabaseQueryHolder const& hol
     _collectionMgr->LoadAccountMounts(holder.GetPreparedResult(AccountInfoQueryHolder::MOUNTS));
     _collectionMgr->LoadAccountStorePurchases(holder.GetPreparedResult(AccountInfoQueryHolder::ACCOUNT_STORE_PURCHASES));
     _collectionMgr->LoadAccountItemAppearances(holder.GetPreparedResult(AccountInfoQueryHolder::ITEM_APPEARANCES), holder.GetPreparedResult(AccountInfoQueryHolder::ITEM_FAVORITE_APPEARANCES));
+    _collectionMgr->LoadAccountFavoriteTransmogSets(holder.GetPreparedResult(AccountInfoQueryHolder::ITEM_FAVORITE_TRANSMOG_SETS));
     _collectionMgr->LoadAccountTransmogIllusions(holder.GetPreparedResult(AccountInfoQueryHolder::TRANSMOG_ILLUSIONS));
     _collectionMgr->LoadAccountTransmogOutfits(holder.GetPreparedResult(AccountInfoQueryHolder::TRANSMOG_OUTFITS));
     _collectionMgr->LoadAccountWarbandScenes(holder.GetPreparedResult(AccountInfoQueryHolder::WARBAND_SCENES));

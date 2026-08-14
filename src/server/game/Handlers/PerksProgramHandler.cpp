@@ -113,6 +113,40 @@ void WorldSession::SendPerksProgramActivityUpdate()
     SendPacket(activityUpdate.Write());
 }
 
+// Sends SMSG_PERKS_ANIM_TOGGLE_KILL_SWITCH: the two client-side feature switches behind
+// C_PerksProgram.IsAttackAnimToggleEnabled() and C_PerksProgram.IsMountSpecialAnimToggleEnabled(). These gate
+// the "hide/show weapon attack animation" and "mount special animation" toggles the Trading Post rewards use;
+// they are a server-side kill switch, not per-character state, and every 12.0.7 capture (68275, 68453 and 68974
+// alike) carries the same enabled/enabled byte. Sent from the login burst so the toggles exist before any UI
+// that reads them is built.
+void WorldSession::SendPerksAnimToggleKillSwitch()
+{
+    WorldPackets::PerksProgram::PerksAnimToggleKillSwitch killSwitch;
+    killSwitch.AttackAnimToggleEnabled = true;
+    killSwitch.MountSpecialAnimToggleEnabled = true;
+    SendPacket(killSwitch.Write());
+}
+
+// CMSG_PERKS_PROGRAM_REQUEST_PENDING_REWARDS: the client asking for Trading Post rewards the account has EARNED
+// but that have NOT been handed out yet -- it draws them as the glowing, uncollected Traveler's Log chest and as
+// the "uncollected Tender" line on the currency tooltip.
+//
+// On this server that set is always empty, and empty is the correct answer rather than a placeholder:
+// PerksProgramActivityMgr::AwardThresholds credits the Trader's Tender for a threshold in the same call that
+// crosses it (Player::AddCurrency, once per threshold), and LoadFromDB only ever restores thresholds that were
+// already paid, so no reward is ever left owing. Reporting one anyway would be worse than saying nothing --
+// the 12.0.7 client has no "claim" opcode at all (the chest is a texture, not a button), so a pending entry
+// the server invented could never be cleared and would leave the chest glowing forever. Retail sends this same
+// four-byte Count = 0 body for a fully-collected account in the 68453 and 68974 captures.
+//
+// The response writer models the full earned-threshold record, so a future deferred-payout model only has to
+// fill Rewards in here.
+void WorldSession::HandlePerksProgramRequestPendingRewards(WorldPackets::PerksProgram::PerksProgramRequestPendingRewards& /*packet*/)
+{
+    WorldPackets::PerksProgram::ResponsePerkPendingRewards response;
+    SendPacket(response.Write());
+}
+
 // Resolves an offered, grantable Trading Post vendor item WITHOUT charging or granting. Returns nullptr if the
 // item is not currently offered, is disabled, has an invalid price, or resolves to no reward the server can grant
 // (a battle pet / illusion / transmog set / warband scene, which BuildVendorList does not yet resolve -- see G2).
@@ -130,6 +164,9 @@ static WorldPackets::PerksProgram::PerksVendorItem const* ResolvePerksPurchase(i
 
 // Whether the resolved reward is already known to the account. Retail hides/blocks owned items; buying one again
 // would burn Trader's Tender and stack a redundant purchase record, so reject it (G11).
+// Otherwise we would charge tender, AddMount/AddToy would be a no-op, and we would still record a
+// "refundable" purchase - whose refund later calls RemoveMount/RemoveToy and REVOKES the collectible
+// the player earned elsewhere while handing back tender.
 static bool IsPerksRewardOwned(CollectionMgr* collectionMgr, WorldPackets::PerksProgram::PerksVendorItem const* item)
 {
     if (item->MountID && collectionMgr->GetAccountMounts().contains(uint32(item->MountID)))

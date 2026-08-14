@@ -695,6 +695,16 @@ struct CampaignEntry
     bool HasFlag(CampaignFlags flag) const { return EnumFlag(static_cast<CampaignFlags>(Flags)).HasFlag(flag); }
 };
 
+struct CampaignXConditionEntry
+{
+    uint32 ID;
+    LocalizedString FailureReason;
+    int32 PlayerConditionID;
+    int32 OrderIndex;
+    int32 Flags;
+    uint32 CampaignID;
+};
+
 struct CampaignXQuestLineEntry
 {
     uint32 ID;
@@ -1212,30 +1222,6 @@ struct CorruptionEffectsEntry
     int32 Flags;
 };
 
-struct RenownRewardsEntry
-{
-    uint32 ID;
-    LocalizedString Name;
-    LocalizedString Description;
-    LocalizedString ToastDescription;
-    int32 CovenantID;
-    int32 Level;
-    int32 Icon;
-    int32 Flags;
-    int32 UiOrder;
-    int32 ItemID;
-    int32 SpellID;
-    int32 MountID;
-    int32 TransmogID;
-    int32 TransmogSetID;
-    int32 CharTitlesID;
-    int32 GarrFollowerID;
-    int32 TransmogIllusionID;
-    int32 Field_12_0_0_63534_016;
-    int32 QuestID;
-    int32 PlayerConditionID;
-};
-
 struct CovenantEntry
 {
     uint32 ID;
@@ -1623,6 +1609,15 @@ struct CriteriaTreeEntry
     int32 Flags;
 
     EnumFlag<CriteriaTreeFlags> GetFlags() const { return static_cast<CriteriaTreeFlags>(Flags); }
+};
+
+struct CurrencyCategoryEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    int32 Flags;
+    uint8 ExpansionID;
+    int32 ParentCategoryID;
 };
 
 struct CurrencyContainerEntry
@@ -2085,6 +2080,16 @@ struct FactionEntry
 };
 
 #define MAX_FACTION_RELATIONS 8
+
+struct FactionGroupEntry
+{
+    uint32 ID;
+    char const* InternalName;
+    LocalizedString Name;
+    uint8 MaskID;
+    int32 HonorCurrencyTextureFileID;
+    int32 ConquestCurrencyTextureFileID;
+};
 
 struct FactionTemplateEntry
 {
@@ -3470,6 +3475,23 @@ struct ItemCreationContextEntry
     uint32 ItemCreationContextGroupID;
 };
 
+struct ItemConversionEntry
+{
+    uint32 ID;
+    int32 Unknown920;
+    int32 ItemBonusTreeID;
+    int32 ItemLogicalCostGroupID;
+    int32 AlternateItemLogicalCostGroupID;
+    int32 PlayerConditionID;
+};
+
+struct ItemConversionEntryEntry
+{
+    uint32 ID;
+    int32 ItemID;
+    uint32 ItemConversionID;
+};
+
 struct ItemCurrencyCostEntry
 {
     uint32 ID;
@@ -3593,6 +3615,15 @@ struct ItemLimitCategoryConditionEntry
     int8 AddQuantity;
     uint32 PlayerConditionID;
     uint32 ParentItemLimitCategoryID;
+};
+
+struct ItemLogicalCostEntry
+{
+    uint32 ID;
+    int32 InventoryTypeSlotMask;
+    int32 Flags;
+    int32 ItemExtendedCostID;
+    uint32 ItemLogicalCostGroupID;
 };
 
 struct ItemModifiedAppearanceEntry
@@ -3865,6 +3896,40 @@ struct KeychainEntry
 {
     uint32 ID;
     std::array<uint8, KEYCHAIN_SIZE> Key;
+};
+
+struct MythicPlusSeasonKeyFloorEntry
+{
+    uint32 ID;
+    int32 KeyFloor;
+    int32 PlayerConditionID;
+    uint32 DisplaySeasonID;
+};
+
+struct MythicPlusSeasonRewardLevelsEntry
+{
+    uint32 ID;
+    uint32 MythicPlusSeasonID;
+    int32 ActivityTierID;
+    int32 DifficultyLevel;
+    int32 WeeklyRewardLevel;
+    int32 EndOfRunRewardLevel;
+};
+
+struct MythicPlusSeasonTrackedAffixEntry
+{
+    uint32 ID;
+    int32 KeystoneAffixID;
+    int32 BonusRating;
+    int32 Field_9_1_0_38511_004;
+    uint32 DisplaySeasonID;
+};
+
+struct MythicPlusSeasonTrackedMapEntry
+{
+    uint32 ID;
+    int32 MapChallengeModeID;
+    uint32 DisplaySeasonID;
 };
 
 struct KeystoneAffixEntry
@@ -4760,6 +4825,18 @@ struct QuestInfoEntry
     uint16 Profession;
 };
 
+struct QuestLineEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    LocalizedString Description;
+    int32 CompletionPlayerConditionID;
+    int32 Flags;
+    uint32 QuestID;
+    int32 PlayerConditionID;
+    int32 Unknown1027_5;
+};
+
 struct QuestLineXQuestEntry
 {
     uint32 ID;
@@ -4821,6 +4898,43 @@ struct RandPropPointsEntry
     std::array<uint32, 5> Epic;
     std::array<uint32, 5> Superior;
     std::array<uint32, 5> Good;
+};
+
+struct RenownRewardsEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    LocalizedString Description;
+    LocalizedString ToastDescription;
+    int32 CovenantID;
+    int32 Level;
+    int32 Icon;
+    int32 Flags;
+    int32 UiOrder;
+    int32 ItemID;
+    int32 SpellID;
+    int32 MountID;
+    int32 TransmogID;
+    int32 TransmogSetID;
+    int32 CharTitlesID;
+    int32 GarrFollowerID;
+    int32 TransmogIllusionID;
+    int32 RewardCategory;        // Field_12_0_0_63534_016 - reward category enum
+    int32 QuestID;
+    int32 PlayerConditionID;
+};
+
+struct RenownRewardsPlunderstormEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    LocalizedString Description;
+    int32 CovenantID;
+    int32 Level;
+    int32 Icon;
+    int32 RewardCategory;        // Field_10_2_6_53840_005
+    int32 UiOrder;
+    int32 SpellID;
 };
 
 struct RewardPackEntry
@@ -6228,6 +6342,12 @@ struct UIChromieTimeExpansionInfoEntry
     int32 RecommendPlayerConditionID;
 };
 
+struct UiTextureKitEntry
+{
+    uint32 ID;
+    char const* KitPrefix;     // textureKit string (e.g. "MajorFaction-DragonscaleExpedition")
+};
+
 #define MAX_UNIT_CONDITION_VALUES 8
 
 struct UnitConditionEntry
@@ -6426,6 +6546,71 @@ struct WarbandScenePlacementEntry
     int32 Field_12_0_0_63534_008;
     int32 SlotID;
     int32 Field_12_0_0_63534_010;
+};
+
+struct WarbandSceneAnimationEntry
+{
+    uint32 ID;
+    int32 SpellVisualKitID;
+    int32 Event;
+    int32 AnimKitID;
+    int32 Field_11_0_0_54210_003;
+    float TimeIsh;
+    uint8 StandState;
+    uint8 SheatheState;
+    int8 Field_11_1_0_58221_008;
+    std::array<int32, 2> Field_11_0_0_54210_005;
+};
+
+struct WarbandSceneAnimChrSpecEntry
+{
+    uint32 ID;
+    int32 WarbandSceneAnimationID;
+    int32 ChrSpecializationID;
+};
+
+struct WarbandScenePlacementFilterReqEntry
+{
+    uint32 ID;
+    uint16 Field_11_1_0_58221_002;
+    int8 Field_11_1_0_58221_005;
+    std::array<int32, 2> Field_11_1_0_58221_003;
+};
+
+struct WarbandScenePlacementOptionEntry
+{
+    DBCPosition3D Position;
+    uint32 ID;
+    uint32 WarbandScenePlacementID;
+    float Orientation;
+    float Scale;
+    int32 Field_11_1_0_58221_005;
+    int32 Field_11_1_0_58221_006;
+};
+
+struct WarbandScenePlcmntAnimOverrideEntry
+{
+    uint32 ID;
+    int32 Field_11_0_0_54210_000;
+    int32 WarbandSceneAnimationID;
+};
+
+struct WarbandPlacementDisplayInfoEntry
+{
+    uint32 ID;
+    uint32 WarbandScenePlacementID;
+    int32 Field_11_2_0_61476_001;
+    int32 Field_11_2_0_61476_002;
+    int32 Field_11_2_0_61476_003;
+    int32 Field_11_2_0_61476_004;
+};
+
+struct WarbandSceneSourceInfoEntry
+{
+    LocalizedString SourceDescription;
+    uint32 ID;
+    uint32 WarbandSceneID;
+    int8 SourceType;
 };
 
 struct WMOAreaTableEntry

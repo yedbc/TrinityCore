@@ -24,6 +24,9 @@
 #include "QuestDef.h"
 #include "QuestPackets.h"
 #include "Timer.h"
+#include "Util.h"
+#include "World.h"
+#include "WorldStateMgr.h"
 
 namespace
 {
@@ -31,6 +34,54 @@ namespace
     constexpr uint32 WORLD_QUEST_UPDATE_INTERVAL = 10 * IN_MILLISECONDS;
     // Fallback active duration when a template row specifies 0 (72h, the retail default observed on the wire).
     constexpr uint32 WORLD_QUEST_DEFAULT_DURATION = 3 * DAY;
+
+    // The realm's own quest reset clock. World.cpp computes these with file-static helpers of the same
+    // name; the logic is repeated here rather than exported because WorldQuestMgr::LoadFromDB runs long
+    // before World::InitQuestResetTimes, so the persisted m_Next*QuestReset values are still 0 at that
+    // point and sWorld->GetNextDailyQuestsResetTime() cannot be used. These depend only on config, which
+    // is loaded first, so they are correct at any time.
+    time_t GetNextDailyResetTime(time_t t)
+    {
+        return GetLocalHourTimestamp(t, sWorld->getIntConfig(CONFIG_DAILY_QUEST_RESET_TIME_HOUR), true);
+    }
+
+    time_t GetNextWeeklyResetTime(time_t t)
+    {
+        t = GetNextDailyResetTime(t);
+        tm time = TimeBreakdown(t);
+        int wday = time.tm_wday;
+        int target = sWorld->getIntConfig(CONFIG_WEEKLY_QUEST_RESET_TIME_WDAY);
+        if (target < wday)
+            wday -= 7;
+        return t + (DAY * (target - wday));
+    }
+
+    // Start of the cycle that currently contains `now`, phase-locked to the reset boundary.
+    //
+    // World quests expire on the reset clock, not at an arbitrary wall-clock offset: the 12.1.0.69273
+    // capture shows daily quests rolling over at the daily reset and weekly ones on the weekly reset day,
+    // with Timer carrying the full cycle length rather than the remaining time. Anchoring to the boundary
+    // is what makes the client's countdown (LastUpdate + Timer - now) agree with the reset the player
+    // sees everywhere else. Anchoring to server start time - the previous behaviour - made a daily quest
+    // expire at whatever hour the server happened to boot.
+    //
+    // Which clock: a whole number of days shorter than a week rides the daily reset; anything a week or
+    // longer, or any duration that is not a whole number of days (302400 = half a week is a real value in
+    // the data), rides the weekly reset, so that half- and multi-week cycles stay in phase with reset day.
+    time_t GetCycleStart(uint32 duration, time_t now)
+    {
+        time_t anchor = (duration >= WEEK || (duration % DAY) != 0)
+            ? GetNextWeeklyResetTime(now) - WEEK
+            : GetNextDailyResetTime(now) - DAY;
+
+        // Both helpers return a boundary strictly after `now` and at most one period out, so `anchor` is
+        // always <= now. Step whole cycles forward until the window contains `now`; this both handles a
+        // duration shorter than its anchor period and stops rounding error accumulating across refreshes.
+        while (anchor + time_t(duration) <= now)
+            anchor += time_t(duration);
+
+        return anchor;
+    }
 }
 
 WorldQuestMgr::WorldQuestMgr() = default;
@@ -78,6 +129,14 @@ void WorldQuestMgr::LoadFromDB()
         tmpl.VariableID = fields[2].GetInt32();
         tmpl.Value = fields[3].GetInt32();
 
+        // The client only displays a world quest when its activation worldstate (VariableID) carries Value
+        // (retail 68974: 178/183 active VariableIDs present in SMSG_INIT_WORLD_STATES with the matching Value,
+        // rotation additions flipped live via SMSG_UPDATE_WORLD_STATE). Activate() pushes the state realm-wide,
+        // which requires the id to not be map-restricted by a `world_state` template row.
+        if (WorldStateTemplate const* worldStateTemplate = WorldStateMgr::GetWorldStateTemplate(tmpl.VariableID); worldStateTemplate && !worldStateTemplate->MapIds.empty())
+            TC_LOG_WARN("sql.sql", "Table `world_quest_template` quest {} uses activation worldstate {} which `world_state` restricts to specific maps - the realm-wide activation value will not be applied, quest will stay hidden.",
+                questId, tmpl.VariableID);
+
         _templates[questId] = tmpl;
         Activate(tmpl, now);
     } while (result->NextRow());
@@ -90,10 +149,16 @@ void WorldQuestMgr::Activate(WorldQuestTemplate const& tmpl, time_t now)
 {
     ActiveWorldQuest& active = _active[tmpl.QuestID];
     active.QuestID = tmpl.QuestID;
-    active.StartTime = now;
-    active.EndTime = now + tmpl.Duration;
+    active.StartTime = GetCycleStart(tmpl.Duration, now);
+    active.EndTime = active.StartTime + tmpl.Duration;
     active.VariableID = tmpl.VariableID;
     active.Value = tmpl.Value;
+
+    // Register the activation worldstate realm-wide so it reaches clients in SMSG_INIT_WORLD_STATES
+    // (and SMSG_UPDATE_WORLD_STATE on rotation changes) - without it the client ignores the quest
+    // entry sent in SMSG_WORLD_QUEST_UPDATE_RESPONSE.
+    if (tmpl.VariableID)
+        WorldStateMgr::SetValue(tmpl.VariableID, tmpl.Value, false, nullptr);
 }
 
 void WorldQuestMgr::Update(uint32 diff)

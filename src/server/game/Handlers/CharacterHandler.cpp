@@ -26,6 +26,7 @@
 #include "Battleground.h"
 #include "BattlegroundPackets.h"
 #include "CalendarMgr.h"
+#include "BnetPresenceMgr.h"
 #include "CharacterCache.h"
 #include "CharacterPackets.h"
 #include "Chat.h"
@@ -51,6 +52,9 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Pet.h"
+#include "ChallengeModeMgr.h"
+#include "ItemConversionMgr.h"
+#include "ItemUpgradeMgr.h"
 #include "Player.h"
 #include "PlayerDump.h"
 #include "QueryHolder.h"
@@ -456,6 +460,15 @@ bool LoginQueryHolder::Initialize()
     stmt->setUInt32(0, GetBattlenetAccountId());
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_REPUTATION, stmt);
 
+    // Phase 10C - renown reward grant tracking (character + warband)
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHAR_RENOWN_REWARDS_GRANTED);
+    stmt->setUInt64(0, lowGuid);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_CHAR_RENOWN_REWARDS_GRANTED, stmt);
+
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_WARBAND_RENOWN_REWARDS_GRANTED);
+    stmt->setUInt32(0, m_battlenetAccountId);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_WARBAND_RENOWN_REWARDS_GRANTED, stmt);
+
     stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_WARBAND_TAXI_MASK);
     stmt->setUInt32(0, GetBattlenetAccountId());
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_WARBAND_TAXI_MASK, stmt);
@@ -474,6 +487,17 @@ bool LoginQueryHolder::Initialize()
     stmt->setUInt32(0, m_battlenetAccountId);
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_WARBAND_ACHIEVEMENT_PROGRESS, stmt);
 
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_ACCOUNT_BANK_TAB_SETTINGS);
+    stmt->setUInt32(0, m_battlenetAccountId);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_TAB_SETTINGS, stmt);
+
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_ACCOUNT_BANK_ITEMS);
+    stmt->setUInt32(0, m_battlenetAccountId);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_ITEMS, stmt);
+
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_ACCOUNT_BANK_COINAGE);
+    stmt->setUInt32(0, m_battlenetAccountId);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_COINAGE, stmt);
     stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_COVENANT_CALLINGS);
     stmt->setUInt64(0, lowGuid);
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_COVENANT_CALLINGS, stmt);
@@ -703,11 +727,18 @@ void WorldSession::HandleCharEnum(CharacterDatabaseQueryHolder const& holder)
                     defaultGroup.Members.push_back(member);
                 }
 
-                // Persist the default group asynchronously
+                // Persist the default group AND its members. Use the same account-scoped derived key the
+                // CMSG_SETUP_WARBAND_GROUPS handler uses (accountId*100 + orderIndex) instead of an AUTO_INCREMENT id:
+                // that lets us insert the members (which need the groupId) HERE rather than dropping them for want of
+                // LAST_INSERT_ID in the async transaction, and keeps the key stable so a later client setup REPLACEs
+                // the same rows. Without the member inserts the auto-populated roster was sent to the client but never
+                // saved, so it vanished on the next login - and the group row DID persist, so the default-creation
+                // branch never re-ran to rebuild it.
+                uint64 const defaultGroupId = uint64(enumHolder.GetBattlenetAccountId()) * 100 + 0; // orderIndex 0
                 CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
 
                 CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_WARBAND_GROUP);
-                stmt->setUInt64(0, 0); // AUTO_INCREMENT - will be assigned by DB
+                stmt->setUInt64(0, defaultGroupId);
                 stmt->setUInt32(1, enumHolder.GetBattlenetAccountId());
                 stmt->setUInt8(2, 0); // orderIndex
                 stmt->setUInt32(3, defaultSceneId);
@@ -716,13 +747,20 @@ void WorldSession::HandleCharEnum(CharacterDatabaseQueryHolder const& holder)
                 stmt->setString(6, std::string());
                 trans->Append(stmt);
 
-                CharacterDatabase.CommitTransaction(trans);
+                for (uint32 memberIdx = 0; memberIdx < defaultGroup.Members.size(); ++memberIdx)
+                {
+                    WorldPackets::Character::WarbandGroupMember const& member = defaultGroup.Members[memberIdx];
+                    stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_WARBAND_GROUP_MEMBER);
+                    stmt->setUInt64(0, defaultGroupId);
+                    stmt->setUInt8(1, uint8(memberIdx));
+                    stmt->setUInt64(2, member.Guid.GetCounter());
+                    stmt->setUInt32(3, member.WarbandScenePlacementID);
+                    stmt->setInt32(4, member.Type);
+                    stmt->setInt32(5, member.ContentSetID);
+                    trans->Append(stmt);
+                }
 
-                // We need the auto-generated groupId for subsequent member inserts.
-                // Since we can't get LAST_INSERT_ID in an async transaction easily,
-                // we'll set a temporary GroupID of 0 in the packet; the client echoes it back
-                // in CMSG_SETUP_WARBAND_GROUPS, but the handler re-derives the persistence key
-                // from the account id + order index, so the echoed value is never trusted.
+                CharacterDatabase.CommitTransaction(trans);
             }
         }
     }
@@ -773,19 +811,35 @@ void WorldSession::HandleSetupWarbandGroups(WorldPackets::Character::SetupWarban
 {
     uint32 battlenetAccountId = GetBattlenetAccountId();
 
-    // Validate: max 5 groups
-    if (setupWarbandGroups.Groups.size() > 5)
+    // Cap taken from the client itself, not from patch notes: the 12.0.7 client exposes the limit to Lua as
+    // GetMaxWarbandGroupCount(), which is a zero-argument constant getter returning 20. In the 68275 binary
+    // (wow_dump.bin, ImageBase 0x7FF7B3140000) that function is at RVA 0xAE7DF0 - it loads its own name string
+    // "GetMaxWarbandGroupCount" (RVA 0x3A87498) and the returned constant with
+    // "mov dword ptr [rbp+0x20], 0x14" at RVA 0xAE7E36, i.e. 20. Reading that slot as the return value was
+    // validated by extracting the same pattern across all 26 sibling constant getters and checking the ones
+    // whose values are independently known: GetIslandsMaxGroupSize=3, GetMaxNumQuestsCanAccept=35,
+    // GetMaxNumTeams=2, GetWarResourcesCurrencyID=1560, GetDragonIslesSuppliesCurrencyID=2003,
+    // GetAzeriteCurrencyID=1553 - all correct. The client is also the thing that enforces this cap in the UI:
+    // Blizzard_GlueXML/Mainline/CharacterSelect.lua:1381 gates the Add Group button on
+    // "CharacterSelectListUtil.GetTotalGroupCount() >= GetMaxWarbandGroupCount()", and
+    // CharacterSelect/CharacterSelectList.lua:13 formats the disabled tooltip with the same value.
+    constexpr std::size_t MaxWarbandGroups = 20;
+
+    // The OrderIndex de-duplication below tracks seen indexes in a uint32 bitmask.
+    static_assert(MaxWarbandGroups <= 32, "seenOrderIndexes has room for at most 32 order indexes");
+
+    if (setupWarbandGroups.Groups.size() > MaxWarbandGroups)
     {
-        TC_LOG_ERROR("network", "WorldSession::HandleSetupWarbandGroups: Account {} sent {} groups, max is 5",
-            battlenetAccountId, setupWarbandGroups.Groups.size());
+        TC_LOG_ERROR("network", "WorldSession::HandleSetupWarbandGroups: Account {} sent {} groups, max is {}",
+            battlenetAccountId, setupWarbandGroups.Groups.size(), MaxWarbandGroups);
         return;
     }
 
     uint32 seenOrderIndexes = 0;
     for (auto const& group : setupWarbandGroups.Groups)
     {
-        // Validate order index: bounded and unique so the derived group key cannot collide
-        if (group.OrderIndex >= 20 || (seenOrderIndexes & (1u << group.OrderIndex)))
+        // Bound and de-duplicate OrderIndex against the same cap, so the two can never disagree.
+        if (group.OrderIndex >= MaxWarbandGroups || (seenOrderIndexes & (1u << group.OrderIndex)))
         {
             TC_LOG_ERROR("network", "WorldSession::HandleSetupWarbandGroups: Account {} sent invalid or duplicate OrderIndex {}",
                 battlenetAccountId, group.OrderIndex);
@@ -844,7 +898,10 @@ void WorldSession::HandleSetupWarbandGroups(WorldPackets::Character::SetupWarban
         stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_WARBAND_GROUP);
         stmt->setUInt64(0, groupId);
         stmt->setUInt32(1, battlenetAccountId);
-        stmt->setUInt8(2, groupIdx);
+        // Persist the actual OrderIndex (the same value the account-scoped key is derived from), NOT the loop
+        // position groupIdx - otherwise sparse/reordered slots (e.g. OrderIndex 0,2,5) are rewritten as 0,1,2 and
+        // the ordering is silently corrupted on reload.
+        stmt->setUInt8(2, group.OrderIndex);
         stmt->setUInt32(3, group.WarbandSceneID);
         stmt->setUInt32(4, group.Flags);
         stmt->setInt32(5, group.ContentSetID);
@@ -1557,6 +1614,10 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     // Hand over anything bought earlier and assigned to this character (see RedeemBattlePayEntitlements).
     RedeemBattlePayEntitlements();
 
+    // Trading Post animation-toggle kill switch; retail places it here, between SMSG_FEATURE_SYSTEM_STATUS and
+    // SMSG_MOTD.
+    SendPerksAnimToggleKillSwitch();
+
     // Send MOTD
     {
         WorldPackets::System::MOTD motd;
@@ -1671,6 +1732,15 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     // Now in world: grant any covenant renown rewards earned before this character was last saved / before the feature existed.
     pCurrChar->UpdateAllRenownRewards();
+    // Mythic+ weekly keystone maintenance: after a weekly reset the carried keystone is adjusted from last week's
+    // runs and restamped with the new week's affixes (no new key is granted here; the Great Vault does that).
+    sChallengeModeMgr.UpdateKeystoneForNewWeek(pCurrChar, false /*createIfMissing*/);
+
+    // Matrix Catalyst charge accrual (biweekly drip, lazily granted at login).
+    sItemConversionMgr.UpdateCharges(pCurrChar);
+
+    // Item upgrade watermarks (per-slot crest-waiver levels shown by the upgrade UI).
+    sItemUpgradeMgr.LoadWatermarks(pCurrChar);
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_ONLINE);
     stmt->setUInt64(0, pCurrChar->GetGUID().GetCounter());
@@ -1871,6 +1941,10 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     sScriptMgr->OnPlayerLogin(pCurrChar, firstLogin);
 
+    // Battle.net presence: the account is now on a specific character. Pushed to presence.v1/v2
+    // subscribers and mirrored into battlenet_game_account_presence.
+    sBnetPresenceMgr->OnCharacterLogin(pCurrChar);
+
     TC_METRIC_EVENT("player_events", "Login", pCurrChar->GetName());
 }
 
@@ -1893,6 +1967,12 @@ void WorldSession::SendFeatureSystemStatus()
     features.CharacterCommunitiesEnabled = false;
     features.ClubPresenceAllowSubscribeAll = true;
     features.ClubPresenceUnsubscribeDelay = 60000;
+
+    // Club Finder (guild recruitment) master gate. The client's C_ClubFinder.IsEnabled()
+    // reads this bit; while false the Club Finder / guild-recruitment UI is greyed out and
+    // no CMSG_CLUB_FINDER_* is ever sent, so our ClubFinderMgr guild-posting path is unreachable.
+    // We implemented the worldserver-side guild club finder (feature/club-finder), so advertise it.
+    features.ClubFinderEnabled = true;
 
     features.EuropaTicketSystemStatus.emplace();
     features.EuropaTicketSystemStatus->ThrottleState.MaxTries = 10;
@@ -1946,6 +2026,23 @@ void WorldSession::SendFeatureSystemStatus()
         }, gameRule.Value);
     }
 
+    // Recruit A Friend. WorldSession::HandleGetRafAccountInfo / HandleRafGenerateRecruitmentLink /
+    // HandleRafClaimActivityReward / HandleRemoveRafRecruit / HandleRafClaimNextReward (ReferAFriendHandler.cpp)
+    // implement the full 5-CMSG/4-SMSG surface against the login-DB recruit tables, but the client's
+    // C_RecruitAFriend.IsEnabled() reads these bits and they have never been assigned - so the whole feature has
+    // been unreachable. Advertise it.
+    features.RAFSystem.Enabled            = sWorld->getBoolConfig(CONFIG_FEATURE_RAF_ENABLED);
+    features.RAFSystem.RecruitingEnabled  = sWorld->getBoolConfig(CONFIG_FEATURE_RAF_RECRUITING_ENABLED);
+    features.RAFSystem.MaxRecruits        = sWorld->getIntConfig(CONFIG_RAF_MAX_RECRUITS);
+    features.RAFSystem.MaxRecruitMonths   = sWorld->getIntConfig(CONFIG_RAF_MAX_RECRUIT_MONTHS);
+    features.RAFSystem.MaxRecruitmentUses = sWorld->getIntConfig(CONFIG_RAF_MAX_RECRUITMENT_USES);
+    features.RAFSystem.DaysInCycle        = sWorld->getIntConfig(CONFIG_RAF_DAYS_IN_CYCLE);
+    features.RAFSystem.RewardsVersion     = 2;   // RAF 3.0 - what RafActivity.db2 (our reward source) describes
+
+    // Dungeon Finder. game/DungeonFinding/ (12 files) is fully wired - CMSG_DF_JOIN -> HandleLfgJoinOpcode etc.
+    // This bit gates the client-side Dungeon Finder UI; without it the tab is greyed and no CMSG_DF_* is ever sent.
+    features.LfdEnabled = sWorld->getIntConfig(CONFIG_LFG_OPTIONSMASK) != 0;
+
     features.AddonChatThrottle.MaxTries = 10;
     features.AddonChatThrottle.TriesRestoredPerSecond = 1;
     features.AddonChatThrottle.UsedTriesPerMessage = 1;
@@ -1955,6 +2052,82 @@ void WorldSession::SendFeatureSystemStatus()
     features.GroupChatThrottle.TriesRestoredPerSecond = 20;
 
     SendPacket(features.Write());
+}
+
+// CMSG_GET_ACCOUNT_CHARACTER_LIST -> SMSG_GET_ACCOUNT_CHARACTER_LIST_RESULT.
+//
+// The client's warband / collections / RAF / shop screens read this list through
+// C_AccountInfo.GetAccountCharacterInfo(index); until now the request was Handle_NULL and the response opcode was
+// send-blocked, so the list was always empty and the ACCOUNT_CHARACTER_LIST_RECIEVED event never fired.
+//
+// The answer is every non-deleted character on every game account linked to this battlenet account. On a
+// single-realm deployment that is the complete account-wide list, so no cross-realm aggregation is needed - all
+// entries carry this realm's virtual address and name.
+void WorldSession::HandleGetAccountCharacterList(WorldPackets::Character::GetAccountCharacterList& getAccountCharacterList)
+{
+    uint32 token = getAccountCharacterList.Token;
+
+    LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_SEL_BNET_GAME_ACCOUNT_IDS);
+    stmt->setUInt32(0, GetBattlenetAccountId());
+
+    GetQueryProcessor().AddCallback(LoginDatabase.AsyncQuery(stmt).WithPreparedCallback([this, token](PreparedQueryResult accountsResult)
+    {
+        if (!accountsResult)
+        {
+            WorldPackets::Character::GetAccountCharacterListResult failure;
+            failure.Token = token;
+            failure.Success = false;
+            SendPacket(failure.Write());
+            return;
+        }
+
+        std::string accountIds;
+        do
+        {
+            if (!accountIds.empty())
+                accountIds += ',';
+            accountIds += std::to_string(accountsResult->Fetch()[0].GetUInt32());
+        } while (accountsResult->NextRow());
+
+        // The game-account id list is variable length, so this cannot be a prepared statement. Every element is a
+        // uint32 rendered by std::to_string, so the interpolation carries no attacker-controlled text.
+        std::string sql = Trinity::StringFormat(
+            "SELECT guid, name, race, class, gender, level FROM characters WHERE account IN ({}) AND deleteDate IS NULL ORDER BY guid", accountIds);
+
+        GetQueryProcessor().AddCallback(CharacterDatabase.AsyncQuery(sql.c_str())
+            .WithCallback([this, token](QueryResult charactersResult)
+        {
+            WorldPackets::Character::GetAccountCharacterListResult response;
+            response.Token = token;
+            response.Success = true;
+
+            std::string realmName;
+            if (std::shared_ptr<Realm const> currentRealm = sRealmList->GetCurrentRealm())
+                realmName = currentRealm->Name;
+
+            uint32 virtualRealmAddress = GetVirtualRealmAddress();
+
+            if (charactersResult)
+            {
+                do
+                {
+                    Field* fields = charactersResult->Fetch();
+
+                    WorldPackets::Character::GetAccountCharacterListResult::AccountCharacter& character = response.Characters.emplace_back();
+                    character.CharacterGUID = ObjectGuid::Create<HighGuid::Player>(fields[0].GetUInt64());
+                    character.Name = fields[1].GetString();
+                    character.RaceID = fields[2].GetUInt8();
+                    character.ClassID = fields[3].GetUInt8();
+                    character.SexID = fields[4].GetUInt8();
+                    character.ExperienceLevel = fields[5].GetUInt8();
+                    character.VirtualRealmAddress = virtualRealmAddress;
+                    character.RealmName = realmName;
+                } while (charactersResult->NextRow());
+            }
+
+            SendPacket(response.Write());
+        }));
+    }));
 }
 
 void WorldSession::HandleSetFactionAtWar(WorldPackets::Character::SetFactionAtWar& packet)

@@ -982,12 +982,12 @@ HousingResult Housing::PlaceDecor(uint32 decorEntryId, float x, float y, float z
     if (GetDecorCount() >= maxDecor)
         return HOUSING_RESULT_MAX_DECOR_REACHED;
 
-    // Check WeightCost-based budget (exterior vs interior) — M2: classify once.
+    // Check WeightCost-based budget (exterior vs interior) - same classification as the reload recompute.
     uint32 weightCost = sHousingMgr.GetDecorWeightCost(decorEntryId);
     bool const isExterior = IsExteriorDecorPlacement(roomGuid);
     if (isExterior)
     {
-        // Outdoor decor uses exterior budget
+        // Outdoor / exterior-plot decor uses exterior budget
         if (_exteriorDecorWeightUsed + weightCost > GetMaxExteriorDecorBudget())
             return HOUSING_RESULT_MAX_DECOR_REACHED;
     }
@@ -2485,16 +2485,12 @@ uint32 Housing::GetMaxFixtureBudget() const
     return sHousingMgr.GetFixtureBudgetForLevel(_level);
 }
 
-bool Housing::IsExteriorDecorPlacement(ObjectGuid roomGuid)
+bool Housing::IsExteriorPlotRoomGuid(ObjectGuid const& roomGuid) const
 {
-    // No room → yard/exterior placement.
-    if (roomGuid.IsEmpty())
-        return true;
-
-    // The plot's base (exterior) room identity: HighGuid::Housing, subType==2,
-    // low 32 bits of the high word == the base room entry id. Retail always
-    // sends this RoomGuid for exterior decor even though it is "on a room".
-    return roomGuid.GetHigh() == HighGuid::Housing
+    // The plot's exterior "room": a Housing-high GUID whose type nibble (bits 53-57 of the high qword) is 2 and
+    // whose low 32 bits are the base-room entry id. Retail sends this as the RoomGuid for exterior placements.
+    return !roomGuid.IsEmpty()
+        && roomGuid.GetHigh() == HighGuid::Housing
         && uint32((roomGuid.GetRawValue(1) >> 53) & 0x1F) == 2
         && uint32(roomGuid.GetRawValue(1) & 0xFFFFFFFFULL) == sHousingMgr.GetBaseRoomEntryId();
 }
@@ -2506,7 +2502,8 @@ void Housing::RecalculateBudgets()
     _roomWeightUsed = 0;
     _fixtureWeightUsed = 0;
 
-    // Sum WeightCost of all placed decor, routing to interior or exterior budget
+    // Sum WeightCost of all placed decor, routing to interior or exterior budget. Must use the SAME classification
+    // as PlaceDecor (IsExteriorDecorPlacement) so a reload does not reclassify exterior-plot decor as interior.
     for (auto const& [guid, decor] : _placedDecor)
     {
         uint32 weightCost = sHousingMgr.GetDecorWeightCost(decor.DecorEntryId);

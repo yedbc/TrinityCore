@@ -178,6 +178,8 @@ WorldPacket const* ReattachResurrect::Write()
     return &_worldPacket;
 }
 
+
+
 void ViolenceLevel::Read()
 {
     _worldPacket >> ViolenceLvl;
@@ -194,6 +196,11 @@ void TimeSyncResponse::Read()
 {
     _worldPacket >> SequenceIndex;
     _worldPacket >> ClientTime;
+}
+
+void DiscardedTimeSyncAcks::Read()
+{
+    _worldPacket >> MaxSequenceIndex;
 }
 
 WorldPacket const* TriggerCinematic::Write()
@@ -269,6 +276,40 @@ void SetRaidDifficulty::Read()
 {
     _worldPacket >> Legacy;
     _worldPacket >> DifficultyID;
+}
+
+WorldPacket const* ChangePlayerDifficultyResult::Write()
+{
+    // The client reads one byte and splits it Result = b >> 4, InCombat = (b >> 3) & 1, which is
+    // what these two bit writes plus the flush produce. Both captured bodies open with exactly
+    // this: 0xC0 = Result 12 / InCombat 0, and 0x60 = Result 6 / InCombat 0.
+    _worldPacket << Bits<4>(Result);
+    _worldPacket << Bits<1>(InCombat);
+    _worldPacket.FlushBits();
+
+    // Which trailing fields exist is decided by Result in the client's own reader; everything
+    // not listed here is the leading byte and nothing else.
+    switch (Result)
+    {
+        case ChangePlayerDifficultyResultCode::Cooldown:
+        case ChangePlayerDifficultyResultCode::Pending:
+            _worldPacket << int64(Cooldown);
+            break;
+        case ChangePlayerDifficultyResultCode::MapDifficultyMessage:
+            _worldPacket << int32(MapDifficultyID);
+            break;
+        case ChangePlayerDifficultyResultCode::OtherHeroic:
+            _worldPacket << PlayerGUID;
+            break;
+        case ChangePlayerDifficultyResultCode::Success:
+            _worldPacket << int32(MapID);
+            _worldPacket << uint16(DifficultyID);
+            break;
+        default:
+            break;
+    }
+
+    return &_worldPacket;
 }
 
 WorldPacket const* DungeonDifficultySet::Write()
@@ -801,6 +842,47 @@ WorldPacket const* StartTimer::Write()
 
     if (PlayerGuid)
         _worldPacket << *PlayerGuid;
+
+    return &_worldPacket;
+}
+
+WorldPacket const* StopTimer::Write()
+{
+    _worldPacket << int32(Type);
+
+    return &_worldPacket;
+}
+
+// Duration first, then the id - see the ElapsedTimer comment in MiscPackets.h.
+ByteBuffer& operator<<(ByteBuffer& data, ElapsedTimer const& timer)
+{
+    data << timer.CurrentDuration;
+    data << uint32(timer.TimerID);
+
+    return data;
+}
+
+WorldPacket const* StartElapsedTimer::Write()
+{
+    _worldPacket << Timer;
+
+    return &_worldPacket;
+}
+
+WorldPacket const* StartElapsedTimers::Write()
+{
+    _worldPacket << uint32(Timers.size());
+    for (ElapsedTimer const& timer : Timers)
+        _worldPacket << timer;
+
+    return &_worldPacket;
+}
+
+WorldPacket const* StopElapsedTimer::Write()
+{
+    _worldPacket << uint32(TimerID);
+    _worldPacket.WriteBit(KeepTimer);
+    _worldPacket.FlushBits();
 
     return &_worldPacket;
 }

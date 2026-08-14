@@ -23,9 +23,11 @@
 #include "DB2Stores.h"
 #include "GossipDef.h"
 #include "Item.h"
+#include "ItemConversionMgr.h"
 #include "ItemPackets.h"
 #include "Log.h"
 #include "NPCPackets.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "World.h"
@@ -912,6 +914,15 @@ void WorldSession::HandleSocketGems(WorldPackets::Item::SocketGems& socketGems)
     if (!socketGems.ItemGuid)
         return;
 
+    // Tell the client its socketing attempt was rejected (mirror of the SMSG_SOCKET_GEMS_SUCCESS sent on success),
+    // so the gem-socket UI clears the pending state instead of hanging.
+    auto sendSocketFailure = [&]()
+    {
+        WorldPackets::Item::SocketGemsFailure failure;
+        failure.Item = socketGems.ItemGuid;
+        SendPacket(failure.Write());
+    };
+
     //cheat -> tried to socket same gem multiple times
     if ((!socketGems.GemItem[0].IsEmpty() && (socketGems.GemItem[0] == socketGems.GemItem[1] || socketGems.GemItem[0] == socketGems.GemItem[2])) ||
         (!socketGems.GemItem[1].IsEmpty() && (socketGems.GemItem[1] == socketGems.GemItem[2])))
@@ -919,11 +930,17 @@ void WorldSession::HandleSocketGems(WorldPackets::Item::SocketGems& socketGems)
 
     Item* itemTarget = _player->GetItemByGuid(socketGems.ItemGuid);
     if (!itemTarget)                                         //missing item to socket
+    {
+        sendSocketFailure();
         return;
+    }
 
     ItemTemplate const* itemProto = itemTarget->GetTemplate();
     if (!itemProto)
+    {
+        sendSocketFailure();
         return;
+    }
 
     //this slot is excepted when applying / removing meta gem bonus
     uint8 slot = itemTarget->IsEquipped() ? itemTarget->GetSlot() : uint8(NULL_SLOT);
@@ -970,10 +987,16 @@ void WorldSession::HandleSocketGems(WorldPackets::Item::SocketGems& socketGems)
             {
                 // no prismatic socket
                 if (!itemTarget->GetEnchantmentId(PRISMATIC_ENCHANTMENT_SLOT))
+                {
+                    sendSocketFailure();
                     return;
+                }
 
                 if (i != firstPrismatic)
+                {
+                    sendSocketFailure();
                     return;
+                }
 
                 acceptableGemTypeMask = SOCKET_COLOR_RED | SOCKET_COLOR_YELLOW | SOCKET_COLOR_BLUE;
                 break;
@@ -990,7 +1013,10 @@ void WorldSession::HandleSocketGems(WorldPackets::Item::SocketGems& socketGems)
 
         // Gem must match socket color
         if (!(acceptableGemTypeMask & gemProperties[i]->Type))
+        {
+            sendSocketFailure();
             return;
+        }
     }
 
     // check unique-equipped conditions
@@ -1314,18 +1340,27 @@ void WorldSession::HandleSetBankAutosortDisabled(WorldPackets::Item::SetBankAuto
 
 void WorldSession::HandlePerformItemInteraction(WorldPackets::Item::PerformItemInteraction& performItemInteraction)
 {
-    if (!_player->GetNPCIfCanInteractWith(performItemInteraction.Banker, UNIT_NPC_FLAG_NONE, UNIT_NPC_FLAG_2_NONE))
-        return;
+    Player* player = GetPlayer();
 
-    Item* item = _player->GetItemByGuid(performItemInteraction.ItemGuid);
-    if (!item)
-        return;
+    WorldPackets::Item::ItemInteractionComplete response;
+    response.Error = true;
 
-    // TODO: Implement specific item interaction logic based on InteractionID
-    // For now, acknowledge the interaction
-    WorldPackets::Item::ItemInteractionComplete result;
-    result.InteractionID = performItemInteraction.InteractionID;
-    SendPacket(result.Write());
+    // UIItemInteractionType::ItemConversion (4) is the only interaction the server implements (Matrix Catalyst).
+    constexpr int32 UI_ITEM_INTERACTION_ITEM_CONVERSION = 4;
+
+    // The interaction agent the client has open must exist near the player (the Catalyst console/steward).
+    // Kept as a range check only: which unit/GO offers the UI is world content (UiItemInteractionID links).
+    bool agentOk = performItemInteraction.AgentGuid.IsEmpty();
+    if (!agentOk)
+        if (WorldObject const* agent = ObjectAccessor::GetWorldObject(*player, performItemInteraction.AgentGuid))
+            agentOk = player->IsWithinDistInMap(agent, INTERACTION_DISTANCE * 4);
+
+    if (agentOk && performItemInteraction.InteractionType == UI_ITEM_INTERACTION_ITEM_CONVERSION)
+        if (Item* item = player->GetItemByGuid(performItemInteraction.ItemGuid))
+            if (sItemConversionMgr.PerformConversion(player, item))
+                response.Error = false;
+
+    SendPacket(response.Write());
 }
 
 void WorldSession::HandleConvertItemToBindToAccount(WorldPackets::Item::ConvertItemToBindToAccount& convertItemToBindToAccount)

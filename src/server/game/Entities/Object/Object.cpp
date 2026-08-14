@@ -1152,6 +1152,36 @@ void WorldObject::SendCombatLogMessage(WorldPackets::CombatLog::CombatLogServerP
     Cell::VisitWorldObjects(this, notifier, GetVisibilityRange());
 }
 
+struct MultiCombatLogSender
+{
+    std::span<WorldPackets::CombatLog::CombatLogServerPacket* const> i_messages;
+
+    explicit MultiCombatLogSender(std::span<WorldPackets::CombatLog::CombatLogServerPacket* const> msgs)
+        : i_messages(msgs)
+    {
+        for (WorldPackets::CombatLog::CombatLogServerPacket* msg : i_messages)
+            msg->Write();
+    }
+
+    void operator()(Player const* player) const
+    {
+        bool const advancedLogging = player->IsAdvancedCombatLoggingEnabled();
+        for (WorldPackets::CombatLog::CombatLogServerPacket const* msg : i_messages)
+            player->SendDirectMessage(advancedLogging ? msg->GetFullLogPacket() : msg->GetBasicLogPacket());
+    }
+};
+
+void WorldObject::SendCombatLogMessages(std::span<WorldPackets::CombatLog::CombatLogServerPacket* const> combatLogs) const
+{
+    MultiCombatLogSender combatLogSender(combatLogs);
+
+    if (Player const* self = ToPlayer())
+        combatLogSender(self);
+
+    Trinity::MessageDistDeliverer<MultiCombatLogSender> notifier(this, combatLogSender, GetVisibilityRange());
+    Cell::VisitWorldObjects(this, notifier, GetVisibilityRange());
+}
+
 void WorldObject::SetMap(Map* map)
 {
     ASSERT(map);
@@ -2854,7 +2884,7 @@ void WorldObject::MovePositionToFirstCollision(Position &pos, float dist, float 
     // Use a detour raycast to get our first collision point
     PathGenerator path(this);
     path.SetUseRaycast(true);
-    path.CalculatePath(pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(), destx, desty, destz, false);
+    path.CalculatePath(destx, desty, destz, false);
 
     // Check for valid path types before we proceed
     if (!(path.GetPathType() & PATHFIND_NOT_USING_PATH))

@@ -528,9 +528,10 @@ namespace WorldPackets
             std::vector<uint32> CraftableItemIDs;
         };
 
-        // (Order Advancement opens via the generic gossip immersive-interaction path -- GossipNPCOption.db2
-        // GossipNpcOptionID -> PlayerInteractionType::GarrTalent -> GARRISON_TALENT_NPC_OPENED. No dedicated
-        // open-talent packet is needed; see Player::OnGossipSelect.)
+        // NOTE: the class-hall Order Advancement talent tree does NOT use a dedicated open packet. The client opens it
+        // from the gossip option itself: SMSG_GOSSIP_OPTION_NPC_INTERACTION carrying the option's GossipNpcOptionID,
+        // which the client resolves via GossipNPCOption.db2 to PlayerInteractionType::GarrTalent and fires
+        // GARRISON_TALENT_NPC_OPENED. See Player::OnGossipSelect (GarrisonTalent falls through to the generic path).
 
         // IDA case 4980817 (§8.51): generic byte-block helper. Conservative shape: {u32 NewMinLevel}.
         class GarrisonAutoTroopMinLevelUpdateResult final : public ServerPacket

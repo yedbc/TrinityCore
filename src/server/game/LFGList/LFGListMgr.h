@@ -51,6 +51,7 @@ namespace LFGList
         uint32 ItemLevel = 0;
         std::string Comment;
         ApplicationState State = ApplicationState::Applied;
+        uint32 AppliedTime = 0;             // drives the retail 300s application timeout (sniff-verified)
     };
 
     // One published group listing.
@@ -64,7 +65,7 @@ namespace LFGList
         uint32 ExpireTime = 0;
         std::vector<Application> Applications;
 
-        uint32 GetActivityID() const { return Descriptor.ActivityID; }
+        uint32 GetCategoryID() const { return Descriptor.CategoryID; }
     };
 }
 
@@ -86,15 +87,16 @@ public:
     LFGList::Listing* GetListingByLeader(ObjectGuid leader);
 
     // Search the registry. Any argument left 0 acts as a wildcard. Results are capped by config.
-    std::vector<LFGList::Listing const*> Search(uint8 category, uint8 activityGroup, uint32 activityId) const;
+    std::vector<LFGList::Listing const*> Search(uint32 category, uint32 activityGroup, uint32 activityId, std::string const& keyword = std::string()) const;
 
-    // Fills one search-result row for a listing (shared by the search reply and the live update push).
+    // Fills one search-result row for a listing. Shared by the search reply, the apply-result snapshot and the
+    // live update push so all three serialize a listing identically.
     void FillSearchRow(WorldPackets::LFGList::SearchResultListing& row, LFGList::Listing const& listing) const;
 
     // Live search updates. While a player has the Premade Groups browser open, retail keeps pushing
-    // SMSG_LFG_LIST_SEARCH_RESULTS_UPDATE as listings appear/change. A search registers the player's
-    // filters here; listing mutations then push the affected row to every matching subscriber.
-    void RegisterSearch(ObjectGuid player, uint8 category, uint8 activityGroup);
+    // SMSG_LFG_LIST_SEARCH_RESULTS_UPDATE as listings appear/change. A search registers the player's filters
+    // here; listing mutations then push the affected row to every subscriber whose filters still match.
+    void RegisterSearch(ObjectGuid player, uint32 category, uint32 activityGroup, std::string const& keyword);
     void UnregisterSearch(ObjectGuid player);
     void NotifyListingChanged(uint32 listingId);
 
@@ -104,17 +106,22 @@ public:
     LFGList::Application* GetApplication(uint32 applicationId);
     bool SetApplicationState(uint32 applicationId, LFGList::ApplicationState state);
     void RemoveApplication(uint32 applicationId);
+    // Drops every application this player has outstanding (logout cleanup).
+    void RemoveApplicationsBy(ObjectGuid applicant);
+    // Refreshes the listing's expiry window (retail: activity extends the 30-minute lifetime).
+    void TouchListing(LFGList::Listing& listing);
 
 private:
     LFGListMgr() = default;
 
-    // An open Premade Groups browser: the filters the player last searched with. 0 = wildcard, matching
-    // Search(). Refreshed by every search; expires so a client that closed the browser (there is no
-    // "stopped searching" opcode) stops receiving pushes.
+    // An open Premade Groups browser: the filters the player last searched with. 0 / empty = wildcard, matching
+    // Search(). Refreshed by every search; expires so a client that closed the browser (there is no "stopped
+    // searching" opcode) stops receiving pushes.
     struct SearchSubscription
     {
-        uint8 CategoryId = 0;
-        uint8 ActivityGroupId = 0;
+        uint32 CategoryId = 0;
+        uint32 ActivityGroupId = 0;
+        std::string Keyword;
         uint32 ExpireTime = 0;
     };
 

@@ -141,6 +141,11 @@ namespace WorldPackets
         enum class UpdateCollisionHeightReason : uint8;
     }
 
+    namespace Party
+    {
+        struct PartyMemberStatsSnapshot;
+    }
+
     namespace Traits
     {
         struct TraitConfig;
@@ -863,7 +868,7 @@ enum class ItemSearchLocation
     Inventory       = 0x02,
     Bank            = 0x04,
     ReagentBank     = 0x08,
-    AccountBank     = 0x10, // NYI
+    AccountBank     = 0x10,
 
     Default         = Equipment | Inventory,
     Everywhere      = Equipment | Inventory | Bank | ReagentBank
@@ -1066,8 +1071,13 @@ enum PlayerLoginQueryIndex
     PLAYER_LOGIN_QUERY_LOAD_WARBAND_MAX_LEVEL_COUNT,
     PLAYER_LOGIN_QUERY_LOAD_WARBAND_ACHIEVEMENTS,
     PLAYER_LOGIN_QUERY_LOAD_WARBAND_ACHIEVEMENT_PROGRESS,
+    PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_TAB_SETTINGS,
+    PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_ITEMS,
+    PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_COINAGE,
     PLAYER_LOGIN_QUERY_LOAD_COVENANT_CALLINGS,
     PLAYER_LOGIN_QUERY_LOAD_COVENANT_SOULBINDS,
+    PLAYER_LOGIN_QUERY_LOAD_CHAR_RENOWN_REWARDS_GRANTED,
+    PLAYER_LOGIN_QUERY_LOAD_WARBAND_RENOWN_REWARDS_GRANTED,
     MAX_PLAYER_LOGIN_QUERY
 };
 
@@ -1389,6 +1399,9 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         std::array<uint32, MAX_PLAYED_TIME_INDEX> m_Played_time;
         uint32 GetTotalPlayedTime() const { return m_Played_time[PLAYED_TIME_TOTAL]; }
         uint32 GetLevelPlayedTime() const { return m_Played_time[PLAYED_TIME_LEVEL]; }
+        // Wall-clock creation time of this character (characters.createTime). Used by ModifierTreeType
+        // PlayerCreatedCharacterLessThanHoursAgoRealTime (204), the real-time sibling of the played-time check.
+        time_t GetCharacterCreateTime() const { return m_createTime; }
 
         Gender GetNativeGender() const override { return Gender(*m_playerData->NativeSex); }
         void SetNativeGender(Gender gender) override { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData).ModifyValue(&UF::PlayerData::NativeSex), gender); }
@@ -1400,6 +1413,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         PetStable const* GetPetStable() const { return m_petStable.get(); }
         void AddPetToUpdateFields(PetStable::PetInfo const& pet, PetSaveMode slot, PetStableFlags flags);
         void SetPetSlot(uint32 petNumber, PetSaveMode dstPetSlot);
+        void SetPetFavorite(uint32 petNumber, bool favorite);   // CMSG_SET_PET_FAVORITE: pin/unpin a stable pet
         ObjectGuid GetStableMaster() const;
         void SetStableMaster(ObjectGuid stableMaster);
 
@@ -1502,6 +1516,16 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
                                     return false;
             }
 
+            if (flag.HasFlag(ItemSearchLocation::AccountBank))
+            {
+                for (uint8 i = ACCOUNT_BANK_SLOT_BAG_START; i < ACCOUNT_BANK_SLOT_BAG_END; ++i)
+                    if (Bag* bag = GetBagByPos(i))
+                        for (uint32 j = 0; j < GetBagSize(bag); ++j)
+                            if (Item* pItem = GetItemInBag(bag, j))
+                                if (callback(pItem) == ItemSearchCallbackResult::Stop)
+                                    return false;
+            }
+
             return true;
         }
 
@@ -1521,6 +1545,10 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         Item* GetUseableItemByPos(uint8 bag, uint8 slot) const;
         Bag*  GetBagByPos(uint8 slot) const;
         std::vector<Item*> GetCraftingReagentItemsToDeposit();
+        std::vector<Item*> GetWarboundItemsToDeposit();
+        std::vector<Item*> GetItemsForBankAutoDeposit(::BankType bank, bool includeReagents) const;
+        static BagSlotFlags GetItemAutoDepositCategory(Item const* item);
+        int8 PickAutoDepositTab(::BankType bank, Item const* item) const;
         Item* GetWeaponForAttack(WeaponAttackType attackType, bool useable = false) const;
         Item* GetShield(bool useable = false) const;
         Item* GetChildItemByGuid(ObjectGuid guid) const;
@@ -1535,7 +1563,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         static bool IsBankPos(uint8 bag, uint8 slot);
         static bool IsChildEquipmentPos(uint16 pos) { return IsChildEquipmentPos(pos >> 8, pos & 255); }
         static bool IsChildEquipmentPos(uint8 bag, uint8 slot);
-        static bool IsAccountBankPos(uint16 pos) { return IsBankPos(pos >> 8, pos & 255); }
+        static bool IsAccountBankPos(uint16 pos) { return IsAccountBankPos(pos >> 8, pos & 255); }
         static bool IsAccountBankPos(uint8 bag, uint8 slot);
         bool IsValidPos(uint16 pos, bool explicit_pos) const { return IsValidPos(pos >> 8, pos & 255, explicit_pos); }
         bool IsValidPos(uint8 bag, uint8 slot, bool explicit_pos) const;
@@ -1548,6 +1576,9 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void SetCharacterBankTabCount(uint8 count) { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::NumCharacterBankTabs), count); }
         uint8 GetAccountBankTabCount() const { return m_activePlayerData->NumAccountBankTabs; }
         void SetAccountBankTabCount(uint8 count) { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::NumAccountBankTabs), count); }
+        uint64 GetAccountBankCoinage() const { return m_activePlayerData->AccountBankCoinage; }
+        void SetAccountBankCoinage(uint64 coinage) { SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::AccountBankCoinage), coinage); }
+        void ModifyAccountBankCoinage(int64 delta);
         void SetCharacterBankTabSettings(uint32 tabId, std::string const& name, std::string const& icon, std::string const& description, BagSlotFlags depositFlags)
         {
             auto setter = m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::CharacterBankTabSettings, tabId);
@@ -1604,6 +1635,7 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         InventoryResult CanUnequipItems(uint32 item, uint32 count) const;
         InventoryResult CanUnequipItem(uint16 src, bool swap) const;
         InventoryResult CanBankItem(uint8 bag, uint8 slot, ItemPosCountVec& dest, Item* pItem, bool swap, bool not_loading = true, bool reagentBankOnly = false) const;
+        InventoryResult CanAccountBankItem(uint8 bag, uint8 slot, ItemPosCountVec& dest, Item* pItem, bool swap) const;
         InventoryResult CanUseItem(Item* pItem, bool not_loading = true) const;
         bool HasItemTotemCategory(uint32 TotemCategory) const;
         InventoryResult CanUseItem(ItemTemplate const* pItem, bool skipRequiredLevelCheck = false) const;
@@ -2904,6 +2936,10 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         uint32 GetGroupUpdateFlag() const { return m_groupUpdateMask; }
         void SetGroupUpdateFlag(uint32 flag) { m_groupUpdateMask |= flag; }
         void RemoveGroupUpdateFlag(uint32 flag) { m_groupUpdateMask &= ~flag; }
+        // state last broadcast to out of range party members, and who already holds it
+        WorldPackets::Party::PartyMemberStatsSnapshot& GetPartyMemberStateSnapshot();
+        GuidSet& GetPartyMemberStateRecipients() { return m_partyMemberStateRecipients; }
+        void ResetPartyMemberState();
         void SetPartyType(GroupCategory category, uint8 type);
         void ResetGroupUpdateSequenceIfNeeded(Group const* group);
         int32 NextGroupUpdateSequenceNumber(GroupCategory category);
@@ -3018,10 +3054,18 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         Garrison* GetGarrisonWithFollower(uint64 followerDbID) const;
         std::unordered_map<int32, std::unique_ptr<Garrison>> const& GetGarrisons() const { return _garrisons; }
         MythicPlusData* GetMythicPlusData() const { return _mythicPlusData.get(); }
+        // Rebuilds the Mythic+ rating update fields (PlayerData + ActivePlayerData DungeonScore) from
+        // MythicPlusData. Called on load and after every recorded keystone run.
+        void UpdateDungeonScore();
+        // Sets one ActivePlayerData::ItemUpgradeHighWatermark slot (item upgrade crest-waiver display).
+        void SetItemUpgradeWatermark(uint32 slot, float itemLevel);
 
         // Covenant / Soulbind
         uint32 GetActiveCovenant() const { return m_activeCovenantId; }
         uint32 GetActiveSoulbind() const { return m_activeSoulbindId; }
+        // SPELL_EFFECT_SET_COVENANT. Joins, switches or (covenantId 0 - spell 338503 "Reset Covenant") leaves a
+        // covenant. Never destroys anything belonging to a covenant the character may return to; see the function.
+        void SetActiveCovenant(uint32 covenantId);
         void ActivateSoulbind(SoulbindEntry const* soulbind);   // validates + persists; reapplies conduit effects
 
         // Soulbind conduit collection (server-authoritative: conduitId -> owned RankIndex)
@@ -3031,9 +3075,6 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         // PlayerSoulbindConduitCountAtRankEqualOrGreaterThan (309), which counts conduits at a minimum rank.
         std::unordered_map<uint32 /*conduitId*/, uint32 /*rankIndex*/> const& GetSoulbindConduits() const { return m_soulbindConduits; }
         bool CollectConduit(uint32 conduitId, int32 rankIndex = -1);   // grant/upgrade; rankIndex < 0 => lowest defined rank
-        // SPELL_EFFECT_SET_COVENANT. Joins, switches or (covenantId 0 - spell 338503 "Reset Covenant") leaves a
-        // covenant. Never destroys anything belonging to a covenant the character may return to; see the function.
-        void SetActiveCovenant(uint32 covenantId);
         void ApplyCovenantSkillLines();                         // grant the active covenant's SkillLine, strip the other three (idempotent)
 
         // Covenant switching / reset (retail spell 338503 "Reset Covenant": SPELL_EFFECT_SET_COVENANT with
@@ -3463,6 +3504,9 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void _LoadCUFProfiles(PreparedQueryResult result);
         void _LoadPlayerData(PreparedQueryResult elementsResult, PreparedQueryResult flagsResult);
         void _LoadCharacterBankTabSettings(PreparedQueryResult result);
+        void _LoadAccountBankTabSettings(PreparedQueryResult result);
+        void _LoadAccountBankItems(PreparedQueryResult result, uint32 timeDiff);
+        void _LoadAccountBankCoinage(PreparedQueryResult result);
 
         /*********************************************************/
         /***                   SAVE SYSTEM                     ***/
@@ -3493,6 +3537,9 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         void _SaveCUFProfiles(CharacterDatabaseTransaction trans);
         void _SavePlayerData(CharacterDatabaseTransaction trans);
         void _SaveCharacterBankTabSettings(CharacterDatabaseTransaction trans) const;
+        void _SaveAccountBankTabSettings(CharacterDatabaseTransaction trans) const;
+        void _SaveAccountBankItems(CharacterDatabaseTransaction trans);
+        void _SaveAccountBankCoinage(CharacterDatabaseTransaction trans) const;
 
         /*********************************************************/
         /***              ENVIRONMENTAL SYSTEM                 ***/
@@ -3618,6 +3665,8 @@ class TC_GAME_API Player final : public Unit, public GridObject<Player>
         GroupReference m_originalGroup;
         Group* m_groupInvite;
         uint32 m_groupUpdateMask;
+        std::unique_ptr<WorldPackets::Party::PartyMemberStatsSnapshot> m_partyMemberState;
+        GuidSet m_partyMemberStateRecipients;
         bool m_bPassOnGroupLoot;
         std::array<GroupUpdateCounter, 2> m_groupUpdateSequences;
 

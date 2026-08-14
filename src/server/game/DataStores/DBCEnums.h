@@ -566,7 +566,7 @@ enum class CriteriaType : int16
     RunInstance                                    = 19,  /*NYI*/ // Run an instance which handles at most {#Max Players} players
     KilledByCreature                               = 20,  // Get killed by "{Creature}"
     CompleteInternalCriteria                       = 21,  /*NYI*/ // Designer Value{`Uses Record ID}
-    CompleteAnyChallengeMode                       = 22,  /*NYI*/ // Complete any challenge mode
+    CompleteAnyChallengeMode                       = 22, // Complete any challenge mode
     KilledByPlayer                                 = 23,  // Die to a player
     MaxDistFallenWithoutDying                      = 24,  // Maximum distance fallen without dying
     EarnChallengeModeMedal                         = 25,  /*NYI*/ // Earn a challenge mode medal of "{#Challenge Mode Medal (OBSOLETE)}" (OBSOLETE)
@@ -615,7 +615,7 @@ enum class CriteriaType : int16
     UseGameobject                                  = 68,  // Use Game Object "{GameObjects}"
     GainAura                                       = 69,  // Gain aura "{Spell}"
     KillPlayer                                     = 70,  // Kill a player (no honor check)
-    CompleteChallengeMode                          = 71,  /*NYI*/ // Complete a challenge mode on map "{Map}"
+    CompleteChallengeMode                          = 71, // Complete a challenge mode on map "{Map}"
     CatchFishInFishingHole                         = 72,  // Catch fish in the "{GameObjects}" fishing hole
     PlayerTriggerGameEvent                         = 73,  // Player will Trigger game event "{GameEvents}"
     Login                                          = 74,  // Login (USE SPARINGLY!)
@@ -668,16 +668,16 @@ enum class CriteriaType : int16
     KickVoterInLFGDungeon                          = 121, /*NYI*/ // Kicked in an LFG dungeon (voter)
     KickTargetInLFGDungeon                         = 122, /*NYI*/ // Kicked in an LFG dungeon (target)
     AbandonedLFGDungeon                            = 123, /*NYI*/ // Abandoned an LFG dungeon
-    MoneySpentOnGuildRepair                        = 124, /*NYI*/ // Guild repair amount spent
+    MoneySpentOnGuildRepair                        = 124, // Guild repair amount spent
     GuildAttainedLevel                             = 125, /*NYI*/ // Guild attained level
     CreatedItemsByCastingSpell                     = 126, /*NYI*/ // Created items by casting a spell
     FishInAnyPool                                  = 127, /*NYI*/ // Fish in any pool
-    GuildBankTabsPurchased                         = 128, /*NYI*/ // Guild bank tabs purchased
-    EarnGuildAchievementPoints                     = 129, /*NYI*/ // Earn guild achievement points
+    GuildBankTabsPurchased                         = 128, // Guild bank tabs purchased
+    EarnGuildAchievementPoints                     = 129, // Earn guild achievement points
     WinAnyBattleground                             = 130, /*NYI*/ // Win any battleground
     ParticipateInAnyBattleground                   = 131, /*NYI*/ // Participate in any battleground
     EarnBattlegroundRating                         = 132, /*NYI*/ // Earn a battleground rating
-    GuildTabardCreated                             = 133, /*NYI*/ // Guild tabard created
+    GuildTabardCreated                             = 133, // Guild tabard created
     CompleteQuestsCountForGuild                    = 134, /*NYI*/ // Count of complete quests for guild (Quest count)
     HonorableKillsForGuild                         = 135, /*NYI*/ // Honorable kills for Guild
     KillAnyCreatureForGuild                        = 136, /*NYI*/ // Kill any NPC for Guild
@@ -729,14 +729,14 @@ enum class CriteriaType : int16
     CollectGarrisonShipment                        = 182, // Garrison Shipment of type "{CharShipmentContainer}" collected
     ItemLevelChangedForGarrisonFollower            = 183, // Garrison Follower: Item Level Changed
     LevelChangedForGarrisonFollower                = 184, // Garrison Follower: Level Changed
-    LearnToy                                       = 185, /*NYI*/ // Learn Toy "{Item}"
-    LearnAnyToy                                    = 186, /*NYI*/ // Learn Any Toy
+    LearnToy                                       = 185, // Learn Toy "{Item}"
+    LearnAnyToy                                    = 186, // Learn Any Toy
     QualityUpgradedForGarrisonFollower             = 187, // Garrison Follower: Quality Upgraded
     LearnHeirloom                                  = 188, // Learn Heirloom "{Item}"
     LearnAnyHeirloom                               = 189, // Learn Any Heirloom
     EarnArtifactXP                                 = 190, // Earn Artifact XP
     AnyArtifactPowerRankPurchased                  = 191, // Artifact Power Ranks Purchased
-    LearnTransmog                                  = 192, /*NYI*/ // Learn Transmog "{ItemModifiedAppearance}"
+    LearnTransmog                                  = 192, // Learn Transmog "{ItemModifiedAppearance}"
     LearnAnyTransmog                               = 193, // Learn Any Transmog
     HonorLevelIncrease                             = 194, // (Player) honor level increase
     PrestigeLevelIncrease                          = 195, /*NYI*/ // (Player) prestige level increase
@@ -747,11 +747,11 @@ enum class CriteriaType : int16
     RecruitAnyGarrisonTroop                        = 200, // Recruit any Garrison Troop
     StartResearchAnyGarrisonTalent                 = 201, // Garrison Talent: Start Research Any
     StartResearchGarrisonTalent                    = 202, // Garrison Talent: Start Research "{GarrTalent}"
-    CompleteAnyWorldQuest                          = 203, /*NYI*/ // Complete Any Quest
+    CompleteAnyWorldQuest                          = 203, // Complete Any Quest
     EarnLicense                                    = 204, /*NYI*/ // Earn License "{BattlePayDeliverable}" (does NOT work for box level)
     CollectTransmogSetFromGroup                    = 205, // (Account Only) Collect a Transmog Set from Group "{TransmogSetGroup}"
-    ParagonLevelIncreaseWithFaction                = 206, /*NYI*/ // (Player) paragon level increase with faction "{Faction}"
-    PlayerHasEarnedHonor                           = 207, /*NYI*/ // Player has earned honor
+    ParagonLevelIncreaseWithFaction                = 206, // (Player) paragon level increase with faction "{Faction}"
+    PlayerHasEarnedHonor                           = 207, // Player has earned honor
     KillCreatureScenario                           = 208, /*NYI*/ // Kill NPC "{Creature}" (scenario criteria only, do not use for player)
     ArtifactPowerRankPurchased                     = 209, /*NYI*/ // Artifact Power Rank of "{ArtifactPower}" Purchased
     ChooseAnyRelicTalent                           = 210, /*NYI*/ // Choose any Relic Talent
@@ -760,7 +760,7 @@ enum class CriteriaType : int16
     AccountHonorLevelReached                       = 213, /*NYI*/ // (Account Only) honor level {#Level} reached
     EarnArtifactXPForAzeriteItem                   = 214, // Earn Artifact experience for Azerite Item
     AzeriteLevelReached                            = 215, // Azerite Level {#Azerite Level} reached
-    MythicPlusCompleted                            = 216, /*NYI*/ // Mythic Plus Completed
+    MythicPlusCompleted                            = 216, // Mythic Plus Completed
     ScenarioGroupCompleted                         = 217, /*NYI*/ // Scenario Group Completed
     CompleteAnyReplayQuest                         = 218, // Complete Any Replay Quest
     BuyItemsFromVendors                            = 219, // Buy items from vendors
@@ -768,13 +768,13 @@ enum class CriteriaType : int16
     ReachMaxLevel                                  = 221, // Reach Max Level
     MemorizeSpell                                  = 222, /*NYI*/ // Memorize Spell "{Spell}"
     LearnTransmogIllusion                          = 223, /*NYI*/ // Learn Transmog Illusion
-    LearnAnyTransmogIllusion                       = 224, /*NYI*/ // Learn Any Transmog Illusion
+    LearnAnyTransmogIllusion                       = 224, // Learn Any Transmog Illusion
     EnterTopLevelArea                              = 225, // Enter Top Level Map Area "{AreaTable}"
     LeaveTopLevelArea                              = 226, // Leave Top Level Map Area "{AreaTable}"
     SocketGarrisonTalent                           = 227, // Socket Garrison Talent {GarrTalent}
     SocketAnySoulbindConduit                       = 228, // Socket Any Soulbind Conduit
     ObtainAnyItemWithCurrencyValue                 = 229, /*NYI*/ // Obtain Any Item With Currency Value "{CurrencyTypes}"
-    MythicPlusRatingAttained                       = 230, /*NYI*/ // (Player) Mythic+ Rating "{#DungeonScore}" attained
+    MythicPlusRatingAttained                       = 230, // (Player) Mythic+ Rating "{#DungeonScore}" attained
     SpentTalentPoint                               = 231, /*NYI*/ // (Player) spent talent point
 
     MythicPlusDisplaySeasonEnded                   = 234, /*NYI*/ // {DisplaySeason}
@@ -782,13 +782,13 @@ enum class CriteriaType : int16
     WinRatedSoloShuffleRound                       = 239, /*NYI*/
     ParticipateInRatedSoloShuffleRound             = 240, /*NYI*/
 
-    ReputationAmountGained                         = 243, /*NYI*/ // Gain reputation amount with {FactionID}; accumulate, not highest
+    ReputationAmountGained                         = 243, // Gain reputation amount with {FactionID}; accumulate, not highest
 
     FulfillAnyCraftingOrder                        = 245,
     FulfillCraftingOrderType                       = 246, // {CraftingOrderType}
 
     PerksProgramMonthComplete                      = 249, /*NYI*/
-    CompleteTrackingQuest                          = 250, /*NYI*/
+    CompleteTrackingQuest                          = 250,
 
     GainLevels                                     = 253, // Gain levels
 
@@ -1903,7 +1903,7 @@ enum class ModifierTreeType : int32
     GarrisonTalentSelected                                              = 201, // Garrison has talent "{GarrTalent}" selected
     GarrisonTalentResearched                                            = 202, // Garrison has talent "{GarrTalent}" researched
     PlayerHasRestriction                                                = 203, // Player has restriction of type "{@CHARACTER_RESTRICTION_TYPE}"
-    PlayerCreatedCharacterLessThanHoursAgoRealTime                      = 204, /*NYI*/ // Player has created their character < {#Hours} hours ago (real time)
+    PlayerCreatedCharacterLessThanHoursAgoRealTime                      = 204, // Player has created their character < {#Hours} hours ago (real time)
     PlayerCreatedCharacterLessThanHoursAgoGameTime                      = 205, // Player has created their character < {#Hours} hours ago (in-game time)
     QuestHasQuestInfoId                                                 = 206, // Quest has Quest Info "{QuestInfo}"
     GarrisonTalentResearchInProgress                                    = 207, // Garrison is researching talent "{GarrTalent}"
@@ -1946,11 +1946,11 @@ enum class ModifierTreeType : int32
     PlayerHasWarModeEnabled                                             = 244, // Player has WarMode Enabled (regardless of shard state)
     PlayerIsOnWarModeShard                                              = 245, // Player is on a WarMode Shard
     PlayerIsAllowedToToggleWarModeInArea                                = 246, // Player is allowed to toggle WarMode in area
-    MythicPlusKeystoneLevelEqualOrGreaterThan                           = 247, /*NYI*/ // Mythic Plus Keystone Level Atleast {#Level}
-    MythicPlusCompletedInTime                                           = 248, /*NYI*/ // Mythic Plus Completed In Time
-    MythicPlusMapChallengeMode                                          = 249, /*NYI*/ // Mythic Plus Map Challenge Mode {MapChallengeMode}
+    MythicPlusKeystoneLevelEqualOrGreaterThan                           = 247, // Mythic Plus Keystone Level Atleast {#Level}
+    MythicPlusCompletedInTime                                           = 248, // Mythic Plus Completed In Time
+    MythicPlusMapChallengeMode                                          = 249, // Mythic Plus Map Challenge Mode {MapChallengeMode}
     MythicPlusDisplaySeason                                             = 250, /*NYI*/ // Mythic Plus Display Season {#Season}
-    MythicPlusMilestoneSeason                                           = 251, /*NYI*/ // Mythic Plus Milestone Season {#Season}
+    MythicPlusMilestoneSeason                                           = 251, // Mythic Plus Milestone Season {#Season}
     PlayerVisibleRace                                                   = 252, // Player visible race is "{ChrRaces}"
     TargetVisibleRace                                                   = 253, // Target visible race is "{ChrRaces}"
     FriendshipRepReactionEqual                                          = 254, // Friendship rep reaction is exactly "{FriendshipRepReaction}"
@@ -2020,7 +2020,7 @@ enum class ModifierTreeType : int32
     CurrencySpentOnGarrisonTalentResearchEqualOrGreaterThan             = 318, /*NYI*/ // Currency {CurrencyTypes} Spent on Garrison Talent Research in Tree {GarrTalentTree} is greater than or equal to {#Quantity}
     RenownCatchupActive                                                 = 319, /*NYI*/ // Renown Catchup Active
     RapidRenownCatchupActive                                            = 320, /*NYI*/ // Rapid Renown Catchup Active
-    PlayerMythicPlusRatingEqualOrGreaterThan                            = 321, /*NYI*/ // Player has Mythic+ Rating of at least "{#DungeonScore}"
+    PlayerMythicPlusRatingEqualOrGreaterThan                            = 321, // Player has Mythic+ Rating of at least "{#DungeonScore}"
     PlayerMythicPlusRunCountInCurrentExpansionEqualOrGreaterThan        = 322, /*NYI*/ // Player has completed at least "{#MythicKeystoneRuns}" Mythic+ runs in current expansion
     PlayerHasCustomizationChoice                                        = 323, // (Mainline) Player has Customization Choice "{ChrCustomizationChoice}"
     PlayerBestWeeklyWinPvpTier                                          = 324, // (Mainline) Player has best weekly win in PVP tier {PvpTier}

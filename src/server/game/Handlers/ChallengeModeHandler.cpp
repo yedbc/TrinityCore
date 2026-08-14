@@ -19,59 +19,13 @@
 #include "ChallengeMode.h"
 #include "ChallengeModeMgr.h"
 #include "ChallengeModePackets.h"
-#include "CharacterDatabase.h"
-#include "DatabaseEnv.h"
+#include "Config.h"
 #include "Item.h"
-#include "ItemBonusMgr.h"
 #include "ItemDefines.h"
 #include "Log.h"
-#include "Loot.h"
-#include "LootMgr.h"
-#include "Mail.h"
 #include "Map.h"
 #include "MythicPlusData.h"
 #include "Player.h"
-
-namespace
-{
-    // Rolls the configured reward pool once (personal loot, tagged with the given context) and returns a single
-    // item id, or 0 if nothing rolled / the pool is empty.
-    [[maybe_unused]] uint32 RollMythicPlusRewardItem(Player* player, uint32 lootId, ItemContext context)
-    {
-        Loot loot(player->GetMap(), ObjectGuid::Empty, LOOT_NONE, nullptr);
-        loot.FillLoot(lootId, LootTemplates_Reference, player, true /*personal*/, true /*noEmptyError*/, LOOT_MODE_DEFAULT, context);
-        for (LootItem const& item : loot.items)
-            if (item.itemid)
-                return item.itemid;
-        return 0;
-    }
-
-    // Item bonuses that scale a reward item to the Mythic+ item level for the given context + keystone level.
-    [[maybe_unused]] std::vector<int32> MythicPlusRewardBonuses(uint32 itemId, ItemContext context, int32 keystoneLevel)
-    {
-        return ItemBonusMgr::GetBonusListsForItem(itemId, ItemBonusMgr::ItemBonusGenerationParams(context, keystoneLevel));
-    }
-
-    // Grants one item (bags, or mail on a full bag) carrying the given scaled bonuses.
-    [[maybe_unused]] void GrantMythicPlusItem(Player* player, uint32 itemId, ItemContext context, std::vector<int32> const& bonuses)
-    {
-        ItemPosCountVec dest;
-        if (player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, 1) == EQUIP_ERR_OK)
-        {
-            player->StoreNewItem(dest, itemId, true, 0, GuidSet(), context, &bonuses);
-        }
-        else if (Item* item = Item::CreateItem(itemId, 1, context, player, false))
-        {
-            item->SetBonuses(bonuses);
-            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-            item->SaveToDB(trans);
-            MailDraft("Great Vault Reward", "Your Great Vault reward.")
-                .AddItem(item)
-                .SendMailTo(trans, player, MailSender(player, MAIL_STATIONERY_GM), MAIL_CHECK_MASK_COPIED);
-            CharacterDatabase.CommitTransaction(trans);
-        }
-    }
-}
 
 void WorldSession::HandleRequestMythicPlusSeasonData(WorldPackets::ChallengeMode::RequestMythicPlusSeasonData& /*requestMythicPlusSeasonData*/)
 {
@@ -107,6 +61,11 @@ void WorldSession::HandleStartChallengeMode(WorldPackets::ChallengeMode::StartCh
         return;
     }
 
+    // Only the actual Mythic Keystone item may start a run (config-tunable; 0 disables the check).
+    if (uint32 keystoneItemId = sChallengeModeMgr.GetKeystoneItemId())
+        if (keystone->GetEntry() != keystoneItemId)
+            return;
+
     uint32 const mapChallengeModeId = keystone->GetModifier(ITEM_MODIFIER_CHALLENGE_MAP_CHALLENGE_MODE_ID);
     uint32 const keystoneLevel = keystone->GetModifier(ITEM_MODIFIER_CHALLENGE_KEYSTONE_LEVEL);
     if (!mapChallengeModeId || !keystoneLevel)
@@ -124,6 +83,12 @@ void WorldSession::HandleStartChallengeMode(WorldPackets::ChallengeMode::StartCh
     ChallengeMode* challenge = instanceMap->GetChallengeMode();
     if (!challenge || challenge->IsActive() || challenge->IsCompleted())
         return;
+
+    // Retail activates the run from the Font of Power pedestal. When enforced, require the pedestal gameobject
+    // near the player; lenient by default because the GO spawn is world-DB content.
+    if (sConfigMgr->GetBoolDefault("ChallengeMode.RequireFontOfPower", false))
+        if (!player->FindNearestGameObjectOfType(GAMEOBJECT_TYPE_CHALLENGE_MODE_REWARD, 40.0f))
+            return;
 
     std::array<uint32, 4> const affixes =
     {
@@ -164,6 +129,15 @@ void WorldSession::HandleMythicPlusRequestMapStats(WorldPackets::ChallengeMode::
     SendPacket(response.Write());
 }
 
+// NOTE (assembly): CMSG_REQUEST_WEEKLY_REWARDS / CMSG_CLAIM_WEEKLY_REWARD are NOT handled here.
+// This branch merges feature/great-vault, whose WeeklyRewardHandler.cpp serves all three Great Vault rows
+// (Dungeon / Raid / World) over the WorldPackets::WeeklyRewards packet family, and an opcode can only have one
+// bound handler. The Mythic+-only pair that used to live here (over WorldPackets::ChallengeMode) is gone; the one
+// behaviour it had that the bound handler lacked - refreshing the carried keystone when the vault is opened after
+// a weekly reset - is called from WeeklyRewardHandler.cpp instead. The reward rules stay shared, never duplicated:
+// the Mythic+ row's season reward-level cap still comes from ChallengeModeMgr (GetVaultRewardLevelCap), and
+// ChallengeModeMgr's BuildMythicPlusVaultOptions / ClaimMythicPlusVaultReward / GetMythicPlusVaultSlotForThreshold
+// remain available for an assembly that binds a Mythic+-only handler instead.
 
 void WorldSession::HandleResetChallengeMode(WorldPackets::ChallengeMode::ResetChallengeMode& /*resetChallengeMode*/)
 {
@@ -174,6 +148,12 @@ void WorldSession::HandleResetChallengeMode(WorldPackets::ChallengeMode::ResetCh
     // Abort the active run and stop the timer. Trash/boss respawn goes through the standard instance reset path.
     if (ChallengeMode* challenge = instanceMap->GetChallengeMode())
     {
+        // Only the player who started the run (the keystone owner) may reset it. Without this any group member -
+        // or anyone who wandered into the instance - could send CMSG_RESET_CHALLENGE_MODE and abort the whole
+        // party's active keystone at any time.
+        if (challenge->GetStarterGuid() != GetPlayer()->GetGUID())
+            return;
+
         if (challenge->IsActive())
         {
             challenge->Reset();
