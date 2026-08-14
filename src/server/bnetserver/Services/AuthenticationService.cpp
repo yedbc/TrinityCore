@@ -21,7 +21,6 @@
 #include "Client/challenge_service.pb.h"
 #include "CryptoRandom.h"
 #include "DatabaseEnv.h"
-#include "Errors.h"
 #include "IPLocation.h"
 #include "LoginRESTService.h"
 #include "Session.h"
@@ -34,10 +33,10 @@ namespace Battlenet::Services
 {
 namespace Shared
 {
-uint32 Authentication::HandleLogon(Session* session, std::string_view program, std::string_view platform,
+uint32 Authentication::HandleLogon(Session* session, ClientBuild::Program::Id program, std::string_view platform,
     std::string_view locale, uint32 applicationVersion, std::string_view deviceId)
 {
-    if (program != "WoW"sv)
+    if (program != ClientBuild::Program::WoW)
     {
         TC_LOG_DEBUG("session", "[Battlenet::Authentication::LogonRequest] {} attempted to log in with game other than WoW (using {})!", session->GetClientInfo(), program);
         return ERROR_BAD_PROGRAM;
@@ -249,12 +248,13 @@ Authentication::Authentication(Session* session) : AuthenticationService(session
 
 uint32 Authentication::HandleLogon(authentication::v1::LogonRequest const* request, NoData* /*response*/, std::function<void(ServiceBase*, uint32, google::protobuf::Message const*)>& continuation)
 {
+    ClientBuild::Program::Id titleId = ClientBuild::Program::Id::FromString(request->program());
     std::string_view deviceId;
 
     if (request->has_device_id())
         deviceId = request->device_id();
 
-    uint32 result = Shared::Authentication::HandleLogon(_session, request->program(), request->platform(), request->locale(), request->application_version(), deviceId);
+    uint32 result = Shared::Authentication::HandleLogon(_session, titleId, request->platform(), request->locale(), request->application_version(), deviceId);
     if (result == ERROR_OK)
     {
         if (request->has_cached_web_credentials())
@@ -335,7 +335,7 @@ Authentication::Authentication(Session* session) : AuthenticationService(session
 uint32 Authentication::HandleLogon(authentication::v2::client::LogonRequest const* request, NoData* /*response*/,
     std::function<void(ServiceBase*, uint32, google::protobuf::Message const*)>& continuation)
 {
-    std::array<char, 5> titleId = ClientBuild::ToCharArray(request->title_id());
+    ClientBuild::Program::Id titleId{ request->title_id() };
     std::string_view deviceId;
     std::string_view cachedAuthToken;
 
@@ -349,7 +349,7 @@ uint32 Authentication::HandleLogon(authentication::v2::client::LogonRequest cons
             cachedAuthToken = logonOptions.auth_token();
     }
 
-    uint32 result = Shared::Authentication::HandleLogon(_session, titleId.data(), request->platform(), request->locale(), request->application_version(), deviceId);
+    uint32 result = Shared::Authentication::HandleLogon(_session, titleId, request->platform(), request->locale(), request->application_version(), deviceId);
     if (result == ERROR_OK)
     {
         if (!cachedAuthToken.empty())
@@ -408,7 +408,7 @@ uint32 Authentication::HandleVerifyAuthToken(std::string_view authToken, std::fu
         {
             account::v2::GameAccountHandle* gameAccount = logonRecord->add_game_account();
             gameAccount->set_id(gameAccountInfo.Id);
-            gameAccount->set_title_id(ClientBuild::ToFourCC("WoW"sv));
+            gameAccount->set_title_id(ClientBuild::Program::WoW);
             gameAccount->set_region(2);
         }
 

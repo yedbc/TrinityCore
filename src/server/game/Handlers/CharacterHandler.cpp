@@ -498,6 +498,7 @@ bool LoginQueryHolder::Initialize()
     stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_ACCOUNT_BANK_COINAGE);
     stmt->setUInt32(0, m_battlenetAccountId);
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_COINAGE, stmt);
+
     stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_COVENANT_CALLINGS);
     stmt->setUInt64(0, lowGuid);
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_COVENANT_CALLINGS, stmt);
@@ -1587,6 +1588,17 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
     }
 
     pCurrChar->SetVirtualPlayerRealm(GetVirtualRealmAddress());
+
+    // Keep the denormalised characters.battlenetAccount column populated so warband features
+    // (currency transfer source enumeration, alt-XP max-level count) that filter on it are not
+    // silently dead. Refresh on every login; a bnetId of 0 (unlinked account) is left as-is.
+    if (uint32 bnetAccountId = GetBattlenetAccountId())
+    {
+        CharacterDatabasePreparedStatement* bnetStmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHARACTER_BNET_ACCOUNT);
+        bnetStmt->setUInt32(0, bnetAccountId);
+        bnetStmt->setUInt64(1, playerGuid.GetCounter());
+        CharacterDatabase.Execute(bnetStmt);
+    }
 
     SendAccountDataTimes(ObjectGuid::Empty, GLOBAL_CACHE_MASK);
     SendTutorialsData();

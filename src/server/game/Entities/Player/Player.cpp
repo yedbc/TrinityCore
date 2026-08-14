@@ -352,6 +352,7 @@ Player::Player(WorldSession* session) : Unit(true), m_sceneMgr(this)
 
     m_ChampioningFaction = 0;
 
+    m_healthFraction = 0.0f;
     m_powerFraction.fill(0.0f);
 
     isDebugAreaTriggers = false;
@@ -538,16 +539,9 @@ bool Player::Create(ObjectGuid::LowType guidlow, WorldPackets::Character::Charac
     LearnDefaultSkills();
     LearnCustomSpells();
 
-    // Original action bar. Do not use Player::AddActionButton because we do not have skill spells loaded at this time
-    // but checks will still be performed later when loading character from db in Player::_LoadActions
+    // original action bar
     for (PlayerCreateInfoActions::const_iterator action_itr = info->action.begin(); action_itr != info->action.end(); ++action_itr)
-    {
-        // create new button
-        ActionButton& ab = m_actionButtons[action_itr->button];
-
-        // set data
-        ab.SetActionAndType(action_itr->action, ActionButtonType(action_itr->type));
-    }
+        AddActionButton(action_itr->button, action_itr->action, action_itr->type);
 
     if (ChrSpecializationEntry const* defaultSpec = sDB2Manager.GetDefaultChrSpecializationForClass(GetClass()))
     {
@@ -1646,7 +1640,7 @@ void Player::RegenerateAll()
 {
     m_regenTimerCount += m_regenTimer;
 
-    for (Powers power = POWER_MANA; power < MAX_POWERS; power = Powers(power + 1))
+    for (Powers power : GetPowerTypes())
         if (power != POWER_RUNES)
             Regenerate(power);
 
@@ -1687,7 +1681,7 @@ void Player::Regenerate(Powers power)
 {
     // Skip regeneration for power type we cannot have
     uint32 powerIndex = GetPowerIndex(power);
-    if (powerIndex == MAX_POWERS || powerIndex >= MAX_POWERS_PER_CLASS)
+    if (powerIndex >= MAX_POWERS_PER_CLASS)
         return;
 
     PowerTypeEntry const* powerType = sDB2Manager.GetPowerTypeEntry(power);
@@ -1790,7 +1784,7 @@ void Player::Regenerate(Powers power)
 void Player::InterruptPowerRegen(Powers power)
 {
     uint32 powerIndex = GetPowerIndex(power);
-    if (powerIndex == MAX_POWERS || powerIndex >= MAX_POWERS_PER_CLASS)
+    if (powerIndex >= MAX_POWERS_PER_CLASS)
         return;
 
     m_regenInterruptTimestamp = GameTime::Now();
@@ -1887,9 +1881,25 @@ void Player::RegenerateHealth()
     addValue += m_baseHealthRegen / 2.5f;
 
     if (addValue < 0.0f)
-        addValue = 0.0f;
+        return;
 
-    ModifyHealth(int32(addValue));
+    addValue += m_healthFraction;
+    int32 integerValue = int32(addValue);
+    if (!integerValue)
+        return;
+
+    if (curValue + integerValue < maxValue)
+    {
+        curValue += integerValue;
+        m_healthFraction = addValue - integerValue;
+    }
+    else
+    {
+        curValue = maxValue;
+        m_healthFraction = 0.0f;
+    }
+
+    SetHealth(curValue);
 }
 
 void Player::ResetAllPowers()
@@ -2592,8 +2602,8 @@ void Player::InitStatsForLevel(bool reapplyMods)
     InitDataForForm(reapplyMods);
 
     // save new stats
-    for (uint8 i = POWER_MANA; i < MAX_POWERS; ++i)
-        SetMaxPower(Powers(i), uint32(GetCreatePowerValue(Powers(i))));
+    for (Powers power : GetPowerTypes())
+        SetMaxPower(power, GetCreatePowerValue(power));
 
     SetMaxHealth(0);                          // stamina bonus will applied later
 
@@ -8458,11 +8468,11 @@ void Player::_ApplyItemBonuses(Item* item, uint8 slot, bool apply)
                 ApplyRatingMod(CR_EXPERTISE, int32(val), apply);
                 break;
             case ITEM_MOD_ATTACK_POWER:
-                HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER, TOTAL_VALUE, float(val), apply);
-                HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER_RANGED, TOTAL_VALUE, float(val), apply);
+                HandleAttackPowerModifier(AttackPowerModIndex::Melee,  (val >= 0) ? AttackPowerModType::FlatPositive : AttackPowerModType::FlatNegative, float(val), apply);
+                HandleAttackPowerModifier(AttackPowerModIndex::Ranged, (val >= 0) ? AttackPowerModType::FlatPositive : AttackPowerModType::FlatNegative, float(val), apply);
                 break;
             case ITEM_MOD_RANGED_ATTACK_POWER:
-                HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER_RANGED, TOTAL_VALUE, float(val), apply);
+                HandleAttackPowerModifier(AttackPowerModIndex::Ranged, (val >= 0) ? AttackPowerModType::FlatPositive : AttackPowerModType::FlatNegative, float(val), apply);
                 break;
             case ITEM_MOD_VERSATILITY:
                 ApplyRatingMod(CR_VERSATILITY_DAMAGE_DONE, int32(val), apply);
@@ -13686,7 +13696,7 @@ void Player::AddItemToBuyBackSlot(Item* pItem)
         uint32 eslot = slot - BUYBACK_SLOT_START;
 
         SetInvSlot(slot, pItem->GetGUID());
-        SetBuybackPrice(eslot, pItem->GetSellPrice(this) * pItem->GetCount());
+        SetBuybackPrice(eslot, pItem->GetSellPrice(this, true) * pItem->GetCount());
 
         SetBuybackTimestamp(eslot, (uint32)etime);
 
@@ -14151,7 +14161,7 @@ void Player::ApplyEnchantment(Item* item, EnchantmentSlot slot, bool apply, bool
         for (int s = 0; s < MAX_ITEM_ENCHANTMENT_EFFECTS; ++s)
         {
             uint32 enchant_display_type = pEnchant->Effect[s];
-            uint32 enchant_amount = pEnchant->EffectPointsMin[s];
+            int32 enchant_amount = pEnchant->EffectPointsMin[s];
             uint32 enchant_spell_id = pEnchant->EffectArg[s];
 
             switch (enchant_display_type)
@@ -14194,9 +14204,9 @@ void Player::ApplyEnchantment(Item* item, EnchantmentSlot slot, bool apply, bool
                             scalingLevel = maxLevel;
 
                         if (GtSpellScalingEntry const* spellScaling = sSpellScalingGameTable.GetRow(scalingLevel))
-                            enchant_amount = uint32(pEnchant->EffectScalingPoints[s] * GetSpellScalingColumnForClass(spellScaling, scalingClass));
+                            enchant_amount = int32(pEnchant->EffectScalingPoints[s] * GetSpellScalingColumnForClass(spellScaling, scalingClass));
                     }
-                    enchant_amount = std::max(enchant_amount, 1u);
+                    enchant_amount = std::max(enchant_amount, 1);
                     HandleStatFlatModifier(UnitMods(UNIT_MOD_RESISTANCE_START + enchant_spell_id), TOTAL_VALUE, float(enchant_amount), apply);
                     break;
                 case ITEM_ENCHANTMENT_TYPE_STAT:
@@ -14217,10 +14227,10 @@ void Player::ApplyEnchantment(Item* item, EnchantmentSlot slot, bool apply, bool
                             scalingLevel = maxLevel;
 
                         if (GtSpellScalingEntry const* spellScaling = sSpellScalingGameTable.GetRow(scalingLevel))
-                            enchant_amount = uint32(pEnchant->EffectScalingPoints[s] * GetSpellScalingColumnForClass(spellScaling, scalingClass));
+                            enchant_amount = int32(pEnchant->EffectScalingPoints[s] * GetSpellScalingColumnForClass(spellScaling, scalingClass));
                     }
 
-                    enchant_amount = std::max(enchant_amount, 1u);
+                    enchant_amount = std::max(enchant_amount, 1);
 
                     TC_LOG_DEBUG("entities.player.items", "Adding {} to stat nb {}", enchant_amount, enchant_spell_id);
                     switch (enchant_spell_id)
@@ -14364,12 +14374,12 @@ void Player::ApplyEnchantment(Item* item, EnchantmentSlot slot, bool apply, bool
                             TC_LOG_DEBUG("entities.player.items", "+ {} EXPERTISE", enchant_amount);
                             break;
                         case ITEM_MOD_ATTACK_POWER:
-                            HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER, TOTAL_VALUE, float(enchant_amount), apply);
-                            HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER_RANGED, TOTAL_VALUE, float(enchant_amount), apply);
+                            HandleAttackPowerModifier(AttackPowerModIndex::Melee,  (enchant_amount >= 0) ? AttackPowerModType::FlatPositive : AttackPowerModType::FlatNegative, float(enchant_amount), apply);
+                            HandleAttackPowerModifier(AttackPowerModIndex::Ranged, (enchant_amount >= 0) ? AttackPowerModType::FlatPositive : AttackPowerModType::FlatNegative, float(enchant_amount), apply);
                             TC_LOG_DEBUG("entities.player.items", "+ {} ATTACK_POWER", enchant_amount);
                             break;
                         case ITEM_MOD_RANGED_ATTACK_POWER:
-                            HandleStatFlatModifier(UNIT_MOD_ATTACK_POWER_RANGED, TOTAL_VALUE, float(enchant_amount), apply);
+                            HandleAttackPowerModifier(AttackPowerModIndex::Ranged, (enchant_amount >= 0) ? AttackPowerModType::FlatPositive : AttackPowerModType::FlatNegative, float(enchant_amount), apply);
                             TC_LOG_DEBUG("entities.player.items", "+ {} RANGED_ATTACK_POWER", enchant_amount);
                             break;
                         case ITEM_MOD_MANA_REGENERATION:
@@ -19720,25 +19730,17 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
 
     // restore remembered power/health values (but not more max values)
     SetHealth(savedHealth > GetMaxHealth() ? GetMaxHealth() : savedHealth);
-    uint32 loadedPowers = 0;
-    for (uint32 i = 0; i < MAX_POWERS; ++i)
+    ClassPowerTypes powerTypes = GetPowerTypes();
+    for (uint32 i = 0; i < powerTypes.PowerTypeCount; ++i)
     {
-        if (GetPowerIndex(Powers(i)) != MAX_POWERS)
-        {
-            uint32 savedPower = fields.powers[loadedPowers];
-            uint32 maxPower = m_unitData->MaxPower[loadedPowers];
-            SetPower(Powers(i), (savedPower > maxPower) ? maxPower : savedPower);
-            if (++loadedPowers >= MAX_POWERS_PER_CLASS)
-                break;
-        }
+        int32 savedPower = fields.powers[i];
+        int32 maxPower = m_unitData->MaxPower[i];
+        SetPower(powerTypes.PowerType[i], std::min(savedPower, maxPower));
     }
-
-    for (; loadedPowers < MAX_POWERS_PER_CLASS; ++loadedPowers)
-        SetUpdateFieldValue(m_values.ModifyValue(&Unit::m_unitData).ModifyValue(&UF::UnitData::Power, loadedPowers), 0);
 
     SetPower(POWER_LUNAR_POWER, 0);
     // Init rune recharge
-    if (GetPowerIndex(POWER_RUNES) != MAX_POWERS)
+    if (GetPowerIndex(POWER_RUNES) < MAX_POWERS_PER_CLASS)
     {
         int32 runes = GetPower(POWER_RUNES);
         int32 maxRunes = GetMaxPower(POWER_RUNES);
@@ -21983,6 +21985,22 @@ void Player::ModifyAccountBankCoinage(int64 delta)
     if (uint64(next) > MAX_MONEY_AMOUNT)
         next = int64(MAX_MONEY_AMOUNT);
     SetAccountBankCoinage(uint64(next));
+
+    // Persist the change immediately as an ATOMIC delta rather than relying on the
+    // last-writer-wins REPLACE at save time (CR-3). Combined with the single-holder account
+    // bank lock (only the holder ever reaches this path) this guarantees the shared balance
+    // in the DB is always authoritative and can never be duped or lost across overlapping
+    // same-bnet sessions. Unlinked accounts (bnetId == 0) never persist shared state.
+    int64 applied = next - current;
+    uint32 bnetAccountId = GetSession() ? GetSession()->GetBattlenetAccountId() : 0;
+    if (!bnetAccountId || applied == 0)
+        return;
+
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_ACCOUNT_BANK_COINAGE_DELTA);
+    stmt->setUInt32(0, bnetAccountId);
+    stmt->setInt64(1, applied);
+    stmt->setInt64(2, applied);
+    CharacterDatabase.Execute(stmt);
 }
 
 void Player::_LoadAccountBankItems(PreparedQueryResult result, uint32 timeDiff)
@@ -23532,6 +23550,9 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
         stmt->setBool(index++, m_activePlayerData->TransmogMetadata->Locked);
         stmt->setUInt8(index++, uint8(m_activePlayerData->UiChromieTimeExpansionID));
         stmt->setUInt32(index++, uint32(m_activePlayerData->TimerunningSeasonID));
+        // Denormalised Bnet account id so warband features (currency transfer, alt-XP) can
+        // filter characters by Battle.net account without a cross-DB join (MJ-1).
+        stmt->setUInt32(index++, GetSession()->GetBattlenetAccountId());
     }
     else
     {
@@ -24743,6 +24764,12 @@ void Player::_SaveAccountBankCoinage(CharacterDatabaseTransaction trans) const
     if (!bnetAccountId)
         return;
 
+    // Only the single account bank lock holder is the authoritative writer of the shared bank.
+    // A non-holder's in-memory copy may be stale (the holder can have mutated the bank since
+    // this session loaded it), so letting it write back would revert the holder's changes.
+    if (!HasPlayerLocalFlag(PLAYER_LOCAL_FLAG_HAS_ACCOUNT_BANK_LOCK))
+        return;
+
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_ACCOUNT_BANK_COINAGE);
     stmt->setUInt32(0, bnetAccountId);
     stmt->setUInt64(1, GetAccountBankCoinage());
@@ -24752,6 +24779,13 @@ void Player::_SaveAccountBankCoinage(CharacterDatabaseTransaction trans) const
 void Player::_SaveAccountBankItems(CharacterDatabaseTransaction trans)
 {
     uint32 bnetAccountId = GetSession()->GetBattlenetAccountId();
+
+    // Refuse to persist shared account bank items for an unlinked account (bnetId == 0) — all
+    // such accounts would otherwise share and overwrite one another's rows (MJ-2/M2). Also
+    // refuse for any session that does not hold the account bank lock: it is not the
+    // authoritative writer and its cached copy may be stale (see _SaveAccountBankCoinage).
+    if (!bnetAccountId || !HasPlayerLocalFlag(PLAYER_LOCAL_FLAG_HAS_ACCOUNT_BANK_LOCK))
+        return;
 
     // Delete all account bank item positions — they will be re-inserted below
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ACCOUNT_BANK_ITEMS_BY_BNET);
@@ -27029,7 +27063,7 @@ Optional<SellResult> Player::CanSellItemToVendor(Item const* item, uint32 amount
     if (amount > item->GetCount())
         return SELL_ERR_CANT_SELL_ITEM;
 
-    uint32 sellPrice = item->GetSellPrice(this);
+    uint32 sellPrice = item->GetSellPrice(this, true);
     if (sellPrice <= 0)
         return SELL_ERR_CANT_SELL_ITEM;
 
@@ -27044,7 +27078,7 @@ Optional<SellResult> Player::CanSellItemToVendor(Item const* item, uint32 amount
 
 Optional<SellResult> Player::SellItemToVendor(Item* item, uint32 amount)
 {
-    uint64 money = uint64(item->GetSellPrice(this)) * amount;
+    uint64 money = uint64(item->GetSellPrice(this, true)) * amount;
 
     if (!ModifyMoney(money)) // ensure player doesn't exceed gold limit
         return SELL_ERR_CANT_SELL_ITEM;
@@ -28264,10 +28298,13 @@ void Player::SendInitialPacketsBeforeAddToMap()
     WorldPackets::Misc::CTROptionsBlock emptyPrevious;
     SendCtrOptions(&emptyPrevious);
 
-    // Account-wide bank lock: grant to this session if no other session for the same
-    // Bnet account already holds it. Without this flag the client shows the
-    // "The bank is being used by another member of your Warband" prompt.
-    if (!sWorld->IsAccountInventoryLockAcquired(GetSession()->GetBattlenetAccountGUID(), GetSession()))
+    // Account-wide bank lock: atomically reserve the shared account bank for this session
+    // if no other session for the same Bnet account already holds it. Without this flag the
+    // client shows the "The bank is being used by another member of your Warband" prompt, and
+    // — critically — the server refuses every account bank mutation from a non-holder, so the
+    // reservation is what actually serialises concurrent same-bnet access. Unlinked accounts
+    // (bnetId == 0) are never granted the lock (TryAcquire rejects an empty Bnet GUID).
+    if (sWorld->TryAcquireAccountInventoryLock(GetSession()->GetBattlenetAccountGUID(), GetSession()))
         SetPlayerLocalFlag(PLAYER_LOCAL_FLAG_HAS_ACCOUNT_BANK_LOCK);
 
     SetMovedUnit(this);
@@ -30485,7 +30522,7 @@ void Player::InitRunes()
         return;
 
     uint32 runeIndex = GetPowerIndex(POWER_RUNES);
-    if (runeIndex == MAX_POWERS)
+    if (runeIndex >= MAX_POWERS_PER_CLASS)
         return;
 
     m_runes = std::make_unique<Runes>();

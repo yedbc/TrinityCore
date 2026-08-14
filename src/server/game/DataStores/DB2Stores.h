@@ -470,6 +470,15 @@ TC_GAME_API extern DB2Storage<WorldEffectEntry>                     sWorldEffect
 TC_GAME_API extern DB2Storage<WorldMapOverlayEntry>                 sWorldMapOverlayStore;
 TC_GAME_API extern DB2Storage<WorldStateExpressionEntry>            sWorldStateExpressionStore;
 
+struct ClassPowerTypes
+{
+    std::array<Powers, MAX_POWERS_PER_CLASS> PowerType = { };
+    uint8 PowerTypeCount = 0;
+
+    Powers const* begin() const { return PowerType.data(); }
+    Powers const* end() const { return PowerType.data() + PowerTypeCount; }
+};
+
 struct ContentTuningLevels
 {
     int16 MinLevel = 0;
@@ -580,8 +589,8 @@ public:
     using FriendshipRepReactionSet = std::set<FriendshipRepReactionEntry const*, FriendshipRepReactionEntryComparator>;
     using MapDifficultyConditionsContainer = std::vector<std::pair<uint32, PlayerConditionEntry const*>>;
     using MountTypeXCapabilitySet = std::set<MountTypeXCapabilityEntry const*, MountTypeXCapabilityEntryComparator>;
-    using MountXDisplayContainer = std::vector<MountXDisplayEntry const*>;
     using DelvesSeasonXSpellContainer = std::vector<DelvesSeasonXSpellEntry const*>;
+    using MountXDisplayContainer = std::vector<MountXDisplayEntry const*>;
 
     static DB2Manager& Instance();
 
@@ -616,7 +625,8 @@ public:
     static CharBaseInfoEntry const* GetCharBaseInfo(Races race, Classes class_);
     ChrClassUIDisplayEntry const* GetUiDisplayForClass(Classes unitClass) const;
     static char const* GetChrClassName(uint8 class_, LocaleConstant locale = DEFAULT_LOCALE);
-    uint32 GetPowerIndexByClass(Powers power, uint32 classId) const;
+    static ClassPowerTypes GetPowerTypesByClass(uint32 classId);
+    static uint32 GetPowerIndexByClass(Powers power, uint32 classId);
     std::vector<ChrCustomizationChoiceEntry const*> const* GetCustomiztionChoices(uint32 chrCustomizationOptionId) const;
     std::vector<ChrCustomizationOptionEntry const*> const* GetCustomiztionOptions(uint8 race, uint8 gender) const;
     std::vector<std::pair<uint32, std::vector<uint32>>> const* GetRequiredCustomizationChoices(uint32 chrCustomizationReqId) const;
@@ -634,6 +644,7 @@ public:
     std::pair<float, float> GetCurveXAxisRange(uint32 curveId) const;
     float GetCurveValueAt(uint32 curveId, float x) const;
     float GetCurveValueAt(CurveInterpolationMode mode, std::span<DBCPosition2D const> points, float x) const;
+    DelvesSeasonXSpellContainer const* GetDelvesSeasonSpells(uint32 delvesSeasonId) const;
     static std::string_view GetDifficultyName(Difficulty difficulty);
     EmotesTextSoundEntry const* GetTextSoundEmoteFor(uint32 emote, uint8 race, uint8 gender, uint8 class_) const;
     float EvaluateExpectedStat(ExpectedStatType stat, uint32 level, int32 expansion, uint32 contentTuningId, Classes unitClass, int32 mythicPlusMilestoneSeason) const;
@@ -650,7 +661,6 @@ public:
     std::vector<ItemLimitCategoryConditionEntry const*> const* GetItemLimitCategoryConditions(uint32 categoryId) const;
     std::vector<ItemSetSpellEntry const*> const* GetItemSetSpells(uint32 itemSetId) const;
     std::vector<ItemSpecOverrideEntry const*> const* GetItemSpecOverrides(uint32 itemId) const;
-    DelvesSeasonXSpellContainer const* GetDelvesSeasonSpells(uint32 delvesSeasonId) const;
     JournalTierEntry const* GetJournalTier(uint32 index) const;
     static LFGDungeonsEntry const* GetLfgDungeon(uint32 mapId, Difficulty difficulty);
     static uint32 GetDefaultMapLight(uint32 mapId);

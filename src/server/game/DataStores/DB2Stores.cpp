@@ -597,6 +597,17 @@ using AllowedHotfixOptionalData = std::pair<uint32 /*optional data key*/, bool(*
 
 namespace
 {
+    struct ClassPowerData
+    {
+        ClassPowerData()
+        {
+            IndexByType.fill(MAX_POWERS_PER_CLASS);
+        }
+
+        ClassPowerTypes TypeByIndex;
+        std::array<uint8, MAX_POWERS> IndexByType;
+    };
+
     struct UiMapBounds
     {
         // these coords are mixed when calculated and used... its a mess
@@ -624,7 +635,7 @@ namespace
     std::unordered_map<std::pair<uint32 /*broadcastTextId*/, CascLocaleBit /*cascLocaleBit*/>, int32> _broadcastTextDurations;
     std::unordered_map<std::pair<uint8, uint8>, CharBaseInfoEntry const*> _charBaseInfoByRaceAndClass;
     std::array<ChrClassUIDisplayEntry const*, MAX_CLASSES> _uiDisplayByClass;
-    std::array<std::array<uint32, MAX_POWERS>, MAX_CLASSES> _powersByClass;
+    std::array<ClassPowerData, MAX_CLASSES> _powersByClass;
     std::unordered_map<uint32 /*chrCustomizationOptionId*/, std::vector<ChrCustomizationChoiceEntry const*>> _chrCustomizationChoicesByOption;
     std::unordered_map<std::pair<uint8, uint8>, ChrModelEntry const*> _chrModelsByRaceAndGender;
     std::map<std::tuple<uint8 /*race*/, uint8/*gender*/, uint8/*shapeshift*/>, ShapeshiftFormModelData> _chrCustomizationChoicesForShapeshifts;
@@ -637,6 +648,7 @@ namespace
     std::unordered_map<uint32 /*creatureDifficultyId*/, std::vector<int32>> _creatureLabels;
     std::unordered_multimap<uint32, CurrencyContainerEntry const*> _currencyContainers;
     CurvePointsContainer _curvePoints;
+    std::unordered_map<uint32, DB2Manager::DelvesSeasonXSpellContainer> _delvesSeasonXSpellsBySeasonId;
     EmotesTextSoundContainer _emoteTextSounds;
     std::unordered_map<std::pair<uint32 /*level*/, int32 /*expansion*/>, ExpectedStatEntry const*> _expectedStatsByLevel;
     std::unordered_map<uint32 /*contentTuningId*/, std::vector<ContentTuningXExpectedEntry const*>> _expectedStatModsByContentTuning;
@@ -650,7 +662,6 @@ namespace
     ItemClassByOldEnumContainer _itemClassByOldEnum;
     std::unordered_set<uint32> _itemsWithCurrencyCost;
     ItemLimitCategoryConditionContainer _itemCategoryConditions;
-    std::unordered_map<uint32, DB2Manager::DelvesSeasonXSpellContainer> _delvesSeasonXSpellsBySeasonId;
     ItemSetSpellContainer _itemSetSpells;
     ItemSpecOverridesContainer _itemSpecOverrides;
     std::vector<JournalTierEntry const*> _journalTiersByIndex;
@@ -1439,19 +1450,14 @@ void DB2Manager::IndexLoadedStores()
         for (ChrClassesXPowerTypesEntry const* power : sChrClassesXPowerTypesStore)
             powers.insert(power);
 
-        for (std::array<uint32, MAX_POWERS>& powersForClass : _powersByClass)
-            powersForClass.fill(MAX_POWERS);
-
         for (ChrClassesXPowerTypesEntry const* power : powers)
         {
-            uint32 index = 0;
-            for (uint32 j = 0; j < MAX_POWERS; ++j)
-                if (_powersByClass[power->ClassID][j] != MAX_POWERS)
-                    ++index;
-
             ASSERT(power->ClassID < MAX_CLASSES);
             ASSERT(power->PowerType < MAX_POWERS);
-            _powersByClass[power->ClassID][power->PowerType] = index;
+
+            uint8 index = _powersByClass[power->ClassID].TypeByIndex.PowerTypeCount++;
+            _powersByClass[power->ClassID].TypeByIndex.PowerType[index] = Powers(power->PowerType);
+            _powersByClass[power->ClassID].IndexByType[power->PowerType] = index;
         }
     }
 
@@ -2419,9 +2425,14 @@ char const* DB2Manager::GetChrClassName(uint8 class_, LocaleConstant locale /*= 
     return classEntry->Name[DEFAULT_LOCALE];
 }
 
-uint32 DB2Manager::GetPowerIndexByClass(Powers power, uint32 classId) const
+ClassPowerTypes DB2Manager::GetPowerTypesByClass(uint32 classId)
 {
-    return _powersByClass[classId][power];
+    return _powersByClass[classId].TypeByIndex;
+}
+
+uint32 DB2Manager::GetPowerIndexByClass(Powers power, uint32 classId)
+{
+    return _powersByClass[classId].IndexByType[power];
 }
 
 std::vector<ChrCustomizationChoiceEntry const*> const* DB2Manager::GetCustomiztionChoices(uint32 chrCustomizationOptionId) const

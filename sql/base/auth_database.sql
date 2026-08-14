@@ -386,34 +386,6 @@ LOCK TABLES `battlenet_account_player_data_element` WRITE;
 UNLOCK TABLES;
 
 --
--- Table structure for table `account_wow_token`
---
-
-DROP TABLE IF EXISTS `account_wow_token`;
-/*!40101 SET @saved_cs_client     = @@character_set_client */;
-/*!50503 SET character_set_client = utf8mb4 */;
-CREATE TABLE `account_wow_token` (
-  `id` bigint unsigned NOT NULL COMMENT 'Token id sent to the client',
-  `account` int unsigned NOT NULL DEFAULT '0' COMMENT 'Owning account, 0 while listed on the market',
-  `state` tinyint unsigned NOT NULL DEFAULT '0' COMMENT '0 Auctionable, 1 Consumable, 2 Listed on the market',
-  `price` bigint unsigned NOT NULL DEFAULT '0' COMMENT 'Copper, only meaningful while state = 2',
-  `createTime` bigint NOT NULL DEFAULT '0',
-  PRIMARY KEY (`id`),
-  KEY `idx_account` (`account`),
-  KEY `idx_state` (`state`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='WoW Token holdings and market listings';
-/*!40101 SET character_set_client = @saved_cs_client */;
-
---
--- Dumping data for table `account_wow_token`
---
-
-LOCK TABLES `account_wow_token` WRITE;
-/*!40000 ALTER TABLE `account_wow_token` DISABLE KEYS */;
-/*!40000 ALTER TABLE `account_wow_token` ENABLE KEYS */;
-UNLOCK TABLES;
-
---
 -- Table structure for table `battlenet_account_player_data_flag`
 --
 
@@ -612,21 +584,6 @@ CREATE TABLE `battlenet_item_favorite_appearances` (
   `itemModifiedAppearanceId` int unsigned NOT NULL,
   PRIMARY KEY (`battlenetAccountId`,`itemModifiedAppearanceId`),
   CONSTRAINT `fk_battlenet_item_favorite_appearances` FOREIGN KEY (`battlenetAccountId`) REFERENCES `battlenet_accounts` (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-/*!40101 SET character_set_client = @saved_cs_client */;
-
---
--- Table structure for table `battlenet_item_favorite_transmog_sets`
---
-
-DROP TABLE IF EXISTS `battlenet_item_favorite_transmog_sets`;
-/*!40101 SET @saved_cs_client     = @@character_set_client */;
-/*!50503 SET character_set_client = utf8mb4 */;
-CREATE TABLE `battlenet_item_favorite_transmog_sets` (
-  `battlenetAccountId` int unsigned NOT NULL,
-  `transmogSetId` int unsigned NOT NULL,
-  PRIMARY KEY (`battlenetAccountId`,`transmogSetId`),
-  CONSTRAINT `fk_battlenet_item_favorite_transmog_sets` FOREIGN KEY (`battlenetAccountId`) REFERENCES `battlenet_accounts` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
@@ -1730,7 +1687,14 @@ INSERT INTO `build_auth_key` VALUES
 (68453,'Mac','x64','WoWC',0x88477E39E83C2A3E032760163F982A67),
 (68453,'Win','A64','WoW',0x2908E5C883715DFD6201B57B0E479067),
 (68453,'Win','x64','WoW',0x4BE7186213EDE43354CB69744C7A41E3),
-(68453,'Win','x64','WoWC',0x526540167D7E9433D46719CAF0785F10);
+(68453,'Win','x64','WoWC',0x526540167D7E9433D46719CAF0785F10),
+(68887,'Mac','A64','WoW',0x791AE732CD34C5860B70F8E76086C3E7),
+(68887,'Mac','A64','WoWC',0x9F28EFD80C1EC42492D226371599CFB1),
+(68887,'Mac','x64','WoW',0x703468E9D218D3C32196A9D770D50C26),
+(68887,'Mac','x64','WoWC',0x05A417FD3AA8C71891A802B876FD923B),
+(68887,'Win','A64','WoW',0x56CC340F63357AC05F5C29E197220640),
+(68887,'Win','x64','WoW',0x5FEF8A5E50C913780D0EBFA21995F942),
+(68887,'Win','x64','WoWC',0x8B875D86DC0DE02E6C3035C4336C411B);
 /*!40000 ALTER TABLE `build_auth_key` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -2191,7 +2155,8 @@ INSERT INTO `build_info` VALUES
 (68256,12,0,7,NULL),
 (68275,12,0,7,NULL),
 (68367,12,0,7,NULL),
-(68453,12,0,7,NULL);
+(68453,12,0,7,NULL),
+(68887,12,0,7,NULL);
 /*!40000 ALTER TABLE `build_info` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -3810,7 +3775,7 @@ CREATE TABLE `realmlist` (
   `timezone` tinyint unsigned NOT NULL DEFAULT '0',
   `allowedSecurityLevel` tinyint unsigned NOT NULL DEFAULT '0',
   `population` float NOT NULL DEFAULT '0',
-  `gamebuild` int unsigned NOT NULL DEFAULT '68453',
+  `gamebuild` int unsigned NOT NULL DEFAULT '68887',
   `Region` tinyint unsigned NOT NULL DEFAULT '1',
   `Battlegroup` tinyint unsigned NOT NULL DEFAULT '1',
   PRIMARY KEY (`id`),
@@ -3825,7 +3790,7 @@ CREATE TABLE `realmlist` (
 LOCK TABLES `realmlist` WRITE;
 /*!40000 ALTER TABLE `realmlist` DISABLE KEYS */;
 INSERT INTO `realmlist` VALUES
-(1,'Trinity','127.0.0.1','127.0.0.1',NULL,NULL,'255.255.255.0',8085,0,0,1,0,0,68453,1,1);
+(1,'Trinity','127.0.0.1','127.0.0.1',NULL,NULL,'255.255.255.0',8085,0,0,1,0,0,68887,1,1);
 /*!40000 ALTER TABLE `realmlist` ENABLE KEYS */;
 UNLOCK TABLES;
 
@@ -4406,7 +4371,8 @@ INSERT INTO `updates` VALUES
 ('2026_06_24_00_auth.sql','EAC304E52C5859FE1D321D26D994ECAFFC4426D2','RELEASED','2026-06-24 09:45:55',0),
 ('2026_06_30_00_auth.sql','1079B42207571BFFC213975206EA2DCCB4934167','RELEASED','2026-06-30 10:00:11',0),
 ('2026_07_02_00_auth.sql','A1E1C1314B080B31023629CE275103ADF3DF0DD2','RELEASED','2026-07-02 10:47:34',0),
-('2026_07_07_00_auth.sql','5B576647A1EFB375EC58C1227E5715721A22AD1A','RELEASED','2026-07-07 10:45:11',0);
+('2026_07_07_00_auth.sql','5B576647A1EFB375EC58C1227E5715721A22AD1A','RELEASED','2026-07-07 10:45:11',0),
+('2026_07_23_00_auth.sql','A7DBFF369F532B0EC641AA3F822300DA4BB7D5F9','RELEASED','2026-07-23 11:52:43',0);
 /*!40000 ALTER TABLE `updates` ENABLE KEYS */;
 UNLOCK TABLES;
 

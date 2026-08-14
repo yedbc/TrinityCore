@@ -166,6 +166,25 @@ ConditionMgr::ConditionTypeInfo const ConditionMgr::StaticConditionTypeData[COND
     { .Name = "Covenant",                  .HasConditionValue1 =  true, .HasConditionValue2 =  true, .HasConditionValue3 = false, .HasConditionStringValue1 = false }
 };
 
+static bool MeetsGroupStatusCondition(Player const* player, GroupStatusCondition status)
+{
+    Group const* group = player->GetGroup();
+    switch (status)
+    {
+        case GroupStatusCondition::NotInGroup:
+            return group == nullptr;
+        case GroupStatusCondition::InGroup:
+            return group != nullptr;
+        case GroupStatusCondition::InGroupButNotInRaid:
+            return group && !group->isRaidGroup();
+        case GroupStatusCondition::InRaid:
+            return group && group->isRaidGroup();
+        case GroupStatusCondition::NotInGroupOrNotInRaid:
+            return !group || !group->isRaidGroup();
+    }
+    return false;
+}
+
 ConditionSourceInfo::ConditionSourceInfo(WorldObject const* target0, WorldObject const* target1, WorldObject const* target2) :
     mConditionTargets({ target0, target1, target2 }),
     mConditionMap(nullptr),
@@ -718,6 +737,12 @@ bool Condition::Meets(ConditionSourceInfo& sourceInfo) const
                 condMeets = player->GetHighestCovenantRenownLevel() >= ConditionValue2;
             break;
         }
+        case CONDITION_GROUP_STATUS:
+        {
+            if (Player const* player = object->ToPlayer())
+                condMeets = MeetsGroupStatusCondition(player, GroupStatusCondition(ConditionValue1));
+            break;
+        }
         default:
             break;
     }
@@ -943,6 +968,7 @@ uint32 Condition::GetSearcherTypeMaskForCondition() const
             mask |= GRID_MAP_TYPE_MASK_PLAYER;
             break;
         case CONDITION_COVENANT:
+        case CONDITION_GROUP_STATUS:
             mask |= GRID_MAP_TYPE_MASK_PLAYER;
             break;
         default:
@@ -3122,34 +3148,8 @@ bool ConditionMgr::IsPlayerMeetingCondition(Player const* player, PlayerConditio
     }
 
     if (condition->PartyStatus)
-    {
-        Group const* group = player->GetGroup();
-        switch (condition->PartyStatus)
-        {
-            case 1:
-                if (group)
-                    return false;
-                break;
-            case 2:
-                if (!group)
-                    return false;
-                break;
-            case 3:
-                if (!group || group->isRaidGroup())
-                    return false;
-                break;
-            case 4:
-                if (!group || !group->isRaidGroup())
-                    return false;
-                break;
-            case 5:
-                if (group && group->isRaidGroup())
-                    return false;
-                break;
-            default:
-                break;
-        }
-    }
+        if (!MeetsGroupStatusCondition(player, GroupStatusCondition(condition->PartyStatus - 1)))
+            return false;
 
     if (condition->PrevQuestID[0])
     {

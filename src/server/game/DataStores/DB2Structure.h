@@ -1825,6 +1825,19 @@ struct DestructibleModelDataEntry
     int8 State3NameSet;
 };
 
+struct DelvesSeasonEntry
+{
+    uint32 ID;
+    int32 FactionID;                                                                  // Faction.ID FK
+};
+
+struct DelvesSeasonXSpellEntry
+{
+    uint32 ID;
+    int32 SpellID;
+    uint32 DelvesSeasonID;
+};
+
 struct DifficultyEntry
 {
     uint32 ID;
@@ -1842,19 +1855,6 @@ struct DifficultyEntry
     uint32 GroupSizeDmgCurveID;
     uint32 GroupSizeSpellPointsCurveID;
     int32 Unknown1105;
-};
-
-struct DelvesSeasonEntry
-{
-    uint32 ID;
-    int32 FactionID;                                                                  // Faction.ID FK
-};
-
-struct DelvesSeasonXSpellEntry
-{
-    uint32 ID;
-    int32 SpellID;
-    int32 DelvesSeasonID;
 };
 
 struct DungeonEncounterEntry
