@@ -180,9 +180,12 @@ void LoginDatabaseConnection::DoPrepareStatements()
     PrepareStatement(LOGIN_SEL_ACCOUNT_STORE_PURCHASES, "SELECT accountStoreItemId, purchaseTime, payerGuid, granted FROM battlenet_account_store_purchases WHERE accountId = ?", CONNECTION_ASYNC);
     PrepareStatement(LOGIN_INS_ACCOUNT_STORE_PURCHASE, "INSERT IGNORE INTO battlenet_account_store_purchases (accountId, accountStoreItemId, purchaseTime, payerGuid, granted) VALUES (?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(LOGIN_DEL_ACCOUNT_STORE_PURCHASE, "DELETE FROM battlenet_account_store_purchases WHERE accountId = ? AND accountStoreItemId = ?", CONNECTION_ASYNC);
-    PrepareStatement(LOGIN_SEL_ACCOUNT_PERKS_PURCHASES, "SELECT perksVendorItemId, price, purchaseTime, mountId, toyId FROM battlenet_account_perks_purchases WHERE accountId = ?", CONNECTION_ASYNC);
-    PrepareStatement(LOGIN_INS_ACCOUNT_PERKS_PURCHASE, "INSERT INTO battlenet_account_perks_purchases (accountId, perksVendorItemId, price, purchaseTime, mountId, toyId) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_SEL_ACCOUNT_PERKS_PURCHASES, "SELECT perksVendorItemId, price, purchaseTime, mountId, toyId, buyerGuid FROM battlenet_account_perks_purchases WHERE accountId = ?", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_INS_ACCOUNT_PERKS_PURCHASE, "INSERT INTO battlenet_account_perks_purchases (accountId, perksVendorItemId, price, purchaseTime, mountId, toyId, buyerGuid) VALUES (?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(LOGIN_DEL_ACCOUNT_PERKS_PURCHASE, "DELETE FROM battlenet_account_perks_purchases WHERE accountId = ? AND perksVendorItemId = ?", CONNECTION_ASYNC);
+    // Account-wide Trader's Tender (currency 2032): authoritative balance shared across all characters of the bnet account.
+    PrepareStatement(LOGIN_SEL_ACCOUNT_PERKS_TENDER, "SELECT amount, lastCacheGrantPeriod FROM battlenet_account_perks_tender WHERE accountId = ?", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_REP_ACCOUNT_PERKS_TENDER, "REPLACE INTO battlenet_account_perks_tender (accountId, amount, lastCacheGrantPeriod) VALUES (?, ?, ?)", CONNECTION_ASYNC);
 
     // Battle Pets
     PrepareStatement(LOGIN_SEL_BATTLE_PETS, "SELECT bp.guid, bp.species, bp.breed, bp.displayId, bp.level, bp.exp, bp.health, bp.quality, bp.flags, bp.name, bp.nameTimestamp, bp.owner, bp.ownerRealmId, dn.genitive, dn.dative, dn.accusative, dn.instrumental, dn.prepositional FROM battle_pets bp LEFT JOIN battle_pet_declinedname dn ON bp.guid = dn.guid WHERE bp.battlenetAccountId = ? AND (bp.ownerRealmId IS NULL OR bp.ownerRealmId = ?)", CONNECTION_ASYNC);
@@ -211,6 +214,9 @@ void LoginDatabaseConnection::DoPrepareStatements()
     PrepareStatement(LOGIN_SEL_BNET_ITEM_FAVORITE_APPEARANCES, "SELECT itemModifiedAppearanceId FROM battlenet_item_favorite_appearances WHERE battlenetAccountId = ?", CONNECTION_ASYNC);
     PrepareStatement(LOGIN_INS_BNET_ITEM_FAVORITE_APPEARANCE, "INSERT INTO battlenet_item_favorite_appearances (battlenetAccountId, itemModifiedAppearanceId) VALUES (?, ?)", CONNECTION_ASYNC);
     PrepareStatement(LOGIN_DEL_BNET_ITEM_FAVORITE_APPEARANCE, "DELETE FROM battlenet_item_favorite_appearances WHERE battlenetAccountId = ? AND itemModifiedAppearanceId = ?", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_SEL_BNET_ITEM_FAVORITE_TRANSMOG_SETS, "SELECT transmogSetId FROM battlenet_item_favorite_transmog_sets WHERE battlenetAccountId = ?", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_INS_BNET_ITEM_FAVORITE_TRANSMOG_SET, "INSERT INTO battlenet_item_favorite_transmog_sets (battlenetAccountId, transmogSetId) VALUES (?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_DEL_BNET_ITEM_FAVORITE_TRANSMOG_SET, "DELETE FROM battlenet_item_favorite_transmog_sets WHERE battlenetAccountId = ? AND transmogSetId = ?", CONNECTION_ASYNC);
     PrepareStatement(LOGIN_SEL_BNET_TRANSMOG_ILLUSIONS, "SELECT blobIndex, illusionMask FROM battlenet_account_transmog_illusions WHERE battlenetAccountId = ? ORDER BY blobIndex DESC", CONNECTION_ASYNC);
     PrepareStatement(LOGIN_INS_BNET_TRANSMOG_ILLUSIONS, "INSERT INTO battlenet_account_transmog_illusions (battlenetAccountId, blobIndex, illusionMask) VALUES (?, ?, ?) "
         "ON DUPLICATE KEY UPDATE illusionMask = illusionMask | VALUES(illusionMask)", CONNECTION_ASYNC);
@@ -231,6 +237,45 @@ void LoginDatabaseConnection::DoPrepareStatements()
 
     PrepareStatement(LOGIN_INS_ACCOUNT_WOW_TOKEN, "INSERT INTO account_wow_token (id, account, state, price, createTime) VALUES (?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(LOGIN_UPD_ACCOUNT_WOW_TOKEN, "UPDATE account_wow_token SET account = ?, state = ?, price = ? WHERE id = ?", CONNECTION_ASYNC);
+
+    // Battle.net friends v2 - durable friend graph (BnetFriendsMgr).
+    PrepareStatement(LOGIN_UPD_BNET_BATTLE_TAG, "UPDATE battlenet_accounts SET battle_tag = ?, battle_tag_disc = ? WHERE id = ?", CONNECTION_ASYNC);
+    // Synchronous: used to pick up a battlenet account created after worldserver startup, on the character-select path.
+    PrepareStatement(LOGIN_SEL_BNET_ACCOUNT_IDENTITY, "SELECT id, email, battle_tag, battle_tag_disc FROM battlenet_accounts WHERE id = ?", CONNECTION_SYNCH);
+    PrepareStatement(LOGIN_REP_BNET_FRIEND, "REPLACE INTO battlenet_account_friend (accountId, friendId, level, note, titleTags, creationTime) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_UPD_BNET_FRIEND_STATE, "UPDATE battlenet_account_friend SET note = ?, titleTags = ? WHERE accountId = ? AND friendId = ?", CONNECTION_ASYNC);
+    // Removing a friend is symmetric on retail - both directions go.
+    PrepareStatement(LOGIN_DEL_BNET_FRIEND_EDGE, "DELETE FROM battlenet_account_friend WHERE (accountId = ? AND friendId = ?) OR (accountId = ? AND friendId = ?)", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_INS_BNET_FRIEND_INVITE, "REPLACE INTO battlenet_account_friend_invite (id, senderId, targetId, targetTag, level, note, creationTime, expirationTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_DEL_BNET_FRIEND_INVITE, "DELETE FROM battlenet_account_friend_invite WHERE id = ?", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_DEL_BNET_FRIEND_INVITES_BY_SENDER, "DELETE FROM battlenet_account_friend_invite WHERE senderId = ?", CONNECTION_ASYNC);
+
+    // Battle.net presence: one row per game account, rewritten on login / logout / character switch / zone change.
+    PrepareStatement(LOGIN_REP_BNET_PRESENCE, "REPLACE INTO battlenet_game_account_presence (gameAccountId, bnetAccountId, isOnline, realmId, characterGuid, characterName, level, raceId, classId, factionId, zoneId, areaId, updateTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    // Any row still flagged online at worldserver startup is a leftover from an unclean shutdown.
+    PrepareStatement(LOGIN_UPD_BNET_PRESENCE_ALL_OFFLINE, "UPDATE battlenet_game_account_presence SET isOnline = 0", CONNECTION_ASYNC);
+    // Battle.net account-scope block list.
+    PrepareStatement(LOGIN_REP_BNET_BLOCKED, "REPLACE INTO battlenet_account_blocked (accountId, blockedAccountId, blockedBattleTag, creationTime, modifiedTime) VALUES (?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_DEL_BNET_BLOCKED, "DELETE FROM battlenet_account_blocked WHERE accountId = ? AND blockedAccountId = ?", CONNECTION_ASYNC);
+
+    // In-game Shop (BattlePay) persistent purchase ledger: GetPurchaseList + idempotency (TK-6).
+    PrepareStatement(LOGIN_INS_BATTLEPAY_PURCHASE, "INSERT INTO account_battlepay_purchase (id, account, productId, status, resultCode, basePrice, userPrice, timeCreated, walletName) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_SEL_BATTLEPAY_PURCHASE_ACCOUNT, "SELECT id, status, resultCode, productId, basePrice, userPrice, timeCreated FROM account_battlepay_purchase WHERE account = ? ORDER BY id ASC", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_SEL_BATTLEPAY_PURCHASE_MAXID, "SELECT MAX(id) FROM account_battlepay_purchase WHERE id BETWEEN ? AND ?", CONNECTION_SYNCH);
+
+    // In-game Shop entitlements ("distributions"). The claim / verify / commit trio is SYNCH on purpose:
+    // assigning an entitlement is a compare-and-swap whose outcome decides whether we grant, so it cannot
+    // be fire-and-forget. Assignments are rare (a handful per account, ever), so the world-thread stall is
+    // bounded and correctness wins. The two list queries are ASYNC, like the purchase list.
+    PrepareStatement(LOGIN_INS_BATTLEPAY_ENTITLEMENT, "INSERT INTO account_battlepay_entitlement (id, account, productId, serviceType, status, purchaseId, claimToken, realmId, targetCharacter, createTime, updateTime) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)", CONNECTION_SYNCH);
+    PrepareStatement(LOGIN_SEL_BATTLEPAY_ENTITLEMENT_ACCOUNT, "SELECT id, productId, serviceType, status, purchaseId, createTime FROM account_battlepay_entitlement WHERE account = ? AND status = 1 ORDER BY id ASC", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_SEL_BATTLEPAY_ENTITLEMENT_MAXID, "SELECT MAX(id) FROM account_battlepay_entitlement WHERE id BETWEEN ? AND ?", CONNECTION_SYNCH);
+    PrepareStatement(LOGIN_SEL_BATTLEPAY_ENTITLEMENT_BY_ID, "SELECT account, productId, serviceType, status, claimToken, realmId, targetCharacter FROM account_battlepay_entitlement WHERE id = ?", CONNECTION_SYNCH);
+    // purchaseId is selected so the delivery notification can name the purchase it completes. The column
+    // already exists (see LOGIN_INS_BATTLEPAY_ENTITLEMENT above), so this needs NO schema change.
+    PrepareStatement(LOGIN_SEL_BATTLEPAY_ENTITLEMENT_PENDING_CHAR, "SELECT id, productId, serviceType, purchaseId FROM account_battlepay_entitlement WHERE realmId = ? AND targetCharacter = ? AND status = 3 ORDER BY id ASC", CONNECTION_ASYNC);
+    PrepareStatement(LOGIN_UPD_BATTLEPAY_ENTITLEMENT_CLAIM, "UPDATE account_battlepay_entitlement SET status = 2, claimToken = ?, realmId = ?, targetCharacter = ?, updateTime = ? WHERE id = ? AND account = ? AND status = 1", CONNECTION_SYNCH);
+    PrepareStatement(LOGIN_UPD_BATTLEPAY_ENTITLEMENT_STATUS, "UPDATE account_battlepay_entitlement SET status = ?, claimToken = ?, updateTime = ? WHERE id = ? AND status = ? AND claimToken = ?", CONNECTION_SYNCH);
 }
 
 LoginDatabaseConnection::LoginDatabaseConnection(MySQLConnectionInfo& connInfo, ConnectionFlags connectionFlags) : MySQLConnection(connInfo, connectionFlags)

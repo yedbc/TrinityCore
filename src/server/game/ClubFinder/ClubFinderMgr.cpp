@@ -16,11 +16,15 @@
  */
 
 #include "ClubFinderMgr.h"
+#include "CharacterCache.h"
 #include "DatabaseEnv.h"
 #include "DB2Stores.h"
 #include "Common.h"
 #include "GameTime.h"
+#include "Guild.h"
+#include "GuildMgr.h"
 #include "Log.h"
+#include "Player.h"
 #include "Timer.h"
 #include <algorithm>
 #include <cctype>
@@ -282,6 +286,24 @@ bool ClubFinderMgr::IsApplicationExpired(ClubFinderApplication const& applicatio
         && GameTime::GetGameTime() - application.LastUpdatedTime > time_t(CLUB_FINDER_APPLICATION_EXPIRY_DAYS) * DAY;
 }
 
+bool ClubFinderMgr::IsPostingVisible(ClubFinderPosting const& posting)
+{
+    // A delisted, pending-delete or banned posting has been removed by moderation and must never
+    // surface, whether through search or a direct posting-id lookup.
+    if (posting.DisplayFlags & (CLUB_FINDER_POSTING_FLAG_POST_DELISTED | CLUB_FINDER_POSTING_FLAG_PENDING_DELETE | CLUB_FINDER_POSTING_FLAG_BANNED))
+        return false;
+
+    // A guild that has not enabled its listing is not advertising.
+    if (!(posting.RecruitmentFlags & CLUB_FINDER_SETTING_ENABLE_LISTING))
+        return false;
+
+    // The client stops showing a posting as active after 30 days; do not offer it either.
+    if (IsPostingExpired(posting))
+        return false;
+
+    return true;
+}
+
 bool ClubFinderMgr::AddPostingDisplayFlags(uint32 postingId, uint32 flags)
 {
     auto itr = _postings.find(postingId);
@@ -322,6 +344,23 @@ bool ClubFinderMgr::RemovePostingDisplayFlags(uint32 postingId, uint32 flags)
     return true;
 }
 
+// CF-7: the faction a posting recruits for is its guild's own faction, and a guild's faction is that
+// of its leader. Resolved from the leader's cached race so it works whether or not the leader is
+// online. Returns TEAM_NEUTRAL when the guild or leader cannot be resolved, which the search treats
+// as "no faction constraint" (permissive) rather than hiding a posting on missing data.
+static TeamId GetPostingTeamId(ClubFinderPosting const& posting)
+{
+    Guild const* guild = sGuildMgr->GetGuildById(posting.ClubId);
+    if (!guild)
+        return TEAM_NEUTRAL;
+
+    CharacterCacheEntry const* leader = sCharacterCache->GetCharacterCacheByGuid(guild->GetLeaderGUID());
+    if (!leader)
+        return TEAM_NEUTRAL;
+
+    return Player::TeamIdForRace(leader->Race);
+}
+
 std::vector<ClubFinderPosting const*> ClubFinderMgr::Search(SearchCriteria const& criteria) const
 {
     std::string needle = criteria.SearchString;
@@ -333,17 +372,23 @@ std::vector<ClubFinderPosting const*> ClubFinderMgr::Search(SearchCriteria const
         if (criteria.Type != CLUB_FINDER_REQUEST_TYPE_ALL && posting.Type != criteria.Type)
             continue;
 
-        // A delisted or removed posting must not surface in a search.
-        if (posting.DisplayFlags & (CLUB_FINDER_POSTING_FLAG_POST_DELISTED | CLUB_FINDER_POSTING_FLAG_PENDING_DELETE | CLUB_FINDER_POSTING_FLAG_BANNED))
+        // Moderation removal, unlisted and expiry gates - shared with the direct posting-id lookup so
+        // the two cannot disagree about which postings are hidden.
+        if (!IsPostingVisible(posting))
             continue;
 
-        // A guild that has not enabled its listing is not advertising.
-        if (!(posting.RecruitmentFlags & CLUB_FINDER_SETTING_ENABLE_LISTING))
-            continue;
-
-        // The client stops showing a posting as active after 30 days; do not offer it either.
-        if (IsPostingExpired(posting))
-            continue;
+        // CF-7 cross-faction search visibility: a posting whose guild is the OPPOSITE faction from the
+        // searching player is hidden here, UNLESS the guild advertises cross-faction (posting.CrossFaction),
+        // in which case it stays visible to both factions. Same-faction postings are always visible, and a
+        // posting whose faction cannot be resolved (TEAM_NEUTRAL) is left visible. This is deliberately a
+        // search-only filter: the direct posting-id lookup (BuildClubCacheData) has no searcher and is not
+        // faction-gated, and apply/accept impose no faction gate at all - a cross-faction join is allowed.
+        if (criteria.SearcherTeamId != -1 && !posting.CrossFaction)
+        {
+            TeamId const postingTeam = GetPostingTeamId(posting);
+            if (postingTeam != TEAM_NEUTRAL && postingTeam != TeamId(criteria.SearcherTeamId))
+                continue;
+        }
 
         // The posting only advertises to players who meet its own item level requirement.
         if (criteria.ItemLevel && posting.ItemLevelRequirement > criteria.ItemLevel)
@@ -358,15 +403,15 @@ std::vector<ClubFinderPosting const*> ClubFinderMgr::Search(SearchCriteria const
         if (criteria.SizeFlags && !(posting.RecruitmentFlags & criteria.SizeFlags & CLUB_FINDER_SETTING_MASK_SIZE))
             continue;
 
+        // Class-role filter (Tank / Healer / Damage): the client sends the requested role bits in the
+        // same recruitmentFlags bit space as focus and size, so it matches directly against the
+        // posting's recruited-role bits (9-11) - the guild must recruit at least one requested role.
+        if (criteria.RoleFlags && !(posting.RecruitmentFlags & criteria.RoleFlags & CLUB_FINDER_SETTING_MASK_ROLE))
+            continue;
+
         // A spec filter matches when the guild recruits at least one of the requested specs.
         if (criteria.Specs && posting.RecruitingSpecs && !(posting.RecruitingSpecs & criteria.Specs))
             continue;
-
-        // A class filter matches when the guild recruits any specialisation of that class. The spec
-        // mask uses the client bit ordering, rebuilt in BuildSpecBitIndex.
-        if (criteria.ClassId && posting.RecruitingSpecs)
-            if (uint64 classMask = GetSpecMaskForClass(criteria.ClassId); classMask && !(posting.RecruitingSpecs & classMask))
-                continue;
 
         // Locale: the posting packs (locale + 1) into bits 21-25 of its flags, the applicant sends a
         // bitmask of (1 << locale). An unset posting locale (packed 0) or an empty applicant mask is

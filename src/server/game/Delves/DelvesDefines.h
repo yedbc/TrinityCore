@@ -73,9 +73,15 @@ inline uint8 GetMaxRevivesForTier(uint8 tier)
 // This is the data layer that previous research (project_tiered_entrance_obfuscation
 // memory) flagged as Unknown — DelvesSeasonXSpell.db2 ships empty in the live
 // client; the actual spell list arrives via packet sniff. Now captured.
+//
+// 12.0.7 REVISION (68974 Darkway capture, TESTER_SNIFF3_DELVE_MINE.md): the Tier-1 run reports
+// WS_DELVE_TIER_SPELL = 1260940 — NOT the 66527-era 1260938 — and none of the 66527 ids are cast;
+// the select flow casts 1305941/426853/1254713 instead. Tier 1 is corrected below on that evidence;
+// tiers 2-11 still carry the 66527 values and NEED RE-VERIFICATION from further captures (the +2
+// offset of tier 1 suggests the whole ladder was re-issued, but one data point is not a ladder).
 static constexpr uint32 TIER_SPELL_IDS[MAX_DELVE_TIER] =
 {
-    1260938,  // Tier 1
+    1260940,  // Tier 1 (68974-verified; 66527 value was 1260938)
     1260942,  // Tier 2
     1260946,  // Tier 3
     1260950,  // Tier 4
@@ -114,7 +120,7 @@ static constexpr char const* TIER_NAMES[MAX_DELVE_TIER] =
 enum DelveWorldStates : uint32
 {
     WS_DELVE_TIER             = 24430,    // Selected tier (1..11)
-    WS_DELVE_IN_DELVE_FLAG    = 26345,    // 0 = outside, 2 = inside
+    WS_DELVE_IN_DELVE_FLAG    = 26345,    // 0 = outside, 1 = inside (68974 Darkway capture; older 66527 notes said 2)
     WS_DELVE_MAP_ID           = 26423,    // Active delve MapID
     WS_DELVE_TIER_SPELL       = 26931,    // The TIER_SPELL_IDS[] value cast for this run
     WS_DELVE_UNKNOWN_26903    = 26903,    // Per-delve, controls center spell display in tier picker
@@ -142,10 +148,9 @@ static constexpr uint8  MAX_COMPANION_GROUP_SIZE = 4;           // Companion joi
 // ---------------------------------------------------------------------------
 // Great Vault
 // ---------------------------------------------------------------------------
-
-static constexpr uint32 VAULT_SLOT_1_COMPLETIONS = 2;
-static constexpr uint32 VAULT_SLOT_2_COMPLETIONS = 4;
-static constexpr uint32 VAULT_SLOT_3_COMPLETIONS = 8;
+// No delve-private slot thresholds live here. Delve completions credit the vault's World activity row, and
+// that row's thresholds come from WeeklyRewardChestThreshold.db2 through WeeklyRewards::WORLD_THRESHOLDS
+// (Type 6, live ids 196/197/198 = 2/4/8) - a single source, so the two cannot drift apart.
 
 // ---------------------------------------------------------------------------
 // Well-Known IDs (from DelvesConstantsDocumentation.lua + WoWDBDefs)
@@ -153,6 +158,7 @@ static constexpr uint32 VAULT_SLOT_3_COMPLETIONS = 8;
 
 static constexpr uint32 CONTENT_TUNING_DELVE_MIN_LEVEL = 2677;
 static constexpr uint32 CURRENCY_RESTORED_COFFER_KEY = 3028;
+static constexpr uint32 CURRENCY_COFFER_KEY_SHARDS = 3310;   // Midnight: shards are a currency (100 -> 1 key on delve entry)
 static constexpr uint32 PDE_COMPANION_INFO_SELECTION = 13;
 static constexpr uint32 WIDGET_SET_COMPANION_TOOLTIP = 1331;
 // TIERED_ENTRANCE_INFO_WORLD_TIER_DIFFICULTY_CHARACTER_ELEMENT_ID (NEW 12.0.7/68275):
@@ -318,6 +324,11 @@ struct DelveTemplate
     // Blizzard_DelvesDifficultyPicker tier-selection UI. One value per delve
     // (sniff-derived; e.g. 1278258 for Atal'Aman, 1265777 for Shadow Enclave).
     uint32 WorldState26903 = 0;
+
+    // Creature entry whose death completes the delve (world content; 0 = no boss-kill completion — the run
+    // then only completes through the scenario path once that is wired). The pragmatic completion trigger,
+    // mirroring the boss-gated completion model proven for Mythic+.
+    uint32 FinalBossEntry = 0;
 };
 
 struct DelveTierReward

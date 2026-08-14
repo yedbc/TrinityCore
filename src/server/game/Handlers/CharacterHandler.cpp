@@ -26,6 +26,7 @@
 #include "Battleground.h"
 #include "BattlegroundPackets.h"
 #include "CalendarMgr.h"
+#include "BnetPresenceMgr.h"
 #include "CharacterCache.h"
 #include "CharacterPackets.h"
 #include "Chat.h"
@@ -51,6 +52,9 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Pet.h"
+#include "ChallengeModeMgr.h"
+#include "ItemConversionMgr.h"
+#include "ItemUpgradeMgr.h"
 #include "Player.h"
 #include "PlayerDump.h"
 #include "QueryHolder.h"
@@ -436,6 +440,10 @@ bool LoginQueryHolder::Initialize()
     stmt->setUInt64(0, lowGuid);
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_COVENANT, stmt);
 
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_COVENANT_SOULBINDS);
+    stmt->setUInt64(0, lowGuid);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_COVENANT_SOULBINDS, stmt);
+
     stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_SOULBIND_CONDUIT);
     stmt->setUInt64(0, lowGuid);
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_SOULBIND_CONDUITS, stmt);
@@ -451,6 +459,15 @@ bool LoginQueryHolder::Initialize()
     stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_ACCOUNT_REPUTATION);
     stmt->setUInt32(0, GetBattlenetAccountId());
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_REPUTATION, stmt);
+
+    // Phase 10C - renown reward grant tracking (character + warband)
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHAR_RENOWN_REWARDS_GRANTED);
+    stmt->setUInt64(0, lowGuid);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_CHAR_RENOWN_REWARDS_GRANTED, stmt);
+
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_WARBAND_RENOWN_REWARDS_GRANTED);
+    stmt->setUInt32(0, m_battlenetAccountId);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_WARBAND_RENOWN_REWARDS_GRANTED, stmt);
 
     stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_WARBAND_TAXI_MASK);
     stmt->setUInt32(0, GetBattlenetAccountId());
@@ -481,6 +498,9 @@ bool LoginQueryHolder::Initialize()
     stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_ACCOUNT_BANK_COINAGE);
     stmt->setUInt32(0, m_battlenetAccountId);
     res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_COINAGE, stmt);
+    stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_COVENANT_CALLINGS);
+    stmt->setUInt64(0, lowGuid);
+    res &= SetPreparedQuery(PLAYER_LOGIN_QUERY_LOAD_COVENANT_CALLINGS, stmt);
 
     return res;
 }
@@ -791,19 +811,35 @@ void WorldSession::HandleSetupWarbandGroups(WorldPackets::Character::SetupWarban
 {
     uint32 battlenetAccountId = GetBattlenetAccountId();
 
-    // Validate: max 5 groups
-    if (setupWarbandGroups.Groups.size() > 5)
+    // Cap taken from the client itself, not from patch notes: the 12.0.7 client exposes the limit to Lua as
+    // GetMaxWarbandGroupCount(), which is a zero-argument constant getter returning 20. In the 68275 binary
+    // (wow_dump.bin, ImageBase 0x7FF7B3140000) that function is at RVA 0xAE7DF0 - it loads its own name string
+    // "GetMaxWarbandGroupCount" (RVA 0x3A87498) and the returned constant with
+    // "mov dword ptr [rbp+0x20], 0x14" at RVA 0xAE7E36, i.e. 20. Reading that slot as the return value was
+    // validated by extracting the same pattern across all 26 sibling constant getters and checking the ones
+    // whose values are independently known: GetIslandsMaxGroupSize=3, GetMaxNumQuestsCanAccept=35,
+    // GetMaxNumTeams=2, GetWarResourcesCurrencyID=1560, GetDragonIslesSuppliesCurrencyID=2003,
+    // GetAzeriteCurrencyID=1553 - all correct. The client is also the thing that enforces this cap in the UI:
+    // Blizzard_GlueXML/Mainline/CharacterSelect.lua:1381 gates the Add Group button on
+    // "CharacterSelectListUtil.GetTotalGroupCount() >= GetMaxWarbandGroupCount()", and
+    // CharacterSelect/CharacterSelectList.lua:13 formats the disabled tooltip with the same value.
+    constexpr std::size_t MaxWarbandGroups = 20;
+
+    // The OrderIndex de-duplication below tracks seen indexes in a uint32 bitmask.
+    static_assert(MaxWarbandGroups <= 32, "seenOrderIndexes has room for at most 32 order indexes");
+
+    if (setupWarbandGroups.Groups.size() > MaxWarbandGroups)
     {
-        TC_LOG_ERROR("network", "WorldSession::HandleSetupWarbandGroups: Account {} sent {} groups, max is 5",
-            battlenetAccountId, setupWarbandGroups.Groups.size());
+        TC_LOG_ERROR("network", "WorldSession::HandleSetupWarbandGroups: Account {} sent {} groups, max is {}",
+            battlenetAccountId, setupWarbandGroups.Groups.size(), MaxWarbandGroups);
         return;
     }
 
     uint32 seenOrderIndexes = 0;
     for (auto const& group : setupWarbandGroups.Groups)
     {
-        // Validate order index: bounded and unique so the derived group key cannot collide
-        if (group.OrderIndex >= 20 || (seenOrderIndexes & (1u << group.OrderIndex)))
+        // Bound and de-duplicate OrderIndex against the same cap, so the two can never disagree.
+        if (group.OrderIndex >= MaxWarbandGroups || (seenOrderIndexes & (1u << group.OrderIndex)))
         {
             TC_LOG_ERROR("network", "WorldSession::HandleSetupWarbandGroups: Account {} sent invalid or duplicate OrderIndex {}",
                 battlenetAccountId, group.OrderIndex);
@@ -1462,6 +1498,15 @@ void WorldSession::HandlePlayerLoginOpcode(WorldPackets::Character::PlayerLogin&
 
     m_playerLoading = playerLogin.Guid;
 
+    // The Shop catalog is served at most once per catalog generation per session, but the client
+    // throws its store state away when it leaves character select, so the copy it fetched there is
+    // gone by the time the in-game Shop opens. Without this reset the in-world
+    // CMSG_BATTLE_PAY_GET_PRODUCT_LIST is silently swallowed by that throttle and the Shop shows an
+    // empty frame ("bad argument #1 to GetProducts" in Blizzard_StoreUI, because it has no product
+    // groups). Clearing the marker on login gives each context exactly one copy, which is what the
+    // throttle was actually meant to do.
+    _battlePayCatalogGeneration = 0;
+
     TC_LOG_DEBUG("network", "Character {} logging in", playerLogin.Guid.ToString());
 
     if (!IsLegitCharacterForAccount(playerLogin.Guid))
@@ -1562,6 +1607,17 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     SendFeatureSystemStatus();
 
+    // Unblock the in-game Shop panel: the client's StoreFrame_IsLoading gate waits on the distribution
+    // list (HasDistributionList). Retail sends it right after the feature status; we replay the blob.
+    SendBattlePayDistributionList();
+
+    // Hand over anything bought earlier and assigned to this character (see RedeemBattlePayEntitlements).
+    RedeemBattlePayEntitlements();
+
+    // Trading Post animation-toggle kill switch; retail places it here, between SMSG_FEATURE_SYSTEM_STATUS and
+    // SMSG_MOTD.
+    SendPerksAnimToggleKillSwitch();
+
     // Send MOTD
     {
         WorldPackets::System::MOTD motd;
@@ -1571,9 +1627,9 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     SendSetTimeZoneInformation();
 
-    // Retail pushes the single sign-on token once, unprompted, in this post-login burst - there is no
-    // client request opcode for it in 12.0.7. See WOW_TOKEN_RE_68275.md.
-    SendGenerateSsoToken();
+    // Note: SMSG_GENERATE_SSO_TOKEN_RESPONSE is NOT pushed here. It is the strict 1:1 answer to
+    // CMSG_BATTLE_PAY_OPEN_CHECKOUT (proven in all 8 captures: checkout #N -> response #N echoing the
+    // request u32); it is sent from WorldSession::HandleBattlePayOpenCheckout. See COMMERCE_AUDIT C-09.
 
     // Send PVPSeason
     {
@@ -1676,6 +1732,15 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     // Now in world: grant any covenant renown rewards earned before this character was last saved / before the feature existed.
     pCurrChar->UpdateAllRenownRewards();
+    // Mythic+ weekly keystone maintenance: after a weekly reset the carried keystone is adjusted from last week's
+    // runs and restamped with the new week's affixes (no new key is granted here; the Great Vault does that).
+    sChallengeModeMgr.UpdateKeystoneForNewWeek(pCurrChar, false /*createIfMissing*/);
+
+    // Matrix Catalyst charge accrual (biweekly drip, lazily granted at login).
+    sItemConversionMgr.UpdateCharges(pCurrChar);
+
+    // Item upgrade watermarks (per-slot crest-waiver levels shown by the upgrade UI).
+    sItemUpgradeMgr.LoadWatermarks(pCurrChar);
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_CHAR_ONLINE);
     stmt->setUInt64(0, pCurrChar->GetGUID().GetCounter());
@@ -1869,6 +1934,10 @@ void WorldSession::HandlePlayerLogin(LoginQueryHolder const& holder)
 
     sScriptMgr->OnPlayerLogin(pCurrChar, firstLogin);
 
+    // Battle.net presence: the account is now on a specific character. Pushed to presence.v1/v2
+    // subscribers and mirrored into battlenet_game_account_presence.
+    sBnetPresenceMgr->OnCharacterLogin(pCurrChar);
+
     TC_METRIC_EVENT("player_events", "Login", pCurrChar->GetName());
 }
 
@@ -1926,6 +1995,16 @@ void WorldSession::SendFeatureSystemStatus()
     // the captured catalog and drive purchases server-side, so advertise the store as available.
     features.BpayStoreAvailable = true;
     features.CommerceServerEnabled = true;
+
+    // In-game Shop (BattlePay) availability. The client's C_StoreSecure.IsAvailable() gate reads
+    // BpayStoreAvailable; with it false the Shop shows "Store not available" and never sends
+    // CMSG_BATTLE_PAY_GET_PRODUCT_LIST, so our product blob is never requested. Retail sends both
+    // of these true (verified against the 12.0.7 in-game-shop sniff). We answer GetProductList with
+    // the captured catalog and drive purchases server-side, so advertise the store as available.
+    // Gated by the Shop.Enabled worldserver.conf toggle (default on).
+    bool const shopEnabled = sWorld->getBoolConfig(CONFIG_SHOP_ENABLED);
+    features.BpayStoreAvailable = shopEnabled;
+    features.CommerceServerEnabled = shopEnabled;
 
     for (World::GameRule const& gameRule : sWorld->GetGameRules())
     {
@@ -2076,13 +2155,20 @@ void WorldSession::HandleTutorialFlag(WorldPackets::Misc::TutorialSetFlag& packe
                 SetTutorialInt(i, 0xFFFFFFFF);
             break;
         case TUTORIAL_ACTION_RESET:
-            // Retail sniff shows all 256 tutorial bits set to 1. The client sends RESET
-            // during the housing tutorial flow to wipe bits before re-setting them one by
-            // one. This clears housing mode-unlock bits (38-40), blocking editor modes with
-            // "Mode not available while in the Tutorial." Treat RESET the same as CLEAR
-            // (all bits = 1) so housing and other systems stay unlocked.
+            // RESET means "show the tutorials again" and must zero the bits (upstream behaviour).
+            //
+            // This was locally changed to set all bits instead, on the reasoning that the client sends RESET
+            // during the housing tutorial flow and that zeroing "clears housing mode-unlock bits (38-40),
+            // blocking editor modes". That conflated two different stores: bits 38-40 are
+            // Enum.FrameTutorialAccount values living in the client CVar bitfield
+            // closedInfoFramesAccountWide, which these 256 server-side flags cannot touch at all (see
+            // HOUSING_MODES_UNLOCKED_CVAR, which sets bit 38 explicitly and keeps the editor unlocked).
+            //
+            // The practical effect was self-defeating: the client sends RESET precisely when it is STARTING a
+            // tutorial sequence, and we answered by marking all 256 tutorials as already seen - so the tutorial
+            // the client had just begun was immediately considered finished and never appeared.
             for (uint8 i = 0; i < MAX_ACCOUNT_TUTORIAL_VALUES; ++i)
-                SetTutorialInt(i, 0xFFFFFFFF);
+                SetTutorialInt(i, 0x00000000);
             break;
         default:
             TC_LOG_ERROR("network", "CMSG_TUTORIAL_FLAG received unknown TutorialAction {}.", packet.Action);

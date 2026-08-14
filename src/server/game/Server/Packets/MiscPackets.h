@@ -30,6 +30,7 @@
 #include "WowTime.h"
 #include <array>
 #include <map>
+#include <vector>
 
 enum class CountdownTimerType : int32;
 enum class DisplayToastType : uint8;
@@ -87,6 +88,42 @@ namespace WorldPackets
             int32 ServerTimeHolidayOffset = 0;
             WowTime GameTime;
             WowTime ServerTime;
+            int32 GameTimeHolidayOffset = 0;
+        };
+
+        // SMSG_GAME_TIME_SET / SMSG_GAME_TIME_UPDATE are LoginSetTimeSpeed without the NewSpeed
+        // float - the clock rate is handed out once, at login, and these two correct the clock
+        // afterwards. Both bodies are a uniform 16 bytes in every 12.0.7 capture:
+        //   +0 uint32 ServerTime (packed WowTime)   +8  int32 ServerTimeHolidayOffset
+        //   +4 uint32 GameTime   (packed WowTime)   +12 int32 GameTimeHolidayOffset
+        //
+        // The two client handlers (GameTime_C.cpp) differ in what they apply:
+        //   SMSG_GAME_TIME_SET    re-applies server time AND game time - a hard re-base.
+        //   SMSG_GAME_TIME_UPDATE re-applies game time only and merely validates the server time
+        //                         pair - the cheap periodic correction.
+        class GameTimeSet final : public ServerPacket
+        {
+        public:
+            explicit GameTimeSet() : ServerPacket(SMSG_GAME_TIME_SET, 16) { }
+
+            WorldPacket const* Write() override;
+
+            WowTime ServerTime;
+            WowTime GameTime;
+            int32 ServerTimeHolidayOffset = 0;
+            int32 GameTimeHolidayOffset = 0;
+        };
+
+        class GameTimeUpdate final : public ServerPacket
+        {
+        public:
+            explicit GameTimeUpdate() : ServerPacket(SMSG_GAME_TIME_UPDATE, 16) { }
+
+            WorldPacket const* Write() override;
+
+            WowTime ServerTime;
+            WowTime GameTime;
+            int32 ServerTimeHolidayOffset = 0;
             int32 GameTimeHolidayOffset = 0;
         };
 
@@ -168,6 +205,30 @@ namespace WorldPackets
             std::vector<Record> Data;
         };
 
+        // SMSG_REATTACH_RESURRECT (0x4201F3): login-sequence resurrect-state reattach (sniff 68275:
+        // sent between SETUP_CURRENCY and ALL_ACHIEVEMENT_DATA; body is two zero bytes when no
+        // resurrect offer is pending, the only state captured).
+        class ReattachResurrect final : public ServerPacket
+        {
+        public:
+            explicit ReattachResurrect() : ServerPacket(SMSG_REATTACH_RESURRECT, 2) { }
+
+            WorldPacket const* Write() override;
+
+            uint8 Unknown1 = 0;
+            uint8 Unknown2 = 0;
+        };
+
+        // SMSG_CLEAR_RESURRECT (0x420013): empty body; sniff 68275 sends it right after the
+        // MOVE_UPDATE_TELEPORT on instance entry - any pending resurrect offer is void on map change.
+        class ClearResurrect final : public ServerPacket
+        {
+        public:
+            explicit ClearResurrect() : ServerPacket(SMSG_CLEAR_RESURRECT, 0) { }
+
+            WorldPacket const* Write() override { return &_worldPacket; }
+        };
+
         class ViolenceLevel final : public ClientPacket
         {
         public:
@@ -199,6 +260,18 @@ namespace WorldPackets
 
             uint32 ClientTime = 0; // Client ticks in ms
             uint32 SequenceIndex = 0; // Same index as in request
+        };
+
+        // Sent when the client throws away time sync work it had queued, typically around a map
+        // transfer. Everything up to and including MaxSequenceIndex will never be answered.
+        class DiscardedTimeSyncAcks final : public ClientPacket
+        {
+        public:
+            explicit DiscardedTimeSyncAcks(WorldPacket&& packet) : ClientPacket(CMSG_DISCARDED_TIME_SYNC_ACKS, std::move(packet)) { }
+
+            void Read() override;
+
+            uint32 MaxSequenceIndex = 0;
         };
 
         class TriggerCinematic final : public ServerPacket
@@ -302,6 +375,48 @@ namespace WorldPackets
 
             int32 Legacy = 0;
             int16 DifficultyID = 0;
+        };
+
+        // Values recovered from the 12.0.7 client's own game-error table (the handler indexes it
+        // with these ids and each entry names one ERR_DIFFICULTY_* string), so the names below are
+        // the client's, not invented. Which trailing fields are present depends on the value -
+        // see ChangePlayerDifficultyResult::Write.
+        enum class ChangePlayerDifficultyResultCode : uint8
+        {
+            Cooldown                        = 0,    // ERR_DIFFICULTY_CHANGE_COOLDOWN_S, or
+                                                    // ERR_DIFFICULTY_CHANGE_COMBAT_COOLDOWN_S when InCombat is set
+            WorldState                      = 1,    // ERR_DIFFICULTY_CHANGE_WORLDSTATE
+            Encounter                       = 2,    // ERR_DIFFICULTY_CHANGE_ENCOUNTER
+            Combat                          = 3,    // ERR_DIFFICULTY_CHANGE_COMBAT
+            PlayerBusy                      = 4,    // ERR_DIFFICULTY_CHANGE_PLAYER_BUSY
+            PlayerOnVehicle                 = 5,    // ERR_DIFFICULTY_CHANGE_PLAYER_ON_VEHICLE
+            Pending                         = 6,    // no error text; client arms a deadline at now + Cooldown
+            AlreadyStarted                  = 7,    // ERR_DIFFICULTY_CHANGE_ALREADY_STARTED
+            MapDifficultyMessage            = 8,    // client displays MapDifficulty.db2 Message_lang of MapDifficultyID
+            OtherHeroic                     = 9,    // ERR_DIFFICULTY_CHANGE_OTHER_HEROIC_S, %s = name of PlayerGUID
+            HeroicInstanceAlreadyRunning    = 10,   // ERR_DIFFICULTY_CHANGE_HEROIC_INSTANCE_ALREADY_RUNNING
+            DisabledInLFG                   = 11,   // ERR_DIFFICULTY_DISABLED_IN_LFG
+            Success                         = 12    // client stores DifficultyID if MapID is the map it is on
+        };
+
+        // Layout taken from the client's deserializer, which switches on Result to decide what else
+        // to read; both captured 12.0.7 bodies re-encode byte for byte through it (Result 12 with
+        // MapID 2526 + DifficultyID 8, and Result 6 with a negative Cooldown).
+        class ChangePlayerDifficultyResult final : public ServerPacket
+        {
+        public:
+            explicit ChangePlayerDifficultyResult(ChangePlayerDifficultyResultCode result)
+                : ServerPacket(SMSG_CHANGE_PLAYER_DIFFICULTY_RESULT, 1 + 8), Result(result) { }
+
+            WorldPacket const* Write() override;
+
+            ChangePlayerDifficultyResultCode Result;
+            bool InCombat = false;                  // only read for Cooldown and Pending
+            int64 Cooldown = 0;                     // seconds; only for Cooldown and Pending
+            int32 MapID = 0;                        // only for Success
+            uint16 DifficultyID = 0;                // only for Success
+            int32 MapDifficultyID = 0;              // only for MapDifficultyMessage
+            ObjectGuid PlayerGUID;                  // only for OtherHeroic
         };
 
         class DungeonDifficultySet final : public ServerPacket
@@ -954,6 +1069,20 @@ namespace WorldPackets
             int32 OverrideLightID = 0;
         };
 
+        // 4 byte body in all 211 captured 12.0.7 occurrences - a single Lightning.db2 id.
+        // 205 of them carry 0, which is the stop form: the client keeps the storm it was last
+        // told about, so leaving a storming zone has to restate it as 0.
+        class StartLightningStorm final : public ServerPacket
+        {
+        public:
+            explicit StartLightningStorm() : ServerPacket(SMSG_START_LIGHTNING_STORM, 4) { }
+            explicit StartLightningStorm(int32 lightningID) : ServerPacket(SMSG_START_LIGHTNING_STORM, 4), LightningID(lightningID) { }
+
+            WorldPacket const* Write() override;
+
+            int32 LightningID = 0;
+        };
+
         class TC_GAME_API DisplayGameError final : public ServerPacket
         {
         public:
@@ -1039,6 +1168,76 @@ namespace WorldPackets
             Duration<Seconds> TimeLeft;
             CountdownTimerType Type = {};
             Optional<ObjectGuid> PlayerGuid;
+        };
+
+        // Cancels the SMSG_START_TIMER countdown of a given type. Wire (12.0.7/68275) is a single
+        // uint32 carrying the CountdownTimerType - verified against the client deserializer for
+        // SMSG_STOP_TIMER (0x42003E), which performs exactly one 4-byte read.
+        class StopTimer final : public ServerPacket
+        {
+        public:
+            explicit StopTimer() : ServerPacket(SMSG_STOP_TIMER, 4) { }
+
+            WorldPacket const* Write() override;
+
+            CountdownTimerType Type = {};
+        };
+
+        // One entry of the client's "world elapsed timer" list (client type name: JamElaspedTimer).
+        //
+        // Wire, derived from the 68275 client deserializers and cross-checked against the
+        // known-good SMSG_START_TIMER layout in the same extraction:
+        //     { int64 CurrentDuration; uint32 TimerID; }
+        // i.e. the 8-byte duration comes FIRST. (This is a field-order/width change from the
+        // 7.3.5-era layout, where TimerID came first and the duration was a uint32.)
+        //
+        // TimerID indexes WorldElapsedTimer.db2. The client reads the timer *type* from that DB2
+        // row - it is NOT on the wire - and Blizzard_ScenarioObjectiveTracker only renders rows
+        // whose Type is ChallengeMode(1) or ProvingGround(2). See ElapsedTimerMgr.h.
+        struct ElapsedTimer
+        {
+            Duration<Seconds> CurrentDuration;
+            uint32 TimerID = 0;
+        };
+
+        ByteBuffer& operator<<(ByteBuffer& data, ElapsedTimer const& timer);
+
+        // Starts (or re-bases) a single elapsed timer. CurrentDuration is the time already elapsed;
+        // the client free-runs its own clock from that baseline.
+        class StartElapsedTimer final : public ServerPacket
+        {
+        public:
+            explicit StartElapsedTimer() : ServerPacket(SMSG_START_ELAPSED_TIMER, 8 + 4) { }
+
+            WorldPacket const* Write() override;
+
+            ElapsedTimer Timer;
+        };
+
+        // Bulk form, used to resynchronise every active timer on zone-in / relog. The client's
+        // PLAYER_ENTERING_WORLD handler calls GetWorldElapsedTimers(), so this is the packet that
+        // repopulates that list.
+        class StartElapsedTimers final : public ServerPacket
+        {
+        public:
+            explicit StartElapsedTimers() : ServerPacket(SMSG_START_ELAPSED_TIMERS, 4) { }
+
+            WorldPacket const* Write() override;
+
+            std::vector<ElapsedTimer> Timers;
+        };
+
+        // Wire: { uint32 TimerID; bit KeepTimer; } - verified against the client deserializer,
+        // which reads the flag as the top bit of one byte (matching OptionalInit/FlushBits packing).
+        class StopElapsedTimer final : public ServerPacket
+        {
+        public:
+            explicit StopElapsedTimer() : ServerPacket(SMSG_STOP_ELAPSED_TIMER, 4 + 1) { }
+
+            WorldPacket const* Write() override;
+
+            uint32 TimerID = 0;
+            bool KeepTimer = false;
         };
 
         class QueryCountdownTimer final : public ClientPacket
@@ -1187,7 +1386,8 @@ namespace WorldPackets
         //   block { uint32 ConditionalFlagsCount; uint8 FactionGroup; uint32 ChromieTimeExpansionMask;
         //           uint32 ConditionalFlags[ConditionalFlagsCount]; }
         //   Two consecutive blocks: [Previous, Current].
-        //   Login pulse sends [current, current] (no transition); state changes send [pre, post].
+        //   The first send of a session carries a default-empty Previous block (capture A rec 721);
+        //   later no-transition pulses send [current, current]; state changes send [pre, post].
         struct CTROptionsBlock
         {
             std::vector<uint32> ConditionalFlags;
@@ -1315,6 +1515,36 @@ namespace WorldPackets
             WorldPacket const* Write() override;
 
             std::vector<CurrencyTransferLogEntry> Entries;
+        };
+
+        // SMSG_DISPLAY_WORLD_TEXT (0x420296) — floats a server-authored, already-formatted string in
+        // the 3D world (the engine behind the Lua AddWorldText / AddCustomWorldText bindings), NOT a
+        // chat line, NOT a centre-screen notification and NOT the Lua combat-text system. The client
+        // handler runs the text through the string-token formatter with Arg1/Arg2 as the two numeric
+        // substitution arguments, then hands it to the world-text renderer; it raises no Lua event and
+        // performs no DB2 lookup, so the display string is entirely the server's to compose.
+        //
+        // Wire, verified against build-68275/68974 captures (5 distinct bodies, zero leftover bytes):
+        //   PackedGuid Guid    — anchor unit; a null guid makes the client fall back to the receiver
+        //   uint32     Arg1
+        //   uint32     Arg2
+        //   Bits<12>   Text length, then FlushBits (the 4 pad bits are 0 in every sample)
+        //   char[len]  Text    — no NUL on the wire
+        //
+        // It is a shared channel: retail sends "|cff94008B+XP" anchored on the creature you killed,
+        // "|cnGOLD_FONT_COLOR:+Gold|r" and "|cnYELLOW_FONT_COLOR:+Neighborly|r" with a null guid, and
+        // "|cff19FF19+Satisfaction|r" anchored on a player. Do not model it as any one system's packet.
+        class DisplayWorldText final : public ServerPacket
+        {
+        public:
+            explicit DisplayWorldText() : ServerPacket(SMSG_DISPLAY_WORLD_TEXT) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid Guid;
+            uint32 Arg1 = 0;
+            uint32 Arg2 = 0;
+            std::string Text;
         };
     }
 }

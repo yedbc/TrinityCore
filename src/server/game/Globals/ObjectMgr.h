@@ -435,6 +435,28 @@ struct TC_GAME_API InstanceSpawnGroupInfo
     uint8 Flags;
 };
 
+// One scheduled ability on a boss encounter's client-side timeline (C_EncounterEvents and the
+// SMSG_INSTANCE_ENCOUNTER_EVENT_* family). Loaded from the world table `instance_encounter_timeline`.
+//
+// EncounterEventID is a row id of the client's own EncounterEvent.db2. That is not a detail - see the
+// header comment on ObjectMgr::LoadInstanceEncounterTimeline for why it may not be invented.
+struct TC_GAME_API InstanceEncounterTimelineInfo
+{
+    uint32 DungeonEncounterID;
+    uint32 DifficultyID;                    // 0 = applies to every difficulty
+    uint32 EncounterEventID;
+    uint32 SpellID;
+    uint32 BroadcastTextID;
+    int32 IconFileID;                       // 0 = resolve the spell's own icon, which is what retail sends
+    uint32 Flags;                           // EncounterEvent.db2 Flags, echoed back on the wire
+    uint8 Severity;
+    Milliseconds FirstCast;                 // offset from the pull
+    Milliseconds RepeatCast;                // 0 = fires once per pull
+    Milliseconds MaxQueueDuration;
+};
+
+typedef std::unordered_map<uint32 /*dungeonEncounterId*/, std::vector<InstanceEncounterTimelineInfo>> InstanceEncounterTimelineContainer;
+
 struct TC_GAME_API SpellClickInfo
 {
     uint32 spellId;
@@ -825,6 +847,15 @@ struct QuestPOIData
 
 typedef std::unordered_map<uint32, QuestPOIData> QuestPOIContainer;
 
+// Maps a quest turn-in to one or more garrison/war-campaign champions (GarrFollower) it should grant.
+struct QuestGarrisonFollower
+{
+    uint32 GarrFollowerID = 0;
+    uint8 GarrType = 0;
+};
+
+typedef std::unordered_map<uint32 /*questId*/, std::vector<QuestGarrisonFollower>> QuestGarrisonFollowerContainer;
+
 typedef std::array<std::unordered_map<uint32, QuestGreeting>, 2> QuestGreetingContainer;
 typedef std::array<std::unordered_map<uint32, QuestGreetingLocale>, 2> QuestGreetingLocaleContainer;
 
@@ -1078,6 +1109,9 @@ class TC_GAME_API ObjectMgr
         std::vector<int32> const* GetCreatureQuestCurrencyList(uint32 creatureId) const;
 
         uint32 GetNearestTaxiNode(float x, float y, float z, uint32 mapid, uint32 team);
+        // Explicit `creature_taxi_node` binding if one exists, else the usual proximity search.
+        uint32 GetTaxiNodeForFlightMaster(uint32 creatureId, float x, float y, float z, uint32 mapid, uint32 team);
+        uint32 GetCreatureTaxiNode(uint32 creatureId) const;
         void GetTaxiPath(uint32 source, uint32 destination, uint32 &path, uint32 &cost);
         void GetTaxiPath(uint32 source, uint32 destination, std::vector<uint32>& path, uint32& cost);
         uint32 GetTaxiMountDisplayId(uint32 id, uint32 team, bool allowed_alt_team = false);
@@ -1121,6 +1155,8 @@ class TC_GAME_API ObjectMgr
         NpcText const* GetNpcText(uint32 textID) const;
         QuestGreeting const* GetQuestGreeting(TypeID type, uint32 id) const;
         QuestGreetingLocale const* GetQuestGreetingLocale(TypeID type, uint32 id) const;
+
+        std::vector<QuestGarrisonFollower> const* GetQuestGarrisonFollowers(uint32 questId) const;
 
         WorldSafeLocsEntry const* GetDefaultGraveyard(uint32 team) const;
         WorldSafeLocsEntry const* GetClosestGraveyard(WorldLocation const& location, uint32 team, WorldObject* conditionObject) const;
@@ -1245,6 +1281,7 @@ class TC_GAME_API ObjectMgr
         void LoadSpawnGroupTemplates();
         void LoadSpawnGroups();
         void LoadInstanceSpawnGroups();
+        void LoadInstanceEncounterTimeline();
         void LoadItemTemplates();
         void LoadItemTemplateAddon();
         void LoadItemScriptNames();
@@ -1270,7 +1307,9 @@ class TC_GAME_API ObjectMgr
         void LoadAccessRequirements();
         void LoadQuestAreaTriggers();
         void LoadQuestGreetings();
+        void LoadQuestGarrisonFollowers();
         void LoadAreaTriggerScripts();
+        void LoadCreatureTaxiNodes();
         void LoadTavernAreaTriggers();
         void LoadGameObjectForQuests();
 
@@ -1368,6 +1407,7 @@ class TC_GAME_API ObjectMgr
         Trinity::IteratorPair<SpawnGroupLinkContainer::const_iterator> GetSpawnMetadataForGroup(uint32 groupId) const { return Trinity::Containers::MapEqualRange(_spawnGroupMapStore, groupId); }
         std::vector<uint32> const* GetSpawnGroupsForMap(uint32 mapId) const { auto it = _spawnGroupsByMap.find(mapId); return it != _spawnGroupsByMap.end() ? &it->second : nullptr; }
         std::vector<InstanceSpawnGroupInfo> const* GetInstanceSpawnGroupsForMap(uint32 mapId) const { auto it = _instanceSpawnGroupStore.find(mapId); return it != _instanceSpawnGroupStore.end() ? &it->second : nullptr; }
+        std::vector<InstanceEncounterTimelineInfo> const* GetInstanceEncounterTimeline(uint32 dungeonEncounterId) const { auto it = _instanceEncounterTimelineStore.find(dungeonEncounterId); return it != _instanceEncounterTimelineStore.end() ? &it->second : nullptr; }
 
         SpawnTrackingTemplateData const* GetSpawnTrackingData(uint32 spawnTrackingId) const;
         Trinity::IteratorPair<SpawnTrackingLinkContainer::const_iterator> GetSpawnMetadataForSpawnTracking(uint32 spawnTrackingId) const { return Trinity::Containers::MapEqualRange(_spawnTrackingMapStore, spawnTrackingId); }
@@ -1712,8 +1752,10 @@ class TC_GAME_API ObjectMgr
         NpcTextContainer _npcTextStore;
         QuestGreetingContainer _questGreetingStore;
         QuestGreetingLocaleContainer _questGreetingLocaleStore;
+        QuestGarrisonFollowerContainer _questGarrisonFollowerStore;
         AreaTriggerContainer _areaTriggerStore;
         AreaTriggerScriptContainer _areaTriggerScriptStore;
+        std::unordered_map<uint32, uint32> _creatureTaxiNodeStore;  // CreatureID -> TaxiNodes.db2 ID
         std::unordered_map<uint32, AreaTriggerPolygon> _areaTriggerPolygons;
         AccessRequirementContainer _accessRequirementStore;
         std::unordered_map<uint32, WorldSafeLocsEntry> _worldSafeLocs;
@@ -1840,6 +1882,7 @@ class TC_GAME_API ObjectMgr
         std::unordered_map<uint32, std::vector<uint32>> _spawnGroupsByMap;
         SpawnGroupLinkContainer _spawnGroupMapStore;
         InstanceSpawnGroupContainer _instanceSpawnGroupStore;
+        InstanceEncounterTimelineContainer _instanceEncounterTimelineStore;
         SpawnTrackingTemplateContainer _spawnTrackingDataStore;
         SpawnTrackingLinkContainer _spawnTrackingMapStore;
         SpawnTrackingQuestObjectiveContainer _spawnTrackingQuestObjectiveStore;

@@ -122,6 +122,7 @@ void CollectionMgr::SaveToDB(LoginDatabaseTransaction trans)
     SaveAccountHeirlooms(trans);
     SaveAccountMounts(trans);
     SaveAccountItemAppearances(trans);
+    SaveAccountFavoriteTransmogSets(trans);
     SaveAccountTransmogIllusions(trans);
     SaveAccountTransmogOutfits(trans);
     SaveAccountWarbandScenes(trans);
@@ -138,6 +139,11 @@ bool CollectionMgr::AddToy(uint32 itemId, bool isFavourite, bool hasFanfare)
     if (UpdateAccountToys(itemId, isFavourite, hasFanfare))
     {
         _owner->GetPlayer()->AddToy(itemId, GetToyFlags(isFavourite, hasFanfare).AsUnderlyingType());
+        // CriteriaType::LearnToy (185, Asset = ItemID) and CriteriaType::LearnAnyToy (186, "Collect 25 Toys").
+        // UpdateAccountToys returns false for an already-known toy, so this only fires on a genuinely new one
+        // - same guarantee AddHeirloom relies on for LearnHeirloom/LearnAnyHeirloom below.
+        _owner->GetPlayer()->UpdateCriteria(CriteriaType::LearnToy, itemId);
+        _owner->GetPlayer()->UpdateCriteria(CriteriaType::LearnAnyToy, 1);
         return true;
     }
 
@@ -609,17 +615,19 @@ void CollectionMgr::LoadPerksProgramPurchases(PreparedQueryResult result)
         data.PurchaseTime = fields[2].GetUInt32();
         data.MountID = fields[3].GetInt32();
         data.ToyID = fields[4].GetInt32();
+        data.BuyerGuid = fields[5].GetUInt64();
         _perksPurchases[perksVendorItemId] = data;
     } while (result->NextRow());
 }
 
-void CollectionMgr::AddPerksProgramPurchase(int32 perksVendorItemId, int32 price, int32 mountId, int32 toyId)
+void CollectionMgr::AddPerksProgramPurchase(int32 perksVendorItemId, int32 price, int32 mountId, int32 toyId, uint64 buyerGuid)
 {
     PerksProgramPurchaseData& data = _perksPurchases[perksVendorItemId];
     data.Price = price;
     data.PurchaseTime = uint32(GameTime::GetGameTime());
     data.MountID = mountId;
     data.ToyID = toyId;
+    data.BuyerGuid = buyerGuid;
 
     LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_INS_ACCOUNT_PERKS_PURCHASE);
     stmt->setUInt32(0, _owner->GetBattlenetAccountId());
@@ -628,6 +636,7 @@ void CollectionMgr::AddPerksProgramPurchase(int32 perksVendorItemId, int32 price
     stmt->setUInt32(3, data.PurchaseTime);
     stmt->setInt32(4, mountId);
     stmt->setInt32(5, toyId);
+    stmt->setUInt64(6, buyerGuid);
     LoginDatabase.Execute(stmt);
 }
 
@@ -946,6 +955,9 @@ void CollectionMgr::AddItemAppearance(ItemModifiedAppearanceEntry const* itemMod
     }
 
     owner->UpdateCriteria(CriteriaType::LearnAnyTransmog, 1);
+    // CriteriaType::LearnTransmog (192, Asset = ItemModifiedAppearanceID). CanAddAppearance/_appearances->test
+    // already rejected known appearances, so this is a genuinely new one.
+    owner->UpdateCriteria(CriteriaType::LearnTransmog, itemModifiedAppearance->ID);
 
     if (ItemEntry const* item = sItemStore.LookupEntry(itemModifiedAppearance->ItemID))
     {
@@ -1085,6 +1097,90 @@ void CollectionMgr::SendFavoriteAppearances() const
     _owner->SendPacket(accountTransmogUpdate.Write());
 }
 
+void CollectionMgr::LoadAccountFavoriteTransmogSets(PreparedQueryResult favoriteTransmogSets)
+{
+    if (!favoriteTransmogSets)
+        return;
+
+    do
+    {
+        _favoriteTransmogSets[favoriteTransmogSets->Fetch()[0].GetUInt32()] = CollectionItemState::Unchanged;
+    } while (favoriteTransmogSets->NextRow());
+}
+
+void CollectionMgr::SaveAccountFavoriteTransmogSets(LoginDatabaseTransaction trans)
+{
+    LoginDatabasePreparedStatement* stmt;
+    for (auto itr = _favoriteTransmogSets.begin(); itr != _favoriteTransmogSets.end();)
+    {
+        switch (itr->second)
+        {
+            case CollectionItemState::New:
+                stmt = LoginDatabase.GetPreparedStatement(LOGIN_INS_BNET_ITEM_FAVORITE_TRANSMOG_SET);
+                stmt->setUInt32(0, _owner->GetBattlenetAccountId());
+                stmt->setUInt32(1, itr->first);
+                trans->Append(stmt);
+                itr->second = CollectionItemState::Unchanged;
+                ++itr;
+                break;
+            case CollectionItemState::Removed:
+                stmt = LoginDatabase.GetPreparedStatement(LOGIN_DEL_BNET_ITEM_FAVORITE_TRANSMOG_SET);
+                stmt->setUInt32(0, _owner->GetBattlenetAccountId());
+                stmt->setUInt32(1, itr->first);
+                trans->Append(stmt);
+                itr = _favoriteTransmogSets.erase(itr);
+                break;
+            case CollectionItemState::Unchanged:
+            case CollectionItemState::Changed:
+                ++itr;
+                break;
+        }
+    }
+}
+
+void CollectionMgr::SetTransmogSetIsFavorite(uint32 transmogSetId, bool apply)
+{
+    auto itr = _favoriteTransmogSets.find(transmogSetId);
+    if (apply)
+    {
+        if (itr == _favoriteTransmogSets.end())
+            _favoriteTransmogSets[transmogSetId] = CollectionItemState::New;
+        else if (itr->second == CollectionItemState::Removed)
+            itr->second = CollectionItemState::Unchanged;
+        else
+            return;
+    }
+    else if (itr != _favoriteTransmogSets.end())
+    {
+        if (itr->second == CollectionItemState::New)
+            _favoriteTransmogSets.erase(transmogSetId);
+        else
+            itr->second = CollectionItemState::Removed;
+    }
+    else
+        return;
+
+    // Incremental form: IsFullUpdate false, and IsSetFavorite selects insert versus erase on the client.
+    WorldPackets::Transmogrification::AccountTransmogSetFavoritesUpdate update;
+    update.IsFullUpdate = false;
+    update.IsSetFavorite = apply;
+    update.FavoriteTransmogSets.push_back(transmogSetId);
+
+    _owner->SendPacket(update.Write());
+}
+
+void CollectionMgr::SendFavoriteTransmogSets() const
+{
+    WorldPackets::Transmogrification::AccountTransmogSetFavoritesUpdate update;
+    update.IsFullUpdate = true;
+    update.FavoriteTransmogSets.reserve(_favoriteTransmogSets.size());
+    for (auto [transmogSetId, state] : _favoriteTransmogSets)
+        if (state != CollectionItemState::Removed)
+            update.FavoriteTransmogSets.push_back(transmogSetId);
+
+    _owner->SendPacket(update.Write());
+}
+
 void CollectionMgr::LoadTransmogIllusions()
 {
     Player* owner = _owner->GetPlayer();
@@ -1156,6 +1252,8 @@ void CollectionMgr::SaveAccountTransmogIllusions(LoginDatabaseTransaction trans)
 void CollectionMgr::AddTransmogIllusion(uint32 transmogIllusionId)
 {
     Player* owner = _owner->GetPlayer();
+    // Count the acquisition only when it is genuinely new - this function is not otherwise idempotent.
+    bool const alreadyKnown = HasTransmogIllusion(transmogIllusionId);
     if (_transmogIllusions->size() <= transmogIllusionId)
     {
         std::size_t numBlocks = _transmogIllusions->num_blocks();
@@ -1170,6 +1268,10 @@ void CollectionMgr::AddTransmogIllusion(uint32 transmogIllusionId)
     uint32 bitIndex = transmogIllusionId % 32;
 
     owner->AddIllusionFlag(blockIndex, 1 << bitIndex);
+
+    // CriteriaType::LearnAnyTransmogIllusion (224) - plain counter over newly learned illusions.
+    if (!alreadyKnown)
+        owner->UpdateCriteria(CriteriaType::LearnAnyTransmogIllusion, 1);
 }
 
 bool CollectionMgr::HasTransmogIllusion(uint32 transmogIllusionId) const

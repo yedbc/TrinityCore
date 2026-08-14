@@ -113,6 +113,7 @@ struct PerksProgramPurchaseData
     uint32 PurchaseTime = 0;
     int32 MountID = 0;   // mount teaching spell id, 0 if the reward was not a mount
     int32 ToyID = 0;     // toy item id, 0 if the reward was not a toy
+    uint64 BuyerGuid = 0; // low GUID of the purchasing character; a refund is only honoured for this same character
 };
 
 class TC_GAME_API CollectionMgr
@@ -169,7 +170,7 @@ public:
 
     // Account-wide Perks Program (Trading Post) purchase history, used to authorise refunds.
     void LoadPerksProgramPurchases(PreparedQueryResult result);
-    void AddPerksProgramPurchase(int32 perksVendorItemId, int32 price, int32 mountId, int32 toyId);
+    void AddPerksProgramPurchase(int32 perksVendorItemId, int32 price, int32 mountId, int32 toyId, uint64 buyerGuid);
     bool RemovePerksProgramPurchase(int32 perksVendorItemId);
     PerksProgramPurchaseData const* GetPerksProgramPurchase(int32 perksVendorItemId) const;
     std::unordered_map<int32, PerksProgramPurchaseData> const& GetPerksProgramPurchases() const { return _perksPurchases; }
@@ -221,6 +222,12 @@ public:
     void SetAppearanceIsFavorite(uint32 itemModifiedAppearanceId, bool apply);
     void SendFavoriteAppearances() const;
 
+    // Favorite transmog sets (ItemCollectionType::TransmogSetFavorite) - account-wide, TransmogSet.db2 ids
+    void LoadAccountFavoriteTransmogSets(PreparedQueryResult favoriteTransmogSets);
+    void SaveAccountFavoriteTransmogSets(LoginDatabaseTransaction trans);
+    void SetTransmogSetIsFavorite(uint32 transmogSetId, bool apply);
+    void SendFavoriteTransmogSets() const;
+
     // Illusions
     void LoadTransmogIllusions();
     void LoadAccountTransmogIllusions(PreparedQueryResult knownTransmogIllusions);
@@ -258,6 +265,7 @@ private:
     std::unique_ptr<boost::dynamic_bitset<uint32>> _appearances;
     std::unordered_map<uint32, std::unordered_set<ObjectGuid>> _temporaryAppearances;
     std::unordered_map<uint32, CollectionItemState> _favoriteAppearances;
+    std::unordered_map<uint32, CollectionItemState> _favoriteTransmogSets;
     std::unique_ptr<boost::dynamic_bitset<uint32>> _transmogIllusions;
     Trinity::Containers::FlatSet<int32> _transmogOutfits;
     WarbandSceneCollectionContainer _warbandScenes;

@@ -19,6 +19,7 @@
 #include "AreaTrigger.h"
 #include "Account.h"
 #include "QueryPackets.h"
+#include "HousingDefines.h"
 #include "HousingMirrorEntity.h"
 #include "HousingNeighborhoodMirrorEntity.h"
 #include "HousingPlayerHouseEntity.h"
@@ -35,6 +36,7 @@
 #include "BattlegroundMgr.h"
 #include "BattlegroundPackets.h"
 #include "BattlegroundScore.h"
+#include "BnetPresenceMgr.h"
 #include "BattlePetMgr.h"
 #include "CellImpl.h"
 #include "Channel.h"
@@ -54,6 +56,7 @@
 #include "Common.h"
 #include "ConditionMgr.h"
 #include "Containers.h"
+#include "CovenantPackets.h"
 #include "CreatureAI.h"
 #include "DB2Stores.h"
 #include "DatabaseEnv.h"
@@ -62,6 +65,7 @@
 #include "DelvesRewards.h"
 #include "DisableMgr.h"
 #include "DuelPackets.h"
+#include "ElapsedTimerMgr.h"
 #include "EquipmentSetPackets.h"
 #include "Formulas.h"
 #include "GameEventMgr.h"
@@ -71,6 +75,7 @@
 #include "GarrisonMgr.h"
 #include "GarrisonPackets.h"
 #include "MythicPlusData.h"
+#include "MythicPlusPacketsCommon.h"
 #include "GitRevision.h"
 #include "HouseInteriorMap.h"
 #include "Housing.h"
@@ -97,6 +102,7 @@
 #include "Language.h"
 #include "LanguageMgr.h"
 #include "LFGMgr.h"
+#include "LFGPackets.h"
 #include "ListUtils.h"
 #include "Log.h"
 #include "Loot.h"
@@ -124,6 +130,7 @@
 #include "PetitionMgr.h"
 #include "PhasingHandler.h"
 #include "PlayerChoice.h"
+#include "PreyMgr.h"
 #include "QueryCallback.h"
 #include "QueryHolder.h"
 #include "QueryResultStructured.h"
@@ -403,6 +410,10 @@ void Player::CleanupsBeforeDelete(bool finalCleanup)
 {
     TradeCancel(false);
     DuelComplete(DUEL_INTERRUPTED);
+
+    // Elapsed timers are per-session bookkeeping keyed by player GUID; drop ours so the manager
+    // does not accumulate entries for characters that are gone.
+    sElapsedTimerMgr->RemoveAllTimers(GetGUID());
 
     Unit::CleanupsBeforeDelete(finalCleanup);
 }
@@ -1640,9 +1651,12 @@ void Player::RegenerateAll()
         if (power != POWER_RUNES)
             Regenerate(power);
 
-    // Runes act as cooldowns, and they don't need to send any data
     if (GetClass() == CLASS_DEATH_KNIGHT)
     {
+        // Draining a rune is announced through the cast packets' rune list, but a rune coming back is not:
+        // SetRuneCooldown only republishes the POWER_RUNES count, which says how many are ready and never
+        // which ones. Collect the runes that finished this tick and name them.
+        uint32 addedRunesMask = 0;
         uint32 regeneratedRunes = 0;
         uint32 regenIndex = 0;
         while (regeneratedRunes < MAX_RECHARGING_RUNES && m_runes->CooldownOrder.size() > regenIndex)
@@ -1655,9 +1669,19 @@ void Player::RegenerateAll()
                 ++regenIndex;
             }
             else
+            {
                 SetRuneCooldown(runeToRegen, 0);
+                addedRunesMask |= 1u << runeToRegen;
+            }
 
             ++regeneratedRunes;
+        }
+
+        if (addedRunesMask)
+        {
+            WorldPackets::Spells::AddRunePower addRunePower;
+            addRunePower.AddedRunesMask = addedRunesMask;
+            SendDirectMessage(addRunePower.Write());
         }
     }
 
@@ -2393,12 +2417,19 @@ void Player::GiveLevel(uint8 level)
     if (level > oldLevel)
         UpdateCriteria(CriteriaType::GainLevels, level - oldLevel);
     if (IsMaxLevel())
-    {
         UpdateCriteria(CriteriaType::ReachMaxLevel);
 
-        // Blizzlike: clear Chromie Time when reaching max level
-        if (m_activePlayerData->UiChromieTimeExpansionID != 0)
-            SetChromieTime(0);
+    // Retail 12.0.x hard-exits Chromie Time at the deactivation level (81): the state is
+    // force-cleared and the player is returned to their faction capital (audit R10/M7;
+    // 12.0.1 patch note moved the threshold 61 -> 71 -> 81). The level-80 soft exit
+    // (auto-accepted return quest + capital auto-exit) is NYI - data unmined, see Player.h.
+    if (level >= ChromieTimeDeactivationLevel && m_activePlayerData->UiChromieTimeExpansionID != 0)
+    {
+        SetChromieTime(0);
+        if (GetTeam() == ALLIANCE)
+            TeleportTo(0, -8833.38f, 628.628f, 94.0066f, 1.06535f); // Stormwind
+        else
+            TeleportTo(1, 1569.97f, -4397.41f, 16.0472f, 0.543025f); // Orgrimmar
     }
 
     PushQuests();
@@ -4400,6 +4431,20 @@ void Player::DeleteFromDB(ObjectGuid playerguid, uint32 accountId, bool updateRe
             Corpse::DeleteFromDB(playerguid, trans);
 
             Garrison::DeleteFromDB(guid, trans);
+
+            // Covenant state is guid-keyed and TC recycles character GUIDs, so leaving these behind is not merely
+            // untidy: a new character created on a deleted character's guid would load the old m_covenantSoulbinds,
+            // read as HasEverJoinedAnyCovenant(), and be treated as a SWITCHER on its very first pledge - receiving
+            // the ability-talent grant reserved for switchers, and inheriting a renown and soulbind history that
+            // was never its own.
+            for (CharacterDatabaseStatements delCovenantStmt : { CHAR_DEL_CHARACTER_COVENANT, CHAR_DEL_CHARACTER_COVENANT_RENOWN,
+                CHAR_DEL_CHARACTER_COVENANT_SOULBIND, CHAR_DEL_CHARACTER_COVENANT_CALLINGS,
+                CHAR_DEL_CHARACTER_SOULBIND_CONDUITS, CHAR_DEL_CHARACTER_SOULBIND_CONDUIT_SOCKETS })
+            {
+                stmt = CharacterDatabase.GetPreparedStatement(delCovenantStmt);
+                stmt->setUInt64(0, guid);
+                trans->Append(stmt);
+            }
 
             stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHAR_TRAIT_ENTRIES_BY_CHAR);
             stmt->setUInt64(0, guid);
@@ -6712,11 +6757,14 @@ void Player::SetChromieTime(int32 expansionId)
 
     SetChromieTimeConditionalFlags(expansionId > 0);
 
-    // Sniffs show FactionGroup is 0 when chromie is inactive and 3/Alliance (or 5/Horde) when active.
+    // Retail keeps FactionGroup populated from the player's faction independent of chromie
+    // state and never resets it on deselect (capture A rec 2149: fg 0->3 with mask 0 before
+    // any chromie interaction; equivalents B 2229 / C 1462). Alliance = 3 (Player|Alliance)
+    // is sniff-verified; the Horde value (expected 5 = Player|Horde per FactionTemplate)
+    // is unverified - no Horde 12.0.5+ sniff exists (audit R5 deferral).
     SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData)
         .ModifyValue(&UF::PlayerData::CtrOptions)
-        .ModifyValue(&UF::CTROptions::FactionGroup),
-        expansionId > 0 ? GetFactionGroupForRace(GetRace()) : uint8(0));
+        .ModifyValue(&UF::CTROptions::FactionGroup), GetFactionGroupForRace(GetRace()));
 
     SendCtrOptions(&previous);
     PhasingHandler::OnConditionChange(this);
@@ -7126,6 +7174,13 @@ bool Player::RewardHonor(Unit* victim, uint32 groupsize, int32 honor, HonorGainS
 
     AddHonorXP(honor);
 
+    // CriteriaType::PlayerHasEarnedHonor (207) - no asset; the real Criteria rows accumulate an honor total
+    // ("Earn 1500 Honor in the 3v3 bracket") and gate the bracket through ModifierTree
+    // (PlayerInArenaWithTeamSize 24 / PlayerInRankedArenaMatch 60 / PlayerInRatedBattleground 63), so
+    // miscValue1 must be the honor amount actually awarded.
+    if (honor > 0)
+        UpdateCriteria(CriteriaType::PlayerHasEarnedHonor, uint32(honor));
+
     if (InBattleground() && honor > 0)
     {
         if (Battleground* bg = GetBattleground())
@@ -7270,6 +7325,31 @@ void Player::_LoadCurrency(PreparedQueryResult result)
 
     } while (result->NextRow());
 
+    // Trader's Tender (currency 2032) is account-wide: its authoritative balance lives in the login DB and was
+    // cached at session init. Override the per-character row with the shared balance so earn/spend/refund all act
+    // on one wallet. A missing account row (cache == -1) means this is the first login since the account-wide
+    // wallet was introduced -> seed the shared balance from this character's existing per-character amount.
+    {
+        PlayerCurrenciesMap::iterator itr = _currencyStorage.find(CURRENCY_TYPE_TRADERS_TENDER);
+        int64 accountTender = GetSession()->GetAccountPerksTender();
+        if (accountTender < 0)
+        {
+            uint32 seed = (itr != _currencyStorage.end()) ? itr->second.Quantity : 0u;
+            GetSession()->StoreAccountPerksTender(seed);
+            accountTender = int64(seed);
+        }
+
+        if (itr == _currencyStorage.end())
+        {
+            PlayerCurrency cur{};
+            cur.state = PLAYERCURRENCY_UNCHANGED;
+            cur.Quantity = uint32(accountTender);
+            _currencyStorage.emplace(CURRENCY_TYPE_TRADERS_TENDER, cur);
+        }
+        else
+            itr->second.Quantity = uint32(accountTender);
+    }
+
     // Mirror the Trader's Tender balance into the perks-program field the Trading Post UI reads.
     if (PlayerCurrenciesMap::const_iterator itr = _currencyStorage.find(CURRENCY_TYPE_TRADERS_TENDER); itr != _currencyStorage.end())
         SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::PerksProgramCurrency), int32(itr->second.Quantity));
@@ -7283,6 +7363,14 @@ void Player::_SaveCurrency(CharacterDatabaseTransaction trans)
         CurrencyTypesEntry const* entry = sCurrencyTypesStore.LookupEntry(itr->first);
         if (!entry) // should never happen
             continue;
+
+        // Trader's Tender is account-wide (persisted to the login DB by StoreAccountPerksTender); never write it
+        // to the per-character character_currency table, which would create a divergent second source of truth.
+        if (itr->first == CURRENCY_TYPE_TRADERS_TENDER)
+        {
+            itr->second.state = PLAYERCURRENCY_UNCHANGED;
+            continue;
+        }
 
         switch (itr->second.state)
         {
@@ -7367,10 +7455,80 @@ void Player::SendCurrencies() const
     SendDirectMessage(packet.Write());
 }
 
+// SMSG_REQUEST_PVP_REWARDS_RESPONSE (0x480014) is decoded but DELIBERATELY not sent. The layout is recorded
+// here so the decode is not repeated; what blocks it is reward data this core does not have.
+//
+// The wire form was pinned from all 6 occurrences in the 12.0.7 family of captures (build-filtered to
+// 68275/68453/68974 and content-hash deduplicated - "rbg rated BG 12.0.7.pkt" is a byte-identical copy of
+// "rated BG 12.0.7.pkt", so the rated Blitz session counts once, not twice). Bodies are 304, 304, 348, 348,
+// 584 and 592 bytes. The shape is fixed, not counted:
+//
+//     RewardBlock[0]
+//     uint8  A            // 2 in the two small captures, 3 in the rated Blitz one
+//     uint8  B            // 0xC0 in all six
+//     RewardBlock[1] .. RewardBlock[12]        // 13 blocks in total, always all 13 present
+//
+// where RewardBlock is byte for byte the existing WorldPackets::LFG::LfgPlayerQuestReward and its
+// operator<< in LFGPackets.cpp - uint8 Mask, int32 RewardMoney, int32 RewardXP, the three uint32 counts up
+// front, then Item[]/Currency[]/BonusCurrency[] as {int32,int32} pairs, then one byte of MSB-first
+// OptionalInit bits (0x80 RewardSpellID, 0x40 ArtifactXPCategory, 0x20 ArtifactXP, 0x10 Honor) and the
+// present optionals in that order. That parser consumes all six bodies with ZERO bytes left over, which is
+// what settles the 13-block count: the client reader sub_7FF7290FB600 likewise calls the per-block reader
+// sub_7FF7291DAB70 thirteen times with two loose u8 reads after the first, and the two agree exactly.
+// Unpopulated activities are sent as all-zero blocks - retail itself left blocks 8 and 10 empty in the rated
+// Blitz capture, and left all but four blocks empty for a levelling character.
+//
+// Decoded values, for anyone verifying this later (currency 1792 = Honor, 1602 = Conquest): the rated Blitz
+// session carried e.g. Honor 300 + Conquest 8000 in block 0, Conquest 29800 + Honor 850 in block 1, and
+// Honor 200 with item 135539 in block 12; several blocks carry RewardSpellID 192953. The two non-PvP
+// captures are a levelling character and carry RewardXP (2150, 12250) where the max-level one carries none.
+//
+// The request side is already correct and needs no new trigger: CMSG_REQUEST_PVP_REWARDS (0x3A0041) has an
+// empty body, matching RequestPVPRewards, and every response in the captures is a direct 1:1 reply to it
+// 100-250 ms later. WorldSession::HandleRequestPvpReward -> here is exactly where retail answers.
+//
+// Only what this core will actually pay is published, and it is read from the same configuration the award
+// path reads, so the advertised figure cannot drift from the received one:
+//   - Honour is the winner's bonus from Battleground::EndBattleground, obtained by calling the very
+//     function that path calls - Battleground::GetBattlegroundCompletionHonor - instead of re-deriving it
+//     here. It was re-derived once, and that was a live drift hazard rather than a theoretical one: the
+//     award path treated the config value as an honorable-kill COUNT, and when that was fixed a
+//     re-derivation here would have gone on advertising ceil(270 * 80 * 1.55) = 33,480 for a win that
+//     pays 270. The first-win-of-the-day distinction is the player's own GetRandomWinner() flag, exactly
+//     as it is there. Rate.Honor IS applied to the advertised figure, because the award path's
+//     Player::RewardHonor applies it before the player receives anything and this frame states what the
+//     player receives; the shared function does that arithmetic so both sites agree by construction.
+//   - Conquest is deliberately NOT advertised. CONFIG_BG_REWARD_WINNER_CONQUEST_FIRST/LAST are declared in
+//     World.cpp and read by nothing at all, so this core awards no Conquest; publishing a figure would
+//     promise a payout that never arrives.
+//   - No item or spell rewards are advertised, because nothing in this core grants the ones retail sends.
+//   - The arena blocks stay empty on purpose rather than by omission: RewardHonor returns early in arenas,
+//     so 2v2, 3v3 and Skirmish genuinely pay no honour here and empty is the truthful answer.
+//   - The remaining blocks are activities this core does not run, and retail itself transmits those as
+//     all-zero blocks, so they are left zero rather than filled with something invented.
+//
+// Note on the opcode table: retail sends 0x480014 on connection index 1, while it is declared
+// CONNECTION_TYPE_REALM here. That difference is intentional and must not be "fixed". REALM always has a
+// socket, this frame is opened in the open world where an instance socket need not exist, and
+// SMSG_BATTLEFIELD_STATUS_QUEUED is likewise declared REALM on this branch and works live despite retail
+// also sending it on index 1.
 void Player::SendPvpRewards() const
 {
-    //WorldPacket packet(SMSG_REQUEST_PVP_REWARDS_RESPONSE, 24);
-    //GetSession()->SendPacket(&packet);
+    WorldPackets::LFG::RequestPvpRewardsResponse response;
+
+    // The same function Battleground::EndBattleground pays out of, with Rate.Honor applied because that
+    // path's RewardHonor applies it before the player sees the honor. Never re-derive this here.
+    uint32 const winnerHonor = Battleground::GetBattlegroundCompletionHonor(true, GetRandomWinner(), true);
+
+    // Every battleground pays this same bonus - EndBattleground does not vary it by bracket - so the
+    // battleground-shaped activities this core actually queues for all advertise it, and nothing else does.
+    for (uint8 slot : { uint8(WorldPackets::LFG::RequestPvpRewardsResponse::RandomBattleground),
+                        uint8(WorldPackets::LFG::RequestPvpRewardsResponse::RatedBattleground),
+                        uint8(WorldPackets::LFG::RequestPvpRewardsResponse::BrawlBattleground),
+                        uint8(WorldPackets::LFG::RequestPvpRewardsResponse::BattlegroundBlitz) })
+        response.Activity[slot].Honor = int32(winnerHonor);
+
+    SendDirectMessage(response.Write());
 }
 
 void Player::SetCreateCurrency(uint32 id, uint32 amount)
@@ -7481,9 +7639,13 @@ void Player::ModifyCurrency(uint32 id, int32 amount, CurrencyGainSource gainSour
 
     itr->second.Quantity += amount;
 
-    // Keep the perks-program field the Trading Post UI reads in sync with the tender balance.
+    // Keep the perks-program field the Trading Post UI reads in sync with the tender balance, and persist the
+    // shared account-wide balance to the login DB (Trader's Tender is never written to character_currency).
     if (id == CURRENCY_TYPE_TRADERS_TENDER)
+    {
         SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::PerksProgramCurrency), int32(itr->second.Quantity));
+        GetSession()->StoreAccountPerksTender(itr->second.Quantity);
+    }
 
     if (amount > 0 && !ignoreCaps) // Ignore total values update for refund
     {
@@ -7847,6 +8009,11 @@ void Player::UpdateArea(uint32 newArea)
         UpdateCriteria(CriteriaType::EnterArea, newArea);
         UpdateCriteria(CriteriaType::LeaveArea, oldArea);
     }
+
+    // Battle.net presence: zone changes are one of the four events presence.v1/v2 subscribers are
+    // pushed on. UpdateArea covers both a subzone change and the tail of a full UpdateZone, and it is
+    // reached even when the zone id has no AreaTable entry, unlike UpdateZone's own body.
+    sBnetPresenceMgr->OnZoneChanged(this, m_zoneUpdateId, newArea);
 }
 
 void Player::UpdateZone(uint32 newZone, uint32 newArea)
@@ -9513,6 +9680,12 @@ void Player::SendInitWorldStates(uint32 zoneId, uint32 areaId) const
         mapId, zoneId, areaId, uint32(packet.Worldstates.size()));
 
     SendDirectMessage(packet.Write());
+
+    // The rotating world states go out with the static ones, which is where the 12.0.7 captures show
+    // them: SMSG_ACTIVE_SCHEDULED_WORLD_STATE_INFO sits in the same burst as SMSG_INIT_WORLD_STATES.
+    // Realm-global content, but the client needs it before it can put a countdown on any widget the
+    // zone it just entered shows.
+    WorldStateMgr::SendActiveScheduledWorldStateInfo(this);
 }
 
 void Player::SetBindPoint(ObjectGuid guid) const
@@ -14775,25 +14948,126 @@ void Player::OnGossipSelect(WorldObject* source, int32 gossipOptionId, uint32 me
             break;
         case GossipOptionNpc::GarrisonTradeskillNpc: // NYI
             break;
-        case GossipOptionNpc::GarrisonRecruitment: // NYI
+        case GossipOptionNpc::GarrisonRecruitment:
+        {
+            // WoD garrison recruiter (e.g. Lysa Serion, 84947, in the Lunarfall/Frostwall inn). Selecting the
+            // option opens the recruitment frame via SMSG_GARRISON_OPEN_RECRUITMENT_NPC, which seeds the three
+            // recruit slots and tells the client whether it may roll a fresh set
+            // (CMSG_GARRISON_GENERATE_RECRUITS) and whether it may pick a counter/trait preference
+            // (CMSG_GARRISON_SET_RECRUITMENT_PREFERENCES). Both of those handlers, and the packet itself, have
+            // been here all along - only the opener was missing, so the option was a dead click.
+            //
+            // Deliberately resolved through the no-arg GetGarrison() (WoD, type 2): HandleGarrisonGenerateRecruits
+            // and HandleGarrisonRecruitFollower both resolve the same way, and seeding the frame from a different
+            // garrison than the one those handlers act on would let a player recruit against the wrong roster.
+            // If the recruiter is ever reused for another garrison type, all three sites must move together.
+            Garrison* garrison = GetGarrison();
+            if (!garrison)
+                break;
+
+            WorldPackets::Garrison::GarrisonOpenRecruitmentNpc openRecruitment;
+            openRecruitment.NpcGUID = guid;
+            openRecruitment.MechanicTypeID = garrison->GetRecruitmentPreferenceAbilityId();
+            openRecruitment.TraitID = garrison->GetRecruitmentPreferenceTraitId();
+
+            // Exactly 3 inline follower records, no count prefix (see GarrisonOpenRecruitmentNpc::Write). Slots
+            // past the rolled count stay default-constructed, matching HandleGarrisonGenerateRecruits.
+            std::vector<WorldPackets::Garrison::GarrisonFollower> const& recruits = garrison->GetAvailableRecruits();
+            for (std::size_t i = 0; i < openRecruitment.Followers.size() && i < recruits.size(); ++i)
+                openRecruitment.Followers[i] = recruits[i];
+
+            openRecruitment.CanGenerateRecruits = true;
+            openRecruitment.CanSetRecruitmentPreference = true;
+            SendDirectMessage(openRecruitment.Write());
             break;
-        // GossipOptionNpc::GarrisonTalent (Order Advancement) intentionally falls through to `default` (handled=false):
-        // the class-hall talent frame opens via the client's immersive-interaction dispatch, which resolves the
-        // gossip option's GossipNpcOptionID in GossipNPCOption.db2 to PlayerInteractionType::GarrTalent and fires
-        // GARRISON_TALENT_NPC_OPENED. So the option only needs its GossipNpcOptionID set (e.g. Hunter=32330) and the
-        // generic SMSG_GOSSIP_OPTION_NPC_INTERACTION below does the rest. (Verified by client RE of sub_7FF72AB660A0 /
-        // sub_7FF72AB62640.) No dedicated open-talent opcode exists.
+        }
+        // GossipOptionNpc::GarrisonTalent (Order Advancement) intentionally has NO case: it falls through to
+        // `default` (handled = false), so the generic immersive-interaction path below runs. The client resolves
+        // the option's GossipNpcOptionID (GossipNPCOption.db2) to PlayerInteractionType::GarrTalent and fires
+        // GARRISON_TALENT_NPC_OPENED -> OrderHallTalentFrame. No dedicated open-talent packet/opcode is needed
+        // (verified by client RE; a dedicated packet leaves a stuck "book cursor" because no frame is registered
+        // for it). The option only needs its GossipNpcOptionID set in GossipNPCOption.db2 (e.g. Hunter = 32330).
+        case GossipOptionNpc::CovenantPreviewNpc:
+        {
+            // Tell the client which covenant to preview. The covenant is NOT inferred from the creature entry - it
+            // comes from the gossip option's own GossipNPCOption.db2 row (CovenantID column), e.g. option 32285 = Kyrian
+            // on Polemarch Adrestes, 32306 = Venthyr on General Draven.
+            int32 covenantId = 0;
+            if (item->GossipNpcOptionID)
+                if (GossipNPCOptionEntry const* npcOption = sGossipNPCOptionStore.LookupEntry(*item->GossipNpcOptionID))
+                    covenantId = npcOption->CovenantID;
+
+            if (covenantId > 0)
+            {
+                WorldPackets::Covenant::CovenantPreviewOpenNpc preview;
+                preview.NpcGUID = guid;
+                preview.CovenantID = covenantId;
+                SendDirectMessage(preview.Write());
+            }
+            else
+                TC_LOG_DEBUG("entities.player", "Player::OnGossipSelect: covenant preview option {} on menu {} has no GossipNPCOption CovenantID; preview not sent.",
+                    gossipOptionId, menuId);
+
+            // Fall through to the generic path so the CovenantPreview interaction is still opened.
+            handled = false;
+            break;
+        }
         case GossipOptionNpc::ChromieTimeNpc:
+            // Fall through to the generic !handled branch, which sends
+            // SMSG_GOSSIP_OPTION_NPC_INTERACTION{GossipNpcOptionID}; the client resolves that through
+            // GossipNPCOption.db2 into PlayerInteractionType::ChromieTime (45) and raises the timeline
+            // picker. Consuming the option here (the old "// NYI" stub) swallowed it and nothing opened.
+            // This matches feature/chromie-time, which owns this handler - integration kept its stub
+            // through the merge even though the branch had already changed this line.
             handled = false;
             break;
         case GossipOptionNpc::RuneforgeLegendaryCrafting: // NYI
             break;
         case GossipOptionNpc::RuneforgeLegendaryUpgrade: // NYI
             break;
-        case GossipOptionNpc::ProfessionsCraftingOrder: // NYI
+        // GossipOptionNpc::ProfessionsCraftingOrder (48) deliberately keeps no case and is NOT listed here: the
+        // 12.0.7 client's GossipNPCOption.db2 carries zero rows of that type, so no live NPC can raise it. It
+        // therefore reaches `default:`, which sets handled = false and opens the generic interaction - strictly
+        // more useful than the upstream "// NYI" stub, which consumed the option and sent nothing. That stub is
+        // deliberately NOT reinstated here: feature/housing-system still carried it only because the branch
+        // predates feature/crafting-orders' removal of it.
+        case GossipOptionNpc::ProfessionsCustomerOrder:
+        {
+            // The crafting-order clerk has its own dedicated open opcode, so it belongs in this
+            // switch rather than in the generic !handled fall-through — exactly like the auctioneer
+            // above. SMSG_CRAFTING_HOUSE_HELLO_RESPONSE REPLACES SMSG_GOSSIP_OPTION_NPC_INTERACTION
+            // here; it does not accompany it.
+            //
+            // Capture evidence (build 68275, ingame-shop_ordersCrafting_professions.pkt, three
+            // identical sequences at ticks 383194 / 761111 / 788488, clerk menu 30243 — the same menu
+            // the crafting-order work targets):
+            //     CMSG_GOSSIP_SELECT_OPTION{guid, 30243, 107733}
+            //   ~150 ms later
+            //     SMSG_CRAFTING_HOUSE_HELLO_RESPONSE{guid, 0x40}      <- the only reply
+            //     CMSG_CRAFTING_ORDER_LIST_MY_ORDERS{same guid}
+            // SMSG_GOSSIP_OPTION_NPC_INTERACTION appears zero times in those windows, and
+            // SMSG_NPC_INTERACTION_OPEN_RESULT zero times in the whole 12.0.7 capture set. That is
+            // not a dead mechanism in the session: the same capture carries three
+            // SMSG_GOSSIP_OPTION_NPC_INTERACTION records for a GameObject, so retail deliberately
+            // does not use it for this clerk.
+            //
+            // The client handler (sub_7FF72ACDB8D0) opens PlayerInteractionType 60 itself and then
+            // fires CRAFTINGORDERS_SHOW_CUSTOMER, so nothing else is needed to raise the frame.
+            PlayerTalkClass->GetInteractionData().StartInteraction(guid, PlayerInteractionType::ProfessionsCustomerOrder);
+
+            WorldPackets::Housing::CraftingHouseHelloResponse craftingHouseHello;
+            craftingHouseHello.Guid = guid;
+            craftingHouseHello.OpenForBusiness = true;  // clear raises CRAFTING_HOUSE_DISABLED instead
+            SendDirectMessage(craftingHouseHello.Write());
+
+            // Merge note (integration/all-systems): feature/crafting-orders reached this line first and set
+            // handled = false here, shipping world SQL that populates gossip_menu_option.GossipNpcOptionID on
+            // menus 27907 and 30243. The capture evidence above wins, so the replace semantics are kept and
+            // `handled` stays true. That SQL is then only inert, not wrong: GossipNpcOptionID is read solely on
+            // the !handled path, which this case no longer takes. Leave the rows in place - they cost nothing
+            // and are the correct data if a future build ever restores the generic trigger.
             break;
-        case GossipOptionNpc::ProfessionsCustomerOrder: // NYI
-            break;
+        }
         case GossipOptionNpc::BarbersChoice: // NYI - unknown if needs sending
             break;
         default:
@@ -15690,6 +15964,11 @@ void Player::RewardQuest(Quest const* quest, LootItemType rewardType, uint32 rew
     uint32 quest_id = quest->GetQuestId();
     QuestStatus oldStatus = GetQuestStatus(quest_id);
 
+    // A turned-in calling frees its slot on the board straight away; the replacement arrives at the next daily
+    // reset. The client agrees with this ordering - it re-requests the callings on QUEST_TURNED_IN.
+    if (quest->GetQuestTag() == QuestTagType::CovenantCalling)
+        OnCovenantCallingCompleted(quest_id);
+
     if (quest->IsDaily() || quest->IsDFQuest())
     {
         SetDailyQuestStatus(quest_id);
@@ -15713,6 +15992,10 @@ void Player::RewardQuest(Quest const* quest, LootItemType rewardType, uint32 rew
         SetRewardedQuest(quest_id);
 
     SetQuestCompletedBit(quest_id, true);
+
+    // Phase 10F - if this quest is a Campaign.Completed marker, auto-grant the
+    // Campaign.RewardQuestID to the player (retail behavior).
+    QuestMgr::OnQuestCompletedHandleCampaignReward(this, quest_id);
 
     for (QuestObjective const& obj : quest->GetObjectives())
     {
@@ -15910,6 +16193,49 @@ void Player::RewardQuest(Quest const* quest, LootItemType rewardType, uint32 rew
     UpdateCriteria(CriteriaType::CompleteQuestsCount);
     UpdateCriteria(CriteriaType::CompleteQuest, quest->GetQuestId());
     UpdateCriteria(CriteriaType::CompleteAnyReplayQuest, 1);
+    // CriteriaType::CompleteAnyWorldQuest (203). No asset - every real Criteria row gates on
+    // ModifierTreeType::QuestHasQuestInfoId (206), which resolves miscValue1 as the quest id, so the quest
+    // id is what must be passed.
+    if (quest->IsWorldQuest())
+        UpdateCriteria(CriteriaType::CompleteAnyWorldQuest, quest->GetQuestId());
+    // CriteriaType::CompleteTrackingQuest (250). Tracking quests (QUEST_FLAGS_TRACKING_EVENT) are the hidden,
+    // auto-rewarded progress markers; they are rewarded through this same path.
+    if (quest->HasFlag(QUEST_FLAGS_TRACKING_EVENT))
+        UpdateCriteria(CriteriaType::CompleteTrackingQuest, quest->GetQuestId());
+
+    // Grant any garrison/war-campaign champions (GarrFollower) mapped to this quest turn-in.
+    // Retail encodes several of these as the quest's RewardSpell (SPELL_EFFECT_ADD_GARRISON_FOLLOWER),
+    // but that path only reaches the follower's own garrison type via Spell::EffectAddGarrisonFollower;
+    // this data-driven table is the authoritative, faction-agnostic mechanism and also covers champions
+    // that are not granted through a reward spell.
+    if (std::vector<QuestGarrisonFollower> const* garrisonFollowers = sObjectMgr->GetQuestGarrisonFollowers(quest_id))
+    {
+        for (QuestGarrisonFollower const& reward : *garrisonFollowers)
+        {
+            GarrisonType garrType = GarrisonType(reward.GarrType);
+            Garrison* garrison = GetGarrison(garrType);
+
+            // Ensure the target garrison exists. In retail the war-campaign garrison is created earlier in
+            // the campaign; create it here as a safety net for the known war-campaign sites so a champion
+            // reward is never silently lost. Unknown types are left to their own creation path.
+            if (!garrison && garrType == GARRISON_TYPE_WAR_CAMPAIGN)
+            {
+                CreateGarrison(GetTeam() == ALLIANCE ? 168 : 169);
+                garrison = GetGarrison(garrType);
+            }
+
+            if (!garrison)
+            {
+                TC_LOG_DEBUG("entities.player.quest", "Player::RewardQuest: quest {} grants GarrFollower {} for GarrType {} but player {} has no such garrison; skipped.",
+                    quest_id, reward.GarrFollowerID, reward.GarrType, GetGUID().ToString());
+                continue;
+            }
+
+            // Idempotent: never double-grant a champion the player already owns.
+            if (!garrison->GetFollowerByEntry(reward.GarrFollowerID))
+                garrison->AddFollower(reward.GarrFollowerID);
+        }
+    }
 
     // make full db save
     SaveToDB(false);
@@ -17363,6 +17689,76 @@ void Player::CurrencyChanged(uint32 currencyId, int32 change)
     UpdateQuestObjectiveProgress(QUEST_OBJECTIVE_CURRENCY, currencyId, change);
     UpdateQuestObjectiveProgress(QUEST_OBJECTIVE_HAVE_CURRENCY, currencyId, change);
     UpdateQuestObjectiveProgress(QUEST_OBJECTIVE_OBTAIN_CURRENCY, currencyId, change);
+
+    // A Shadowlands covenant stores its renown in a per-covenant currency (Covenant.db2 CurrencyTypesID), so a
+    // change to one of those currencies IS a renown level change. This is the hook the reputation-driven path
+    // gets from ReputationMgr - see Player::GetCovenantRenownCurrency for why the reputation path can never
+    // fire for covenants 1-4.
+    if (uint32 covenantId = GetCovenantIdForRenownCurrency(currencyId))
+    {
+        UpdateCovenantRenownRewards(covenantId);
+        if (covenantId == m_activeCovenantId)
+            SyncCovenantRenownDisplayCurrency();
+    }
+    else if (currencyId == CURRENCY_TYPE_COVENANT_RENOWN && change > 0)
+    {
+        // Renown-granting CONTENT awards the shared display currency, not the per-covenant one: every quest in
+        // the world database that awards renown awards 1822 (58407 "The Medallion of Dominion", 62406 "Staff of
+        // the Primus", 60108 "Drust and Ashes"), and the per-covenant currencies carry an AwardConditionID
+        // (PlayerCondition 70101-70104, "CovenantID == n") marking them as the covenant-scoped copy. So a gain
+        // on 1822 is credited to the active covenant's track, which is where renown is actually stored; the
+        // resulting change on that currency runs the branch above and mirrors the value straight back, so this
+        // settles in one round trip instead of looping. Losses are never forwarded - the track is the authority
+        // and a spurious display loss self-heals on the next sync.
+        if (CurrencyTypesEntry const* covenantCurrency = GetCovenantRenownCurrency(m_activeCovenantId))
+        {
+            int32 unclaimed = int32(GetCurrencyQuantity(CURRENCY_TYPE_COVENANT_RENOWN))
+                - int32(GetCurrencyQuantity(covenantCurrency->ID));
+            if (unclaimed > 0)
+                ModifyCurrency(covenantCurrency->ID, unclaimed, CurrencyGainSource::RenownRepGain);
+        }
+    }
+
+    // Reservoir anima works the same way as renown - per-covenant storage (1859-1862) behind a shared display
+    // currency (1813) - with one difference that matters: anima is SPENT. Sanctum research and Anima Conductor
+    // channels charge 1813, so unlike renown the mirror has to carry losses as well as gains, or a spend would
+    // be undone by the next sync and anima would be infinite.
+    // Both directions of the anima mirror move currency, and moving currency re-enters this function. The
+    // round trip is designed to settle immediately (the second hop finds the two sides equal and does nothing),
+    // but "designed to settle" is not "cannot loop": if the view and the track ever clamped differently the
+    // pair would oscillate forever and take the world thread with them. This latch makes that impossible -
+    // the outermost hop owns the reconciliation and any nested one is skipped, leaving at worst a divergence
+    // that the next sync (login, covenant switch, next anima change) repairs.
+    if (m_covenantAnimaSyncing)
+        return;
+
+    if (uint32 animaCovenantId = GetCovenantIdForAnimaCurrency(currencyId))
+    {
+        if (animaCovenantId == m_activeCovenantId)
+        {
+            m_covenantAnimaSyncing = true;
+            SyncCovenantAnimaDisplayCurrency();
+            m_covenantAnimaSyncing = false;
+        }
+    }
+    else if (currencyId == CURRENCY_TYPE_RESERVOIR_ANIMA)
+    {
+        // Every anima gain and every anima charge in the build lands on 1813; credit or debit it against the
+        // active covenant's track, which is where anima is actually stored. CurrencyChanged runs after the
+        // storage has already been updated, so the difference below is the amount the track still owes or owns.
+        if (CurrencyTypesEntry const* covenantCurrency = GetCovenantAnimaCurrency(m_activeCovenantId))
+        {
+            int32 unbanked = int32(GetCurrencyQuantity(CURRENCY_TYPE_RESERVOIR_ANIMA))
+                - int32(GetCurrencyQuantity(covenantCurrency->ID));
+            if (unbanked)
+            {
+                m_covenantAnimaSyncing = true;
+                ModifyCurrency(covenantCurrency->ID, unbanked, CurrencyGainSource::Vendor,
+                    CurrencyDestroyReason::Garrison);
+                m_covenantAnimaSyncing = false;
+            }
+        }
+    }
 }
 
 void Player::UpdateQuestObjectiveProgress(QuestObjectiveType objectiveType, int32 objectId, int64 addCount, ObjectGuid victimGuid /*= ObjectGuid::Empty*/,
@@ -18910,8 +19306,11 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
     //Other way is to saves m_team into characters table.
     SetFactionForRace(GetRace());
 
-    // Restore Chromie Time state from DB
-    if (fields.chromieTimeExpansionId > 0)
+    // Restore Chromie Time state from DB. A character at or above the deactivation level
+    // restores nothing: the update fields stay zeroed and the next save persists 0, so a
+    // stale DB value (e.g. written before a level-up cleared the state) cannot resurrect
+    // chromie time on login (audit R8/m3, SRV CHR-4; band per audit R10).
+    if (fields.chromieTimeExpansionId > 0 && GetLevel() < ChromieTimeDeactivationLevel)
     {
         if (UIChromieTimeExpansionInfoEntry const* entry = sUIChromieTimeExpansionInfoStore.LookupEntry(uint32(fields.chromieTimeExpansionId)))
         {
@@ -19362,6 +19761,9 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
     // must be before inventory (some items required reputation check)
     m_reputationMgr->LoadFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_REPUTATION));
     m_reputationMgr->LoadAccountWideFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_REPUTATION));
+    m_reputationMgr->LoadRenownRewardsGrantedFromDB(
+        holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_CHAR_RENOWN_REWARDS_GRANTED),
+        holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_WARBAND_RENOWN_REWARDS_GRANTED));
 
     if (PreparedQueryResult maxLevelResult = holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_WARBAND_MAX_LEVEL_COUNT))
         _warbandMaxLevelCharCount = std::min((*maxLevelResult)[0].GetUInt64(), uint64(5));
@@ -19370,10 +19772,12 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
     _LoadAccountBankTabSettings(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_TAB_SETTINGS));
     _LoadAccountBankCoinage(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_ACCOUNT_BANK_COINAGE));
 
+    _LoadCovenantSoulbinds(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_COVENANT_SOULBINDS));
     _LoadCovenant(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_COVENANT));
     _LoadSoulbindConduits(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_SOULBIND_CONDUITS));
     _LoadSoulbindConduitSockets(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_SOULBIND_CONDUIT_SOCKETS));
     _LoadRenownRewards(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_RENOWN_REWARDS));
+    _LoadCovenantCallings(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_COVENANT_CALLINGS));
     ApplyConduitSpells();   // spell/aura systems are ready by here (mirrors _LoadGlyphAuras above)
 
     _LoadInventory(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_INVENTORY),
@@ -19568,8 +19972,12 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
 
     _mythicPlusData = std::make_unique<MythicPlusData>(this);
     _mythicPlusData->LoadFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MYTHIC_PLUS));
-    _mythicPlusData->LoadWeeklyFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MYTHIC_PLUS_WEEKLY));
+    // The vault row must load BEFORE the weekly runs: loading the runs prunes a week that has already reset,
+    // and that prune both reads the stored claim/keystone boundaries and rewrites the row with the previous
+    // week's captured summary. Loading it afterwards would clobber the capture with the pre-reset values.
     _mythicPlusData->LoadVaultFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MYTHIC_PLUS_VAULT));
+    _mythicPlusData->LoadWeeklyFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_MYTHIC_PLUS_WEEKLY));
+    UpdateDungeonScore();
 
     std::unique_ptr<Housing> housing = std::make_unique<Housing>(this);
     if (housing->LoadFromDB(holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_HOUSING),
@@ -19579,34 +19987,24 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
         holder.GetPreparedResult(PLAYER_LOGIN_QUERY_LOAD_HOUSING_CATALOG)))
         _housings.push_back(std::move(housing));
 
-    // TODO: When the housing tutorial questline is implemented, this brute-force approach
-    // (setting all tutorial bits + injecting closedInfoFramesAccountWide / housingTutorialsEnabled
-    // CVars) must be replaced with proper quest-driven tutorial progression. The client Lua UI
-    // sets FrameTutorialAccount bits (e.g. HousingModesUnlocked=38) individually as the player
-    // completes each tutorial step. At that point, remove the blanket CVar injection below and
-    // let the questline handlers set the appropriate closedInfoFramesAccountWide bits on completion.
+    // The client Lua UI sets FrameTutorialAccount bits individually as the player completes each
+    // tutorial step. We set exactly one of them up front - HousingModesUnlocked (38), which the editor
+    // needs - and leave the rest to the client. An earlier revision set the whole bitfield and forced
+    // housingTutorialsEnabled=0, which unlocked the editor but also told the client the entire housing
+    // tutorial was already done, so first-time buyers were dropped straight into the House Finder.
     //
-    // Mark all tutorials as seen. Retail sniff shows all 256 tutorial bits set to 1 (0xFF bytes).
+    // The 256-bit server tutorial flags are NOT touched here. They used to be blanket-set to all-ones on every
+    // login ("retail sniff shows all 256 bits set" - true of a veteran retail account, not of a fresh one), which
+    // permanently marked every tutorial in the game as already seen for the account. The client owns this state
+    // and reports each step through CMSG_TUTORIAL (WorldSession::HandleTutorialFlag), so letting it drive them is
+    // both correct and self-repairing.
     if (GetSession())
     {
-        bool needsUpdate = false;
-        for (uint8 i = 0; i < MAX_ACCOUNT_TUTORIAL_VALUES; ++i)
-        {
-            if (GetSession()->GetTutorialInt(i) != 0xFFFFFFFF)
-            {
-                GetSession()->SetTutorialInt(i, 0xFFFFFFFF);
-                needsUpdate = true;
-            }
-        }
-        if (needsUpdate)
-            GetSession()->SendTutorialsData();
-
         // The 256-bit server tutorial flags (above) are separate from the client's
         // FrameTutorialAccount UI flags. The client stores those in the CVar bitfield
         // "closedInfoFramesAccountWide" within the GLOBAL_CONFIG_CACHE account data.
         // Without setting bit 38 (HousingModesUnlocked), the housing editor UI keeps
         // expert/cleanup/layout modes locked with "Tutorial Mode" error.
-        // Also disable housing tutorials entirely via housingTutorialsEnabled=0.
         AccountData const* configCache = GetSession()->GetAccountData(GLOBAL_CONFIG_CACHE);
         std::string configData = configCache ? configCache->Data : "";
         bool configModified = false;
@@ -19645,10 +20043,16 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
             }
         };
 
-        // Mark ALL FrameTutorialAccount bits as seen (48 bits = 2 uint32 words, all 1s)
-        ensureCVar("closedInfoFramesAccountWide", "4294967295 4294967295");
-        // Disable housing tutorial gates entirely
-        ensureCVar("housingTutorialsEnabled", "0");
+        // Unlock the housing editor modes and NOTHING else - see HOUSING_MODES_UNLOCKED_CVAR.
+        // housingTutorialsEnabled is deliberately left alone so the client runs the housing tutorial
+        // normally; forcing it to 0 here is what skipped the tutorial and dropped a first-time buyer
+        // straight into the House Finder.
+        ensureCVar("closedInfoFramesAccountWide", HOUSING_MODES_UNLOCKED_CVAR);
+        // Actively restore the client default rather than merely stopping writing it: accounts that
+        // logged in under the old code still carry a persisted housingTutorialsEnabled="0" in their
+        // GLOBAL_CONFIG_CACHE, and leaving it alone would keep the tutorial suppressed forever for
+        // exactly the characters that hit the bug. This repairs our own past write; it is not a gate.
+        ensureCVar("housingTutorialsEnabled", "1");
 
         if (configModified)
         {
@@ -19788,15 +20192,17 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
             }
 
             // Calculate progress in the 0-1000 scale (sniff: ProgressRequired=1000)
-            float progressRequired = 1000.0f;
+            float progressRequired = INITIATIVE_PROGRESS_REQUIRED;
             float currentProgress = activeInit->Progress * progressRequired;
 
-            // Find current milestone
+            // Find current milestone. RequiredContributionAmount is a percentage (DB2: 25/50/75/100)
+            // while Progress is a 0..1 fraction, so it has to be scaled before comparing — comparing
+            // them raw pinned CurrentMilestoneID to the first milestone forever.
             int32 currentMilestoneID = -1;
             auto milestones = sInitiativeManager.GetMilestonesForCycle(cycleID);
             for (auto const& m : milestones)
             {
-                if (activeInit->Progress < m.RequiredContributionAmount)
+                if (activeInit->Progress * INITIATIVE_MILESTONE_SCALE < m.RequiredContributionAmount)
                 {
                     currentMilestoneID = static_cast<int32>(m.MilestoneID);
                     break;
@@ -19979,6 +20385,30 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
             }
         }
     }
+    // Safety net for characters that joined a covenant before the sanctum garrison existed (or whose creation was
+    // lost): give them the GarrType 111 garrison now. Same pattern as the war-campaign create in RewardQuest.
+    // No SQL migration is needed - the row is written by the next SaveToDB. Must run after both _LoadCovenant and
+    // the garrison load loop above.
+    if (m_activeCovenantId && !GetGarrison(GARRISON_TYPE_COVENANT))
+        CreateGarrison(GARR_SITE_COVENANT_SANCTUM);
+
+    // Re-apply GarrTalentRank.PerkSpellID for every already-researched talent. Permanently learned perks are
+    // idempotent here; the soulbind trait perks are auras and genuinely need re-casting, and this is the first
+    // point where both the garrisons and the covenant/soulbind state (_LoadCovenant, above) are loaded.
+    for (auto const& [garrType, garrison] : GetGarrisons())
+        garrison->ApplyAllTalentPerks();
+
+    // ...and take back the ones belonging to a covenant this character is no longer serving. ApplyAllTalentPerks
+    // only ever adds, so without this a character that switched covenants would keep the abilities, sanctum perks
+    // and soulbind traits of the covenant it left for as long as it kept logging in. Repairs characters that
+    // switched before this existed, and is a no-op for everybody else.
+    if (Garrison* sanctum = GetGarrison(GARRISON_TYPE_COVENANT))
+        sanctum->RefreshCovenantTalentPerks();
+
+    // Roll the calling board forward over every daily reset that passed while the character was offline. The
+    // board is stored as timestamps, so this is pure catch-up arithmetic and produces the same result whether
+    // the character was away for an hour or a month.
+    UpdateCovenantCallings();
 
     _InitHonorLevelOnLoadFromDB(fields.honor, fields.honorLevel);
 
@@ -20002,6 +20432,8 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
 
     m_achievementMgr->CheckAllAchievementCriteria(this);
     m_questObjectiveCriteriaMgr->CheckAllQuestObjectiveCriteria(this);
+
+    sPreyMgr->OnPlayerLogin(this);          // Midnight S1 Prey/Voidforge — restore hunt/Journey state (no-op until content lands)
 
     PushQuests();
 
@@ -21611,6 +22043,15 @@ void Player::_LoadCovenant(PreparedQueryResult result)
     Field* fields = result->Fetch();
     m_activeCovenantId = fields[0].GetUInt32();
     m_activeSoulbindId = fields[1].GetUInt32();
+
+    // Replicate to the client. PlayerData::CovenantID/SoulbindID are what C_Covenants.GetActiveCovenantID() and
+    // C_Soulbinds.GetActiveSoulbindID() read, and what the covenant/soulbind PlayerConditions and criteria test;
+    // without these writes the whole covenant UI behaves as if the character never joined one.
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData).ModifyValue(&UF::PlayerData::CovenantID), int32(m_activeCovenantId));
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData).ModifyValue(&UF::PlayerData::SoulbindID), int32(m_activeSoulbindId));
+
+    // Covenant membership grants a hidden SkillLine that gates covenant-locked objects (see ApplyCovenantSkillLines).
+    ApplyCovenantSkillLines();
 }
 
 void Player::_LoadAccountBankTabSettings(PreparedQueryResult result)
@@ -21763,6 +22204,49 @@ void Player::_LoadAccountBankItems(PreparedQueryResult result, uint32 timeDiff)
     CharacterDatabase.CommitTransaction(trans);
 }
 
+void Player::_LoadCovenantSoulbinds(PreparedQueryResult result)
+{
+    if (!result)
+        return;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        m_covenantSoulbinds[fields[0].GetUInt32()] = fields[1].GetUInt32();
+    } while (result->NextRow());
+}
+
+void Player::RememberCovenantSoulbind(uint32 covenantId, uint32 soulbindId)
+{
+    if (!covenantId)
+        return;
+
+    auto [itr, inserted] = m_covenantSoulbinds.insert({ covenantId, soulbindId });
+    if (!inserted)
+    {
+        if (itr->second == soulbindId)
+            return;
+        itr->second = soulbindId;
+    }
+
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_CHARACTER_COVENANT_SOULBIND);
+    stmt->setUInt64(0, GetGUID().GetCounter());
+    stmt->setUInt32(1, covenantId);
+    stmt->setUInt32(2, soulbindId);
+    CharacterDatabase.Execute(stmt);
+}
+
+uint32 Player::GetRememberedCovenantSoulbind(uint32 covenantId) const
+{
+    auto itr = m_covenantSoulbinds.find(covenantId);
+    return itr != m_covenantSoulbinds.end() ? itr->second : 0;
+}
+
+bool Player::HasEverJoinedCovenant(uint32 covenantId) const
+{
+    return m_covenantSoulbinds.count(covenantId) != 0;
+}
+
 void Player::_LoadRenownRewards(PreparedQueryResult result)
 {
     if (!result)
@@ -21775,9 +22259,608 @@ void Player::_LoadRenownRewards(PreparedQueryResult result)
     } while (result->NextRow());
 }
 
+namespace
+{
+// Shadowlands covenant renown.
+//
+// CURRENCY_TYPE_COVENANT_RENOWN (1822) is the shared display currency. The client's renown UI reads it, and so
+// does every renown gate in the build: all 46 PlayerCondition rows in 12.0.7.68275 that reference a renown
+// currency reference 1822 and none reference the per-covenant currencies 1829-1832, as do the
+// ModifierTreeType 119 (PlayerHasCurrencyEqualOrGreaterThan) nodes behind the sanctum reservoir gates. So 1822
+// has to track the ACTIVE covenant's renown or none of those gates can ever evaluate true.
+//
+// Renown level for a covenant-renown currency quantity: level = quantity + 1.
+//
+// RenownRewards.db2 publishes levels 1..80 for covenants 1-4, while CurrencyTypes 1822/1829-1832 all cap at
+// MaxQty 79 (and share MaxQtyWorldStateID 19735, "Covenant Renown (Currency) - Max quantity", default 79).
+// Quantity 0 is therefore Renown 1 - the level a character holds the moment it joins - and quantity 79 is
+// Renown 80; without the offset the level-80 rewards would be unreachable.
+//
+// The offset is specific to the Shadowlands covenants. For every Dragonflight/TWW major faction the highest
+// RenownRewards level equals the currency MaxQty exactly (Valdrakken Accord 2088 MaxQty 30 / levels 1..30,
+// Maruuk Centaur 2002 MaxQty 25 / levels 1..25, Loamm Niffen 2402 MaxQty 20 / levels 1..20, ...), which is
+// why ReputationMgr::GetRenownLevel returns the raw quantity for the reputation-driven path and must not be
+// changed. Cross-check: the two sanctum reservoir gates PlayerCondition 82863 / 82871 (recorded as the
+// Renown 11 / Renown 19 requirements of GarrTalent 1138/1141/1144/1147 and 1139/1142/1145/1148) resolve to
+// ModifierTree 145849 / 145865, both ModifierTreeType 119 on currency 1822 with amounts 10 and 18.
+constexpr int32 COVENANT_RENOWN_LEVEL_OFFSET = 1;
+}
+
+CurrencyTypesEntry const* Player::GetCovenantRenownCurrency(uint32 covenantId)
+{
+    CovenantEntry const* covenant = covenantId ? sCovenantStore.LookupEntry(covenantId) : nullptr;
+    if (!covenant || covenant->CurrencyTypesID <= 0)
+        return nullptr;
+
+    // Covenant.db2 also carries the Dragonflight and later major factions, and they publish a CurrencyTypesID
+    // too. Those run on renown REPUTATION (their Faction row publishes RenownCurrencyID) and are served by
+    // UpdateRenownRewards(FactionEntry const*); claiming them here would double-grant and would apply the
+    // Shadowlands-only level offset to them. Only covenants whose faction publishes no renown currency - which
+    // in this build is exactly the four Shadowlands covenants - are currency-driven.
+    FactionEntry const* faction = sFactionStore.LookupEntry(uint32(covenant->FactionID));
+    if (!faction || faction->RenownCurrencyID > 0)
+        return nullptr;
+
+    return sCurrencyTypesStore.LookupEntry(uint32(covenant->CurrencyTypesID));
+}
+
+uint32 Player::GetCovenantIdForRenownCurrency(uint32 currencyId)
+{
+    if (!currencyId)
+        return 0;
+
+    for (CovenantEntry const* covenant : sCovenantStore)
+        if (CurrencyTypesEntry const* currency = GetCovenantRenownCurrency(covenant->ID))
+            if (currency->ID == currencyId)
+                return covenant->ID;
+
+    return 0;
+}
+
+uint32 Player::GetCovenantRenownLevel(uint32 covenantId /*= 0*/) const
+{
+    if (!covenantId)
+        covenantId = m_activeCovenantId;
+
+    CurrencyTypesEntry const* currency = GetCovenantRenownCurrency(covenantId);
+    if (!currency)
+        return 0;
+
+    return GetCurrencyQuantity(currency->ID) + COVENANT_RENOWN_LEVEL_OFFSET;
+}
+
+uint32 Player::GetHighestCovenantRenownLevel() const
+{
+    uint32 highest = 0;
+    for (CovenantEntry const* covenant : sCovenantStore)
+    {
+        CurrencyTypesEntry const* currency = GetCovenantRenownCurrency(covenant->ID);
+        if (!currency)
+            continue;
+
+        // Same guard as UpdateCovenantRenownRewards: quantity 0 means Renown 1 for a covenant the character has
+        // actually joined, but it must not read as Renown 1 for the three it never touched.
+        uint32 quantity = GetCurrencyQuantity(currency->ID);
+        if (!quantity && covenant->ID != m_activeCovenantId)
+            continue;
+
+        highest = std::max(highest, quantity + COVENANT_RENOWN_LEVEL_OFFSET);
+    }
+
+    return highest;
+}
+
+uint32 Player::GetMaxCovenantRenownLevel()
+{
+    // Read the cap rather than hardcode it. Renown is stored as a currency quantity with level = quantity + 1, and
+    // CurrencyTypes 1829-1832 (and the 1822 display mirror) all publish MaxQty 79 through the shared
+    // MaxQtyWorldStateID 19735, i.e. Renown 80 - which is also exactly the highest level RenownRewards.db2 defines
+    // for covenants 1-4. Falls back to the RenownRewards ceiling if the currency ever stops publishing a cap.
+    if (CurrencyTypesEntry const* currency = GetCovenantRenownCurrency(1))
+        if (currency->MaxQty)
+            return currency->MaxQty + COVENANT_RENOWN_LEVEL_OFFSET;
+
+    return 0;
+}
+
+bool Player::IsCovenantSwitchUnlocked() const
+{
+    // The 9.1.5 rule, and only that rule: covenant switching becomes free and unpenalised once ANY covenant has
+    // been taken to maximum renown. The launch-era model (a re-join quest chain, a lockout and a renown penalty)
+    // is deliberately NOT implemented - none of its numbers are published anywhere in the 12.0.7.68275 client
+    // data, so building it would mean inventing them.
+    uint32 const required = GetMaxCovenantRenownLevel();
+    if (!required)
+        return false;
+
+    return GetHighestCovenantRenownLevel() >= required;
+}
+
+bool Player::CanChangeCovenant() const
+{
+    // A character that never pledged is not switching, it is joining. "Never pledged" has to mean never, not
+    // merely "has none right now": spell 338503 "Reset Covenant" sets the covenant to 0, and treating the result
+    // as a first-time joiner would turn reset-then-rejoin into a free switch that skips the renown gate entirely.
+    // HasEverJoinedAnyCovenant() is remembered per covenant on the way out, so it survives the reset.
+    if (!m_activeCovenantId)
+        return !HasEverJoinedAnyCovenant() || IsCovenantSwitchUnlocked();
+
+    return IsCovenantSwitchUnlocked();
+}
+
+void Player::SyncCovenantRenownDisplayCurrency()
+{
+    if (!sCurrencyTypesStore.LookupEntry(CURRENCY_TYPE_COVENANT_RENOWN))
+        return;
+
+    // The per-covenant currency is the authority; 1822 is a view of it. A character with no covenant has no
+    // renown, so the view goes to zero - covenant PlayerConditions test 1822 without also testing CovenantID,
+    // and a stale display value would satisfy them.
+    uint32 target = 0;
+    if (CurrencyTypesEntry const* covenantCurrency = GetCovenantRenownCurrency(m_activeCovenantId))
+        target = GetCurrencyQuantity(covenantCurrency->ID);
+
+    int32 delta = int32(target) - int32(GetCurrencyQuantity(CURRENCY_TYPE_COVENANT_RENOWN));
+    if (!delta)
+        return;
+
+    // 1822 shares MaxQtyWorldStateID 19735 with the per-covenant currencies, so ModifyCurrency's cap clamp can
+    // never make the view disagree with the track it views. On a covenant switch the view moves down to the
+    // newly-active covenant's own (independently stored) renown - hence FactionConversion as the reason.
+    ModifyCurrency(CURRENCY_TYPE_COVENANT_RENOWN, delta, CurrencyGainSource::RenownRepGain,
+        CurrencyDestroyReason::FactionConversion);
+}
+
+bool Player::IsCovenantRenownCatchupActive() const
+{
+    // Accelerated renown catch-up is NOT implemented, so the honest answer is "no".
+    //
+    // Retail gated renown gains by calendar week and boosted gains for a character below the account's
+    // renown high-water mark. Neither the weekly schedule nor the boost rate is published anywhere in the
+    // 12.0.7.68275 client data - CurrencyTypes 1822/1829-1832 all have MaxEarnablePerWeek = 0, and the only
+    // two ModifierTree rows of type RenownCatchupActive/RapidRenownCatchupActive (167897/167898) carry no
+    // assets - so there is nothing to derive the mechanic from. Reporting true here would promise the client's
+    // renown UI a bonus the server never pays, so it stays false until real accelerated gains exist.
+    return false;
+}
+
+namespace
+{
+// The four Shadowlands covenants store their reservoir anima the same way they store their renown: in a
+// per-covenant currency, with a shared display currency mirroring the active one.
+//
+//   1859 Reservoir Anima-Kyrian / 1860 -Venthyr / 1861 -Night Fae / 1862 -Necrolord
+//
+// All four carry AwardConditionID 70101-70104 (the same "CovenantID == n" PlayerConditions the renown family
+// uses) and the same MaxQty 200000 as the shared 1813, which is what makes the mirror safe: the view can never
+// clamp differently from the track it views. The order below is covenant id order and is asserted against the
+// AwardConditionID mapping rather than assumed - see GetCovenantAnimaCurrency.
+constexpr std::array<uint32, 4> CovenantAnimaCurrencies = { 1859, 1860, 1861, 1862 };
+
+// Covenant Callings.
+//
+// Three numbers govern the board, and all three are read off the 12.0.7.68275 client rather than assumed:
+//
+//  * MaxSlots = 3. CovenantCallingsConstants.Callings.MaxCallings = 3 (Blizzard_APIDocumentationGenerated/
+//    CovenantCallingsConstantsDocumentation.lua). The client iterates exactly 1..MaxCallings over the id list
+//    this server sends and treats a missing entry as "already done today" (CovenantCallingMixin:Init sets
+//    isLockedToday when its bounty is nil).
+//
+//  * One new calling per daily reset. CovenantCallingsMixin:GetDaysUntilNext returns
+//    "index - firstLockedIndex + 1" for a locked slot, i.e. the first empty slot refills in 1 day, the second
+//    in 2 and the third in 3 (the matching BOUNTY_BOARD_NO_CALLINGS_DAYS_1/2/3 strings exist). A board emptied
+//    by completing all three therefore comes back one calling at a time, not all at once.
+//
+//  * Three days of offer life. That is the same statement seen from the other side: a full board refills over
+//    exactly three resets, so an untaken calling can be at most three resets old. It is the only one of the
+//    three that has no single line of client data naming it, and it is what makes 1-per-day and 3-concurrent
+//    consistent instead of contradictory.
+//
+// A completed calling frees its slot immediately and the slot refills at the NEXT reset (the 1-day rule).
+// An expired calling frees its slot at a reset boundary and refills in the SAME pass, so a board nobody
+// touches stays full at three rather than flickering empty for a day.
+namespace CovenantCallings
+{
+    constexpr uint8 MaxSlots = 3;
+    constexpr time_t OfferDuration = 3 * DAY;
+}
+}
+
+CurrencyTypesEntry const* Player::GetCovenantAnimaCurrency(uint32 covenantId)
+{
+    // Only the four Shadowlands covenants have an anima track; Covenant.db2 rows 12+ (the Dragonflight and
+    // later major factions) reuse the table for renown only and must not be given one.
+    if (!covenantId || covenantId > CovenantAnimaCurrencies.size())
+        return nullptr;
+
+    if (!sCovenantStore.LookupEntry(covenantId))
+        return nullptr;
+
+    return sCurrencyTypesStore.LookupEntry(CovenantAnimaCurrencies[covenantId - 1]);
+}
+
+uint32 Player::GetCovenantIdForAnimaCurrency(uint32 currencyId)
+{
+    if (!currencyId)
+        return 0;
+
+    for (std::size_t i = 0; i < CovenantAnimaCurrencies.size(); ++i)
+        if (CovenantAnimaCurrencies[i] == currencyId)
+            return uint32(i) + 1;
+
+    return 0;
+}
+
+void Player::SyncCovenantAnimaDisplayCurrency()
+{
+    if (!sCurrencyTypesStore.LookupEntry(CURRENCY_TYPE_RESERVOIR_ANIMA))
+        return;
+
+    CurrencyTypesEntry const* covenantCurrency = GetCovenantAnimaCurrency(m_activeCovenantId);
+    if (!covenantCurrency)
+    {
+        // No covenant, no track to mirror. The view is deliberately LEFT ALONE rather than zeroed: a character
+        // that banked reservoir anima before it was covenant-scoped (or before it joined at all) holds that
+        // balance only on 1813, and zeroing the view here would be the only place in this system that can
+        // destroy a balance. It is handed to a track by MigrateLegacyReservoirAnima the moment one exists.
+        return;
+    }
+
+    // The per-covenant currency is the authority; 1813 is a view of it. Repointing the view at a switch is safe
+    // because the invariant "view == active track" holds at all times while a covenant is active - see
+    // Player::CurrencyChanged, which forwards every change on the view into the track in both directions. So the
+    // outgoing covenant's balance is already banked on its own currency before the view moves off it.
+    int32 delta = int32(GetCurrencyQuantity(covenantCurrency->ID)) - int32(GetCurrencyQuantity(CURRENCY_TYPE_RESERVOIR_ANIMA));
+    if (!delta)
+        return;
+
+    ModifyCurrency(CURRENCY_TYPE_RESERVOIR_ANIMA, delta, CurrencyGainSource::Vendor,
+        CurrencyDestroyReason::FactionConversion);
+}
+
+void Player::MigrateLegacyReservoirAnima()
+{
+    // One-shot repair for characters whose reservoir anima predates covenant scoping: everything that ever
+    // grants anima targets 1813 (SPELL_EFFECT_GIVE_CURRENCY 166 - nothing in the build targets 1859-1862), so
+    // such a character has a balance on the view and nothing on its track.
+    //
+    // It is safe to run on every login because it can only ever move anima ONTO the track, and it self-disables:
+    // once the view and the track agree there is nothing to move, and the invariant maintained by CurrencyChanged
+    // keeps them in agreement from then on. It must run BEFORE the first SyncCovenantAnimaDisplayCurrency of the
+    // session, which repoints the view at the track.
+    CurrencyTypesEntry const* covenantCurrency = GetCovenantAnimaCurrency(m_activeCovenantId);
+    if (!covenantCurrency)
+        return;
+
+    int32 unbanked = int32(GetCurrencyQuantity(CURRENCY_TYPE_RESERVOIR_ANIMA))
+        - int32(GetCurrencyQuantity(covenantCurrency->ID));
+    if (unbanked > 0)
+        ModifyCurrency(covenantCurrency->ID, unbanked, CurrencyGainSource::Vendor);
+}
+
+bool Player::AreCovenantCallingsUnlocked() const
+{
+    CovenantEntry const* covenant = m_activeCovenantId ? sCovenantStore.LookupEntry(m_activeCovenantId) : nullptr;
+    if (!covenant || covenant->BountySetID <= 0)
+        return false;
+
+    BountySetEntry const* bountySet = sBountySetStore.LookupEntry(uint32(covenant->BountySetID));
+    if (!bountySet)
+        return false;
+
+    // BountySet.VisiblePlayerConditionID is the real gate and the only one that works. Every covenant bounty set
+    // (111 Kyrian / 112 Venthyr / 113 Necrolord / 114 Night Fae) carries LockedQuestID = 0, so the LockedQuestID
+    // test this used to do could never refuse anything - callings unlocked the instant a character joined.
+    // The VisiblePlayerConditionID rows (84987/84989/84988/84990) each pin CovenantID plus the covenant campaign
+    // chapter that actually opens callings in retail (PrevQuestID 57559 "Choosing Your Purpose" + the covenant's
+    // own chapter quest, PrevQuestLogic 5).
+    //
+    // Note the pairing is taken from Covenant.BountySetID -> BountySet.VisiblePlayerConditionID and never from
+    // the numeric order of the ids: BountySet 113 belongs to covenant 4 (Necrolord) and 114 to covenant 3
+    // (Night Fae), and PlayerCondition 84988/84990 carry CovenantID 4/3 to match. Reading them in id order
+    // would gate two of the four covenants on another covenant's campaign.
+    if (bountySet->VisiblePlayerConditionID > 0
+        && !ConditionMgr::IsPlayerMeetingCondition(this, uint32(bountySet->VisiblePlayerConditionID)))
+        return false;
+
+    return true;
+}
+
+uint32 Player::RollCovenantCalling(uint32 covenantId, uint8 slot, time_t issueTime) const
+{
+    CovenantEntry const* covenant = sCovenantStore.LookupEntry(covenantId);
+    if (!covenant || covenant->BountySetID <= 0)
+        return 0;
+
+    std::vector<BountyEntry const*> const* bounties = sDB2Manager.GetBountiesForBountySet(covenant->BountySetID);
+    if (!bounties)
+        return 0;
+
+    std::vector<BountyEntry const*> eligible;
+    eligible.reserve(bounties->size());
+    for (BountyEntry const* bounty : *bounties)
+    {
+        if (bounty->QuestID <= 0)
+            continue;
+
+        // Never offer the same calling twice at once.
+        bool alreadyOffered = false;
+        if (std::vector<CovenantCallingSlot> const* slots = Trinity::Containers::MapGetValuePtr(m_covenantCallings, covenantId))
+            for (CovenantCallingSlot const& existing : *slots)
+                if (existing.BountyID == bounty->ID)
+                    alreadyOffered = true;
+
+        if (alreadyOffered)
+            continue;
+
+        // Nor one the character is already carrying or has already completed in this daily period - the client
+        // would render it as an offer it can neither accept nor turn in.
+        if (GetQuestStatus(uint32(bounty->QuestID)) != QUEST_STATUS_NONE || IsDailyQuestDone(uint32(bounty->QuestID)))
+            continue;
+
+        // Bounty.TurninPlayerConditionID gates whether the bounty's turn-in is possible at all. It is honoured
+        // here for completeness, but note that it is 0 on all 96 covenant Bounty rows in 12.0.7.68275 (only 7
+        // rows in the whole table carry one, and they are Legion/BfA emissaries), so this can never fire for a
+        // covenant today. It is kept because the field is the plan's stated gate and costs nothing.
+        if (bounty->TurninPlayerConditionID > 0
+            && !ConditionMgr::IsPlayerMeetingCondition(this, uint32(bounty->TurninPlayerConditionID)))
+            continue;
+
+        eligible.push_back(bounty);
+    }
+
+    if (eligible.empty())
+        return 0;
+
+    std::sort(eligible.begin(), eligible.end(), [](BountyEntry const* left, BountyEntry const* right)
+    {
+        return left->ID < right->ID;
+    });
+
+    // Deterministic rather than random: the same character, slot and issue boundary must always produce the
+    // same calling. The issue stamp is a daily-reset boundary, so the pick is stable for the whole day and a
+    // server restart mid-day cannot hand the player a different board than the one they were already looking at.
+    uint64 seed = GetGUID().GetCounter();
+    seed = seed * 1099511628211ull + uint64(issueTime);
+    seed = seed * 1099511628211ull + uint64(slot);
+    seed = seed * 1099511628211ull + uint64(covenantId);
+    seed ^= seed >> 29;
+
+    return eligible[seed % eligible.size()]->ID;
+}
+
+void Player::UpdateCovenantCallings()
+{
+    uint32 const covenantId = m_activeCovenantId;
+    if (!covenantId)
+        return;
+
+    if (!AreCovenantCallingsUnlocked())
+        return;
+
+    time_t const now = GameTime::GetGameTime();
+    // The daily reset boundary that is currently in force. Anchoring every timestamp on it is what makes the
+    // board roll over exactly at reset instead of drifting to whenever the player happened to log in.
+    time_t const lastReset = sWorld->GetNextDailyQuestsResetTime() - DAY;
+    time_t const nextReset = sWorld->GetNextDailyQuestsResetTime();
+
+    std::vector<CovenantCallingSlot>& slots = m_covenantCallings[covenantId];
+
+    // A board that has never existed starts with every slot due at the current reset, so a character that has
+    // just unlocked callings sees a full board of three rather than one calling and a two-day wait. This is the
+    // steady state of the three rules above (issue one per reset, keep three, three-day life), just entered at
+    // once instead of over three days.
+    if (slots.empty())
+    {
+        slots.resize(CovenantCallings::MaxSlots);
+        for (CovenantCallingSlot& slot : slots)
+            slot.RefillTime = lastReset;
+
+        m_covenantCallingsChanged = true;
+    }
+    else if (slots.size() < CovenantCallings::MaxSlots)
+    {
+        // Defensive: a partially-written board (a truncated row set) is topped up rather than left short.
+        while (slots.size() < CovenantCallings::MaxSlots)
+            slots.push_back(CovenantCallingSlot{ 0, 0, lastReset });
+
+        m_covenantCallingsChanged = true;
+    }
+
+    // 1. Expire. An offer that has run out frees its slot and becomes due immediately: its expiry is itself a
+    //    reset boundary, so "immediately" means "at this reset", and the replacement is issued in step 3 below.
+    for (CovenantCallingSlot& slot : slots)
+    {
+        if (!slot.BountyID || slot.ExpireTime > now)
+            continue;
+
+        slot.BountyID = 0;
+        slot.RefillTime = slot.ExpireTime;
+        slot.ExpireTime = 0;
+        m_covenantCallingsChanged = true;
+    }
+
+    // 2. Schedule any slot that was freed without a refill date (a completed calling). Pending slots queue up
+    //    behind whatever is already scheduled, one per reset - which is exactly the 1/2/3-day countdown the
+    //    client renders from GetDaysUntilNext.
+    {
+        time_t cursor = lastReset;
+        for (CovenantCallingSlot const& slot : slots)
+            if (!slot.BountyID && slot.RefillTime > cursor)
+                cursor = slot.RefillTime;
+
+        for (CovenantCallingSlot& slot : slots)
+        {
+            if (slot.BountyID || slot.RefillTime)
+                continue;
+
+            cursor += DAY;
+            slot.RefillTime = cursor;
+            m_covenantCallingsChanged = true;
+        }
+    }
+
+    // 3. Issue. Every slot whose refill boundary has passed gets a calling, so a character who was offline for
+    //    three days comes back to a full board instead of losing the days they were away. The offer is stamped
+    //    with the boundary it was due at, not with "now", which keeps expiry on reset boundaries.
+    for (uint8 i = 0; i < slots.size(); ++i)
+    {
+        CovenantCallingSlot& slot = slots[i];
+        if (slot.BountyID || !slot.RefillTime || slot.RefillTime > now)
+            continue;
+
+        uint32 const bountyId = RollCovenantCalling(covenantId, i, slot.RefillTime);
+        if (!bountyId)
+            continue;   // pool exhausted for now; the slot stays due and is retried on the next pass
+
+        slot.BountyID = bountyId;
+        slot.ExpireTime = slot.RefillTime + CovenantCallings::OfferDuration;
+        slot.RefillTime = 0;
+        m_covenantCallingsChanged = true;
+
+        // An offer issued at a boundary already more than OfferDuration in the past would be born expired
+        // (a character offline for a week). Give it the current period instead of a dead slot.
+        if (slot.ExpireTime <= now)
+            slot.ExpireTime = nextReset + CovenantCallings::OfferDuration - DAY;
+    }
+}
+
+std::vector<int32> Player::GetCovenantCallingBountyIDs() const
+{
+    std::vector<int32> bountyIds;
+
+    std::vector<CovenantCallingSlot> const* slots = Trinity::Containers::MapGetValuePtr(m_covenantCallings, m_activeCovenantId);
+    if (!slots)
+        return bountyIds;
+
+    // Slot order matters: the client indexes the list 1..MaxCallings and treats every index past the end as a
+    // calling already dealt with today, which is precisely what an empty slot means.
+    bountyIds.reserve(slots->size());
+    for (CovenantCallingSlot const& slot : *slots)
+        if (slot.BountyID)
+            bountyIds.push_back(int32(slot.BountyID));
+
+    return bountyIds;
+}
+
+void Player::SendCovenantCallingsUpdate()
+{
+    WorldPackets::Covenant::CovenantCallingsAvailabilityResponse response;
+    response.CallingsUnlocked = AreCovenantCallingsUnlocked();
+    if (response.CallingsUnlocked)
+        response.BountyIDs = GetCovenantCallingBountyIDs();
+
+    SendDirectMessage(response.Write());
+}
+
+void Player::OnCovenantCallingCompleted(uint32 questId)
+{
+    std::vector<CovenantCallingSlot>* slots = Trinity::Containers::MapGetValuePtr(m_covenantCallings, m_activeCovenantId);
+    if (!slots)
+        return;
+
+    bool freed = false;
+    for (CovenantCallingSlot& slot : *slots)
+    {
+        if (!slot.BountyID)
+            continue;
+
+        BountyEntry const* bounty = sBountyStore.LookupEntry(slot.BountyID);
+        if (!bounty || uint32(bounty->QuestID) != questId)
+            continue;
+
+        // Freed with no refill date: UpdateCovenantCallings schedules it for the next reset, so a completed
+        // calling is replaced tomorrow rather than sitting out the rest of its three-day offer window.
+        slot.BountyID = 0;
+        slot.ExpireTime = 0;
+        slot.RefillTime = 0;
+        freed = true;
+    }
+
+    if (!freed)
+        return;
+
+    m_covenantCallingsChanged = true;
+    UpdateCovenantCallings();
+    SendCovenantCallingsUpdate();
+}
+
+void Player::_LoadCovenantCallings(PreparedQueryResult result)
+{
+    if (!result)
+        return;
+
+    do
+    {
+        Field* fields = result->Fetch();
+
+        uint32 const covenantId = fields[0].GetUInt32();
+        uint8 const slotIndex = fields[1].GetUInt8();
+        if (!covenantId || slotIndex >= CovenantCallings::MaxSlots)
+            continue;
+
+        std::vector<CovenantCallingSlot>& slots = m_covenantCallings[covenantId];
+        if (slots.empty())
+            slots.resize(CovenantCallings::MaxSlots);
+
+        CovenantCallingSlot& slot = slots[slotIndex];
+        slot.BountyID = fields[2].GetUInt32();
+        slot.ExpireTime = fields[3].GetInt64();
+        slot.RefillTime = fields[4].GetInt64();
+
+        // A bounty that no longer exists in DB2 (a build change) must not keep its slot hostage.
+        if (slot.BountyID && !sBountyStore.LookupEntry(slot.BountyID))
+        {
+            slot.BountyID = 0;
+            slot.ExpireTime = 0;
+            slot.RefillTime = 0;
+            m_covenantCallingsChanged = true;
+        }
+    } while (result->NextRow());
+}
+
+void Player::_SaveCovenantCallings(CharacterDatabaseTransaction trans)
+{
+    if (!m_covenantCallingsChanged)
+        return;
+
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_COVENANT_CALLINGS);
+    stmt->setUInt64(0, GetGUID().GetCounter());
+    trans->Append(stmt);
+
+    for (auto const& [covenantId, slots] : m_covenantCallings)
+    {
+        for (uint8 i = 0; i < slots.size(); ++i)
+        {
+            CovenantCallingSlot const& slot = slots[i];
+            if (!slot.BountyID && !slot.RefillTime)
+                continue;   // a slot with nothing to remember costs nothing to forget
+
+            stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHARACTER_COVENANT_CALLINGS);
+            stmt->setUInt64(0, GetGUID().GetCounter());
+            stmt->setUInt32(1, covenantId);
+            stmt->setUInt8(2, i);
+            stmt->setUInt32(3, slot.BountyID);
+            stmt->setInt64(4, slot.ExpireTime);
+            stmt->setInt64(5, slot.RefillTime);
+            trans->Append(stmt);
+        }
+    }
+
+    m_covenantCallingsChanged = false;
+}
+
 void Player::GrantRenownReward(RenownRewardsEntry const* reward)
 {
     if (!reward)
+        return;
+
+    // RenownRewards rows can carry an eligibility gate, and it is load-bearing rather than cosmetic: the
+    // Renown 48 batch is twelve rows per covenant, one per class (PlayerCondition 39985/39986/39987/40073/
+    // 42230/42788-42794 are pure ClassMask conditions), and the two Kyrian Renown 4 companions 1270/1271 are
+    // gated on the campaign quests 60294/60293 (PlayerCondition 85540/85541). Ungated, every character would
+    // receive all twelve class items and both companions.
+    if (reward->PlayerConditionID > 0 && !ConditionMgr::IsPlayerMeetingCondition(this, uint32(reward->PlayerConditionID)))
         return;
 
     if (reward->SpellID > 0)
@@ -21803,11 +22886,28 @@ void Player::GrantRenownReward(RenownRewardsEntry const* reward)
         GetSession()->GetCollectionMgr()->AddTransmogSet(uint32(reward->TransmogSetID));
 
     if (reward->GarrFollowerID > 0)
-        if (Garrison* garrison = GetGarrison())
-            garrison->AddFollower(uint32(reward->GarrFollowerID));
+    {
+        // Route to the follower's own garrison type. The no-arg GetGarrison() is the WoD garrison (type 2), and
+        // all 37 GarrFollowerID rewards of covenants 1-4 are GarrTypeID 111 (the covenant sanctum), so this
+        // grant silently did nothing for every covenant companion - the same failure class already fixed in
+        // Spell::EffectAddGarrisonFollower.
+        GarrisonType garrType = GARRISON_TYPE_GARRISON;
+        if (GarrFollowerEntry const* followerEntry = sGarrFollowerStore.LookupEntry(uint32(reward->GarrFollowerID)))
+            garrType = GarrisonType(followerEntry->GarrTypeID);
 
-    // Remaining RenownRewards fields with no clean single-call grant path (follow-up): TransmogIllusionID (no
-    // CollectionMgr add-illusion API) and QuestID (reward-quest grant semantics need confirmation).
+        if (Garrison* garrison = GetGarrison(garrType))
+            garrison->AddFollower(uint32(reward->GarrFollowerID));
+    }
+
+    if (reward->TransmogIllusionID > 0)
+        if (sTransmogIllusionStore.LookupEntry(uint32(reward->TransmogIllusionID)))
+            GetSession()->GetCollectionMgr()->AddTransmogIllusion(uint32(reward->TransmogIllusionID));
+
+    // RenownRewards.QuestID is deliberately NOT granted. It is not a reward quest: 424 of the 511 covenant rows
+    // carry one, and the same id repeats across unrelated rows of the same covenant (e.g. Kyrian 64508 appears
+    // on the Renown 1, 4, 5 and 6 rows, which award nothing, a companion, a campaign milestone and a transmog
+    // respectively). It reads as the quest the UI links the row to, not something to hand out; pushing 424
+    // quests at a character would be destructive. Left until the field's meaning is confirmed in-game.
 }
 
 void Player::UpdateRenownRewards(FactionEntry const* renownFaction)
@@ -21833,7 +22933,34 @@ void Player::UpdateRenownRewards(FactionEntry const* renownFaction)
     if (!covenantId)
         return;
 
-    int32 currentLevel = GetReputationMgr().GetRenownLevel(renownFaction);
+    GrantRenownRewardsUpTo(covenantId, GetReputationMgr().GetRenownLevel(renownFaction));
+}
+
+void Player::UpdateCovenantRenownRewards(uint32 covenantId)
+{
+    // Same in-world guard as the reputation path: never grant items mid-load. A character that already holds
+    // renown is caught up by UpdateAllRenownRewards() once it is in world.
+    if (!IsInWorld())
+        return;
+
+    CurrencyTypesEntry const* currency = GetCovenantRenownCurrency(covenantId);
+    if (!currency)
+        return;
+
+    // A covenant the character never joined has no renown, and quantity 0 would otherwise read as Renown 1 and
+    // claim that level's rewards for all four covenants at once. The active covenant is always walked, because
+    // a fresh member legitimately sits at quantity 0 / Renown 1.
+    if (covenantId != m_activeCovenantId && !GetCurrencyQuantity(currency->ID))
+        return;
+
+    GrantRenownRewardsUpTo(covenantId, int32(GetCovenantRenownLevel(covenantId)));
+}
+
+void Player::GrantRenownRewardsUpTo(uint32 covenantId, int32 currentLevel)
+{
+    if (!covenantId || currentLevel <= 0)
+        return;
+
     uint32& granted = m_renownRewardsGranted[covenantId];
     if (int32(granted) >= currentLevel)
         return;
@@ -21854,9 +22981,25 @@ void Player::UpdateRenownRewards(FactionEntry const* renownFaction)
 
 void Player::UpdateAllRenownRewards()
 {
+    // Reputation-driven renown (Dragonflight and later major factions).
     for (CovenantEntry const* covenant : sCovenantStore)
         if (FactionEntry const* faction = sFactionStore.LookupEntry(uint32(covenant->FactionID)))
             UpdateRenownRewards(faction);
+
+    // Currency-driven renown (the four Shadowlands covenants). Every covenant is walked, not just the active
+    // one: the per-covenant currencies 1829-1832 persist independently, so a character that switched covenants
+    // still owns - and is still owed the rewards of - its other tracks.
+    for (CovenantEntry const* covenant : sCovenantStore)
+        UpdateCovenantRenownRewards(covenant->ID);
+
+    // 1822 is a display mirror of the active covenant's track and nothing writes it directly; refresh it once
+    // the character is in world so the renown UI and the renown PlayerConditions see the right value on login.
+    SyncCovenantRenownDisplayCurrency();
+
+    // Same for the reservoir anima view (1813), but bank any pre-covenant-scoping balance onto the track first
+    // so that repointing the view cannot cost anybody the anima they had.
+    MigrateLegacyReservoirAnima();
+    SyncCovenantAnimaDisplayCurrency();
 }
 
 void Player::ActivateSoulbind(SoulbindEntry const* soulbind)
@@ -21864,13 +23007,18 @@ void Player::ActivateSoulbind(SoulbindEntry const* soulbind)
     if (!soulbind)
         return;
 
-    // Switching soulbinds changes the active tree, so strip the previously-applied conduit spells first.
+    // Switching soulbinds changes the active tree, so strip the previously-applied conduit spells and trait perks
+    // first - both are scoped to the tree that is about to stop being active.
     RemoveConduitSpells();
+    RemoveSoulbindTraitSpells();
 
-    // Activating a soulbind implies membership in its covenant (there is no separate covenant-choice opcode in
-    // the client protocol), so keep the active covenant consistent with the chosen soulbind.
-    m_activeCovenantId = uint32(soulbind->CovenantID);
+    // The active covenant is NOT derived from the soulbind. It is set by the covenant-choice flow
+    // (SPELL_EFFECT_SET_COVENANT -> SetActiveCovenant). Deriving it here let any client free-switch covenant by
+    // simply activating a foreign covenant's soulbind; WorldSession::HandleActivateSoulbind now rejects a soulbind
+    // whose CovenantID does not match the player's, and this function no longer overwrites it.
     m_activeSoulbindId = soulbind->ID;
+
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData).ModifyValue(&UF::PlayerData::SoulbindID), int32(m_activeSoulbindId));
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_CHARACTER_COVENANT);
     stmt->setUInt64(0, GetGUID().GetCounter());
@@ -21878,26 +23026,177 @@ void Player::ActivateSoulbind(SoulbindEntry const* soulbind)
     stmt->setUInt32(2, m_activeSoulbindId);
     CharacterDatabase.Execute(stmt);
 
-    // Re-apply the conduits socketed into the newly-active soulbind's tree.
+    // Re-apply the conduits socketed into, and the trait nodes taken in, the newly-active soulbind's tree.
     ApplyConduitSpells();
+    ApplySoulbindTraitSpells();
 }
 
+void Player::ApplyCovenantSkillLines()
+{
+    // Covenant membership is expressed to the lock system as a hidden SkillLine (Covenant.db2 SkillLineID:
+    // 2730 Kyrian / 2731 Venthyr / 2732 Night Fae / 2733 Necrolord). LOCKTYPE_COVENANT_* (157-160) resolve to
+    // those skills via SkillByLockType (SharedDefines.h) and Spell::CanOpenLock compares the player's skill value
+    // against Lock.db2's required value. The four covenant Lock rows (3285-3288) all require 300, and the skill
+    // lines have no SkillTiers cap (SkillRaceClassInfo.SkillTierID = 0), so membership grants exactly 300.
+    constexpr uint16 CovenantSkillValue = 300;
+
+    for (CovenantEntry const* covenant : sCovenantStore)
+    {
+        if (covenant->SkillLineID <= 0)
+            continue;
+
+        bool const isActive = covenant->ID == m_activeCovenantId;
+        uint16 const value = isActive ? CovenantSkillValue : 0;
+
+        // Skip no-op writes so this stays cheap and idempotent (it runs on every load and covenant set).
+        if (GetPureSkillValue(uint32(covenant->SkillLineID)) == value)
+            continue;
+
+        SetSkill(uint32(covenant->SkillLineID), 0, value, value);
+    }
+}
+
+// Join, switch or leave a covenant. SPELL_EFFECT_SET_COVENANT is the only way in:
+//
+//   299204/299205/299206/299207 "<Covenant> Covenant"  -> MiscValue 1/2/3/4, the pledge
+//   338503                      "Reset Covenant"        -> MiscValue 0, plus SPELL_EFFECT_QUEST_FAIL on all four
+//                                                          covenant-choice quests 56066-56069 and the two phase
+//                                                          refresh effects (167/170). That is the whole retail
+//                                                          reset mechanism, read straight off the client data.
+//
+// NOTHING HERE DESTROYS COVENANT-SCOPED STATE. A switch is a change of which covenant is being SERVED, not a
+// wipe of the one being left:
+//
+//   kept  - renown (per-covenant currencies 1829-1832) and the granted-reward high-water mark
+//           (character_covenant_renown), reservoir anima (1859-1862) and redeemed souls (1863-1866),
+//           every researched sanctum/ability/soulbind talent (character_garrison_talents; every covenant-scoped
+//           GarrTalentTree names its owner in FeatureSubtypeIndex, so the four covenants own disjoint rows),
+//           the sanctum garrison itself with all of its companions, missions and shipments, the conduit
+//           collection and its sockets, and each covenant's calling board.
+//   moved  - the 1822 renown and 1813 anima DISPLAY currencies, which are views of the active covenant's track.
+//   scoped - the covenant SkillLine, the GarrTalentRank.PerkSpellID perks of covenant-scoped trees, the active
+//            soulbind and the conduit/trait auras that hang off it. All of these come back on return.
 void Player::SetActiveCovenant(uint32 covenantId)
 {
-    // Blizzlike join order is: choose covenant (this) -> then its soulbinds unlock. Driven by
-    // SPELL_EFFECT_SET_COVENANT (the covenant-choice quest's reward spell); there is no covenant opcode.
-    // Unlike ActivateSoulbind (which implies the covenant), this sets the covenant WITHOUT touching the
-    // active soulbind, so a player can join before picking a soulbind.
-    if (m_activeCovenantId == covenantId)
-        return;
+    uint32 const previousCovenantId = m_activeCovenantId;
+    bool const changed = previousCovenantId != covenantId;
+
+    if (changed && previousCovenantId)
+    {
+        // ---- leave the covenant being served -------------------------------------------------------------
+        // Remember which soulbind it was using so returning restores it (and with it the conduits socketed into
+        // that tree and its trait nodes, none of which are touched here).
+        RememberCovenantSoulbind(previousCovenantId, m_activeSoulbindId);
+
+        // Bank anything sitting unspent on the 1813 view onto the covenant that earned it BEFORE the view is
+        // repointed, then empty the view. This is the one ordering that matters in the whole function: the view is
+        // about to stop describing this covenant, and everything in the build that grants anima grants it on the
+        // view. Emptying it is what makes the banking safe rather than duplicating - the balance now lives only on
+        // 1859-1862, and without this step the next join would read the leftover view as anima the INCOMING
+        // covenant had not banked yet and hand it a free copy of the outgoing covenant's reservoir.
+        MigrateLegacyReservoirAnima();
+        if (int32 viewQuantity = int32(GetCurrencyQuantity(CURRENCY_TYPE_RESERVOIR_ANIMA)))
+        {
+            // Under the mirror latch, and that is not optional: this covenant is still the active one, so without
+            // it Player::CurrencyChanged would faithfully forward the emptying of the view onto 1859-1862 and wipe
+            // the very balance the line above just banked. The latch is exactly the "the caller owns this
+            // reconciliation" flag the anima mirror already uses internally.
+            m_covenantAnimaSyncing = true;
+            ModifyCurrency(CURRENCY_TYPE_RESERVOIR_ANIMA, -viewQuantity, CurrencyGainSource::Vendor,
+                CurrencyDestroyReason::FactionConversion);
+            m_covenantAnimaSyncing = false;
+        }
+
+        // Take down the auras of the soulbind that is stopping being active. Their sources (sockets, trait rows)
+        // stay in the database.
+        RemoveConduitSpells();
+        RemoveSoulbindTraitSpells();
+
+        m_activeSoulbindId = 0;
+        SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData).ModifyValue(&UF::PlayerData::SoulbindID), int32(0));
+    }
 
     m_activeCovenantId = covenantId;
 
-    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_CHARACTER_COVENANT);
-    stmt->setUInt64(0, GetGUID().GetCounter());
-    stmt->setUInt32(1, m_activeCovenantId);
-    stmt->setUInt32(2, m_activeSoulbindId);
-    CharacterDatabase.Execute(stmt);
+    // Replicate to the client (drives C_Covenants.GetActiveCovenantID, covenant PlayerConditions and criteria).
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData).ModifyValue(&UF::PlayerData::CovenantID), int32(m_activeCovenantId));
+
+    // Grant the joined covenant's SkillLine and strip the other three (idempotent). With covenantId 0 this strips
+    // all four, which is what closes the covenant-locked objects behind a character that left.
+    ApplyCovenantSkillLines();
+
+    if (changed)
+    {
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_CHARACTER_COVENANT);
+        stmt->setUInt64(0, GetGUID().GetCounter());
+        stmt->setUInt32(1, m_activeCovenantId);
+        stmt->setUInt32(2, m_activeSoulbindId);
+        CharacterDatabase.Execute(stmt);
+    }
+
+    // Joining a covenant grants the covenant sanctum (GarrType 111, GarrSite 296). It backs the Sanctum UI,
+    // sanctum research (GarrTalentTree rows with GarrTypeID 111) and Adventures, and SPELL_EFFECT_LEARN_GARR_TALENT
+    // silently no-ops without it. Guarded so it is created once and re-running the covenant choice is harmless.
+    // Leaving a covenant deliberately does NOT delete it: it holds the researched talents, the companions and the
+    // running missions of every covenant this character has served.
+    if (m_activeCovenantId && !GetGarrison(GARRISON_TYPE_COVENANT))
+        CreateGarrison(GARR_SITE_COVENANT_SANCTUM);
+
+    if (!changed)
+        return;
+
+    if (Garrison* sanctum = GetGarrison(GARRISON_TYPE_COVENANT))
+    {
+        // A covenant that is being returned to already owns its ability talents. One that is being joined for the
+        // first time as a SWITCH does not, and it never will: the class + signature abilities are handed out by
+        // the covenant campaign (quest reward spells 337187/337059/337191/337190 and 328604/320846/336692/337388
+        // -> SPELL_EFFECT_LEARN_GARR_TALENT), and a switcher does not run a second campaign. Seating the ability
+        // tree here is exactly what those grant spells do - all 14 talents of trees 393/396/397/395 are authored
+        // cost 0 / gold 0 / duration 0 with no prerequisites, and GarrTalentRank.PerkPlayerConditionID does the
+        // per-class filtering - so no spell id or ability id is assumed anywhere.
+        // A FIRST pledge is left alone: there the campaign is still ahead of the character and grants them itself.
+        if (m_activeCovenantId && HasEverJoinedAnyCovenant())
+            sanctum->GrantCovenantAbilityTalents(m_activeCovenantId);
+
+        // Strip the perks of every covenant-scoped tree that is no longer the active covenant's and (re)apply the
+        // active one's. The talent rows themselves are untouched, so this is fully reversible.
+        sanctum->RefreshCovenantTalentPerks();
+    }
+
+    if (m_activeCovenantId)
+    {
+        // Record the pledge (and, on a return, keep the remembered soulbind). This is also what makes the NEXT
+        // change to this covenant read as a switch rather than a first pledge.
+        RememberCovenantSoulbind(m_activeCovenantId, GetRememberedCovenantSoulbind(m_activeCovenantId));
+
+        // Restore the soulbind this covenant was last using. ActivateSoulbind re-applies its conduits and traits
+        // and persists the pair, so a returning member gets its whole soulbind back in one step.
+        if (uint32 rememberedSoulbind = GetRememberedCovenantSoulbind(m_activeCovenantId))
+            if (SoulbindEntry const* soulbind = sSoulbindStore.LookupEntry(rememberedSoulbind))
+                if (uint32(soulbind->CovenantID) == m_activeCovenantId)
+                    ActivateSoulbind(soulbind);
+    }
+
+    // Renown is per-covenant and never resets, so the joined covenant's own track becomes current: repoint
+    // the 1822 display mirror at it and hand over anything already earned there (a returning member keeps
+    // the renown it had). A brand-new member sits at currency 0, which is Renown 1. With no covenant the view
+    // goes to zero, because the renown PlayerConditions read 1822 without also testing CovenantID.
+    SyncCovenantRenownDisplayCurrency();
+    UpdateCovenantRenownRewards(m_activeCovenantId);
+
+    // Reservoir anima repoints the same way. The outgoing covenant's balance was banked above, so this hands the
+    // character its new covenant's own reservoir rather than a copy of the old one; the Migrate call picks up
+    // anything gained while the character was covenantless and banks it onto the covenant now being served.
+    MigrateLegacyReservoirAnima();
+    SyncCovenantAnimaDisplayCurrency();
+
+    // The calling board is per covenant too; seed/roll the new covenant's board and tell the client.
+    UpdateCovenantCallings();
+    SendCovenantCallingsUpdate();
+
+    // Covenant membership drives phases and CONDITION_COVENANT, and spell 338503 carries SPELL_EFFECT_UPDATE_
+    // PLAYER_PHASE (167) + SPELL_EFFECT_UPDATE_ZONE_AURAS_AND_PHASES (170) for exactly that reason.
+    PhasingHandler::OnConditionChange(this);
 }
 
 void Player::_LoadSoulbindConduits(PreparedQueryResult result)
@@ -22112,6 +23411,70 @@ void Player::RemoveConduitSpells()
         if (int32 spellId = GetConduitSpell(socket.first))
             RemoveAurasDueToSpell(uint32(spellId));
     }
+}
+
+// Walk the active soulbind's GarrTalentTree and apply/remove the PerkSpellID of every trait node the character has
+// already taken. Conduits are the sockets on that same tree (ApplyConduitSpells above); these are the non-socket
+// nodes, e.g. Pelagos (tree 357): 328266 Combat Meditation, 328261 Focusing Mantra, 329786 Road of Trials,
+// 329777 Phial of Patience, 328265, 328263, 328257, 351146, 351147, 351149.
+// Selecting one of these nodes is a free, instant GarrTalent (cost 0 / duration 0), so Garrison::LearnTalent puts it
+// straight at rank 1 - the point where its perk becomes live.
+template<typename Action>
+static void ForEachActiveSoulbindTraitPerk(Player* player, uint32 activeSoulbindId, Action action)
+{
+    SoulbindEntry const* soulbind = sSoulbindStore.LookupEntry(activeSoulbindId);
+    if (!soulbind)
+        return;
+
+    Garrison const* garrison = player->GetGarrison(GARRISON_TYPE_COVENANT);
+    if (!garrison)
+        return;
+
+    uint32 const treeId = uint32(soulbind->GarrTalentTreeID);
+    for (auto const& [garrTalentId, talent] : garrison->GetAllTalents())
+    {
+        if (talent.Rank < 1)
+            continue;
+
+        GarrTalentEntry const* talentEntry = sGarrTalentStore.LookupEntry(garrTalentId);
+        if (!talentEntry || talentEntry->GarrTalentTreeID != treeId)
+            continue;
+
+        std::vector<GarrTalentRankEntry const*> const* ranks = sGarrisonMgr.GetTalentRanksForTalent(garrTalentId);
+        if (!ranks)
+            continue;
+
+        int32 const last = std::min<int32>(talent.Rank, static_cast<int32>(ranks->size()));
+        for (int32 i = 0; i < last; ++i)
+            if ((*ranks)[i]->PerkSpellID > 0)
+                action(uint32((*ranks)[i]->PerkSpellID), (*ranks)[i]);
+    }
+}
+
+void Player::ApplySoulbindTraitSpells()
+{
+    ForEachActiveSoulbindTraitPerk(this, m_activeSoulbindId, [this](uint32 spellId, GarrTalentRankEntry const* rankEntry)
+    {
+        if (rankEntry->PerkPlayerConditionID > 0)
+            if (PlayerConditionEntry const* perkCondition = sPlayerConditionStore.LookupEntry(uint32(rankEntry->PerkPlayerConditionID)))
+                if (!ConditionMgr::IsPlayerMeetingCondition(this, perkCondition))
+                    return;
+
+        if (!sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE))
+            return;
+
+        if (!HasAura(spellId))
+            CastSpell(this, spellId, true);
+    });
+}
+
+void Player::RemoveSoulbindTraitSpells()
+{
+    // Unconditional: a perk condition that has stopped passing must not leave the aura stuck on the player.
+    ForEachActiveSoulbindTraitPerk(this, m_activeSoulbindId, [this](uint32 spellId, GarrTalentRankEntry const* /*rankEntry*/)
+    {
+        RemoveAurasDueToSpell(spellId);
+    });
 }
 
 /*********************************************************/
@@ -22478,8 +23841,8 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
     _SaveStoredAuraTeleportLocations(trans);
     m_achievementMgr->SaveAccountWideToDB(trans);
     m_achievementMgr->SaveToDB(trans);
-    m_reputationMgr->SaveToDB(trans);
     m_reputationMgr->SaveAccountWideToDB(trans);
+    m_reputationMgr->SaveToDB(trans);
     m_questObjectiveCriteriaMgr->SaveToDB(trans);
     m_perksActivityMgr->SaveToDB(trans);
     _SaveEquipmentSets(trans);
@@ -22494,6 +23857,7 @@ void Player::SaveToDB(LoginDatabaseTransaction loginTransaction, CharacterDataba
     for (auto const& h : _housings)
         if (h)
             h->SaveToDB(trans);
+    _SaveCovenantCallings(trans);
     for (auto const& [type, garrison] : _garrisons)
         garrison->SaveToDB(trans);
 
@@ -25110,8 +26474,13 @@ bool Player::ActivateTaxiPathTo(std::vector<uint32> const& nodes, Creature* npc 
     else
         mount_display_id = sObjectMgr->GetTaxiMountDisplayId(sourcenode, GetTeam(), npc == nullptr || (sourcenode == 315 && GetClass() == CLASS_DEATH_KNIGHT));
 
+    // Some nodes publish no MountCreatureID for either team - the covenant sanctum transport network nodes are
+    // the case in point: their TaxiPath rows are 4-node TAXI_PATH_NODE_FLAG_TELEPORT stubs at a single position,
+    // so there is nothing to be mounted on. A missing display is only an error when the node claims a mount.
+    bool const sourceNodeHasMount = node->MountCreatureID[0] != 0 || node->MountCreatureID[1] != 0;
+
     // in spell case allow 0 model
-    if ((mount_display_id == 0 && spellid == 0) || sourcepath == 0)
+    if ((mount_display_id == 0 && spellid == 0 && sourceNodeHasMount) || sourcepath == 0)
     {
         GetSession()->SendActivateTaxiReply(ERR_TAXIUNSPECIFIEDSERVERERROR);
         m_taxi.ClearTaxiDestinations();
@@ -26590,6 +27959,7 @@ void Player::SendInitialVisiblePackets(WorldObject* target) const
     if (Unit* targetUnit = target->ToUnit())
     {
         SendAurasForTarget(targetUnit);
+        targetUnit->SendResumeCastTo(this);
         if (targetUnit->IsAlive())
         {
             if (targetUnit->HasUnitState(UNIT_STATE_MELEE_ATTACKING) && targetUnit->GetVictim())
@@ -26783,7 +28153,24 @@ void Player::SetGroup(Group* group, int8 subgroup)
         m_group.setSubGroup((uint8)subgroup);
     }
 
+    // the incremental party state baseline only means anything to the group it was broadcast in
+    ResetPartyMemberState();
+
     UpdateObjectVisibility(false);
+}
+
+WorldPackets::Party::PartyMemberStatsSnapshot& Player::GetPartyMemberStateSnapshot()
+{
+    if (!m_partyMemberState)
+        m_partyMemberState = std::make_unique<WorldPackets::Party::PartyMemberStatsSnapshot>();
+
+    return *m_partyMemberState;
+}
+
+void Player::ResetPartyMemberState()
+{
+    m_partyMemberState.reset();
+    m_partyMemberStateRecipients.clear();
 }
 
 void Player::SendInitialPacketsBeforeAddToMap()
@@ -26885,6 +28272,8 @@ void Player::SendInitialPacketsBeforeAddToMap()
     m_reputationMgr->SendInitialReputations();
     /// SMSG_SETUP_CURRENCY
     SendCurrencies();
+    /// SMSG_REATTACH_RESURRECT - 12.x login sequence reattaches (or zeroes) pending resurrect state here
+    SendDirectMessage(WorldPackets::Misc::ReattachResurrect().Write());
     /// SMSG_EQUIPMENT_SET_LIST
     SendEquipmentSetList();
 
@@ -26974,6 +28363,7 @@ void Player::SendInitialPacketsBeforeAddToMap()
     SendDirectMessage(heirloomUpdate.Write());
 
     GetSession()->GetCollectionMgr()->SendFavoriteAppearances();
+    GetSession()->GetCollectionMgr()->SendFavoriteTransmogSets();
 
     // SMSG_ACCOUNT_WARBAND_SCENE_UPDATE
     WorldPackets::Misc::AccountWarbandSceneUpdate warbandSceneUpdate;
@@ -26985,9 +28375,12 @@ void Player::SendInitialPacketsBeforeAddToMap()
     initialSetup.ServerExpansionLevel = sWorld->getIntConfig(CONFIG_EXPANSION);
     SendDirectMessage(initialSetup.Write());
 
-    // Send Chromie Time state to client on login
-    if (m_activePlayerData->UiChromieTimeExpansionID != 0)
-        SendCtrOptions();
+    // Retail sends SMSG_SET_CTR_OPTIONS during login to every player regardless of chromie
+    // state (captures A/B/C: pulses appear in all 32 non-chromie sessions too - audit M4),
+    // and the first send of a session carries a default-empty Previous block
+    // ([ (0,0,0,[]), current ] - A rec 721 / B 485 / C 469, audit m2).
+    WorldPackets::Misc::CTROptionsBlock emptyPrevious;
+    SendCtrOptions(&emptyPrevious);
 
     // Account-wide bank lock: grant to this session if no other session for the same
     // Bnet account already holds it. Without this flag the client shows the
@@ -27201,6 +28594,11 @@ void Player::SendInitialPacketsAfterAddToMap()
 
     // Push the account-wide store front (catalogue + per-item ownership) once the player is in the world.
     GetSession()->SendAccountStoreFrontUpdate();
+    // Resynchronise the client's world elapsed timers for the map we just entered. This is what
+    // makes a mid-run zone-in (or a relog inside a running Mythic+ instance) show the dungeon timer
+    // at the correct elapsed value - previously the timer was only ever pushed once, at run start,
+    // so anyone who was not present at that moment saw nothing.
+    sElapsedTimerMgr->SendActiveTimers(this);
 }
 
 void Player::SendUpdateToOutOfRangeGroupMembers()
@@ -27223,6 +28621,26 @@ void Player::SendTransferAborted(uint32 mapid, TransferAbortReason reason, uint8
     transferAborted.TransfertAbort = reason;
     transferAborted.MapDifficultyXConditionID = mapDifficultyXConditionID;
     SendDirectMessage(transferAborted.Write());
+}
+
+void Player::SendPreloadWorld(int32 mapId, Position const& destination) const
+{
+    WorldPackets::Movement::PreloadWorld preloadWorld;
+    preloadWorld.MapID = mapId;
+    // Retail sends the player's current position with a zeroed facing, and expresses the
+    // destination as a delta from it - the client streams around Loc.Pos + MovementOffset.
+    preloadWorld.Loc.Pos = Position(GetPositionX(), GetPositionY(), GetPositionZ(), 0.0f);
+    preloadWorld.Reason = NEW_WORLD_SEAMLESS;
+    preloadWorld.MovementOffset = Position(destination.GetPositionX() - GetPositionX(),
+        destination.GetPositionY() - GetPositionY(), destination.GetPositionZ() - GetPositionZ());
+    SendDirectMessage(preloadWorld.Write());
+}
+
+void Player::SendCancelPreloadWorld(int32 mapId) const
+{
+    WorldPackets::Movement::CancelPreloadWorld cancelPreloadWorld;
+    cancelPreloadWorld.MapID = mapId;
+    SendDirectMessage(cancelPreloadWorld.Write());
 }
 
 void Player::ApplyEquipCooldown(Item* pItem)
@@ -27654,7 +29072,17 @@ void Player::DailyReset()
     m_lastDailyQuestTime = 0;
 
     for (auto const& [type, garrison] : _garrisons)
+    {
         garrison->ResetFollowerActivationLimit();
+        // An Anima Conductor channel bought with reservoir anima lasts until the daily reset (the client's own
+        // confirm dialog counts down C_DateAndTime.GetSecondsUntilDailyReset), so this is where it lapses.
+        garrison->ExpireTemporaryChannelAnima();
+    }
+
+    // One new calling per daily reset, and any offer that has run out of its three days lapses here.
+    UpdateCovenantCallings();
+    if (AreCovenantCallingsUnlocked())
+        SendCovenantCallingsUpdate();
 
     FailCriteria(CriteriaFailEvent::DailyQuestsCleared, 0);
 }
@@ -32618,6 +34046,36 @@ void Player::UpdateInitiativeFavor(uint32 favor)
         h.MapID = s.MapID;
         h.PlotID = s.PlotID;
     }
+}
+
+void Player::UpdateDungeonScore()
+{
+    // The client renders Mythic+ rating purely from these two update fields: the public roster summary
+    // (party frames / inspect) and the owner's full per-season score tree (the Mythic+ UI, score colors).
+    WorldPackets::MythicPlus::DungeonScoreSummary summary;
+    WorldPackets::MythicPlus::DungeonScoreData data;
+    if (MythicPlusData* mythicPlus = GetMythicPlusData())
+    {
+        mythicPlus->BuildDungeonScoreSummary(summary);
+        mythicPlus->BuildDungeonScoreData(data);
+    }
+
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_playerData).ModifyValue(&UF::PlayerData::DungeonScore), std::move(summary));
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::DungeonScore), std::move(data));
+}
+
+void Player::SetItemUpgradeWatermark(uint32 slot, float itemLevel)
+{
+    SetUpdateFieldValue(m_values.ModifyValue(&Player::m_activePlayerData).ModifyValue(&UF::ActivePlayerData::ItemUpgradeHighWatermark, slot), itemLevel);
+}
+
+Garrison* Player::GetGarrisonWithFollower(uint64 followerDbID) const
+{
+    for (auto const& [type, garrison] : _garrisons)
+        if (garrison->GetFollower(followerDbID))
+            return garrison.get();
+
+    return nullptr;
 }
 
 void Player::SendMovementSetCollisionHeight(float height, WorldPackets::Movement::UpdateCollisionHeightReason reason)

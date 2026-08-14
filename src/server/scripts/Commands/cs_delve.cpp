@@ -35,7 +35,9 @@ EndScriptData */
 #include "Language.h"
 #include "Player.h"
 #include "RBAC.h"
+#include "WeeklyRewardsMgr.h"
 #include "WorldSession.h"
+#include <array>
 
 using namespace Trinity::ChatCommands;
 
@@ -61,6 +63,7 @@ public:
             { "bountiful",  HandleDelveBountifulCommand,     rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
             { "progress",   HandleDelveProgressCommand,      rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
             { "settier",    HandleDelveSetTierCommand,       rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
+            { "complete",   HandleDelveCompleteCommand,      rbac::RBAC_PERM_COMMAND_DEBUG, Console::No },
             { "companion",  delveCompanionTable },
         };
 
@@ -117,7 +120,7 @@ public:
         if (Delves::DelveTemplate const* tmpl = sDelveMgr->GetDelveTemplate(player->GetMapId()))
         {
             handler->PSendSysMessage("Current map IS a delve: mapId={}, zoneId={}", tmpl->MapId, tmpl->ZoneId);
-            if (sDelveMgr->IsDelveCurrentlyBountiful(tmpl->MapChallengeModeId))
+            if (sDelveMgr->IsDelveCurrentlyBountiful(tmpl->Id))
                 handler->PSendSysMessage("  This delve is currently BOUNTIFUL");
         }
         else
@@ -179,8 +182,40 @@ public:
         handler->PSendSysMessage("Highest Tier This Week: {}", progress.HighestTierThisWeek);
         handler->PSendSysMessage("Weekly Bountiful: {}", progress.WeeklyBountifulCount);
         handler->PSendSysMessage("Weekly Coffer Shards: {}/{}", progress.WeeklyCofferShards, Delves::MAX_COFFER_KEY_SHARDS_PER_WEEK);
-        handler->PSendSysMessage("Great Vault Slots: {}", Delves::DelvesRewards::GetGreatVaultSlotCount(progress.WeeklyCompletions));
+        // Report the vault state the client will actually see, straight from the World activity row the delve
+        // completions credit (character-scoped, unlike the account-wide delve counters above).
+        WeeklyRewards::CharacterVault const& vault = sWeeklyRewardsMgr.GetVault(player->GetGUID());
+        WeeklyRewards::ActivityRow const& worldRow = vault.Rows[uint8(WeeklyRewards::ActivityType::World)];
+        std::array<uint32, 3> const& worldThresholds = WeeklyRewards::ThresholdsFor(WeeklyRewards::ActivityType::World);
 
+        uint8 earnedSlots = 0;
+        for (uint32 threshold : worldThresholds)
+            if (worldRow.Count >= threshold)
+                ++earnedSlots;
+
+        handler->PSendSysMessage("Great Vault (World row): {} completions, {}/{} slots earned (thresholds {}/{}/{})",
+            worldRow.Count, earnedSlots, worldThresholds.size(),
+            worldThresholds[0], worldThresholds[1], worldThresholds[2]);
+
+        return true;
+    }
+
+    // .delve complete — pays out the current delve for the player (testing shortcut for the boss-kill /
+    // scenario completion path). Uses the selected tier and the live bountiful state of the map's delve.
+    static bool HandleDelveCompleteCommand(ChatHandler* handler)
+    {
+        Player* player = handler->GetSession()->GetPlayer();
+        Delves::DelveTemplate const* tmpl = sDelveMgr->GetDelveTemplate(player->GetMapId());
+        if (!tmpl)
+        {
+            handler->SendSysMessage("You are not inside a known delve map.");
+            return false;
+        }
+
+        uint8 const tier = player->m_delveSelectedTier ? player->m_delveSelectedTier : 1;
+        bool const bountiful = sDelveMgr->IsDelveCurrentlyBountiful(tmpl->Id);
+        Delves::DelvesRewards::AwardDelveCompletion(player, tier, bountiful, true /*revives remaining*/);
+        handler->PSendSysMessage("Delve {} completed at tier {} (bountiful: {}).", tmpl->Id, tier, bountiful ? "yes" : "no");
         return true;
     }
 

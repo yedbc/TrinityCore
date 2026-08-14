@@ -466,8 +466,11 @@ namespace WorldPackets
             uint32 GarrPlotInstanceID = 0;
         };
 
-        // Conservative shape (no IDA byte detail in audit): {u32 Result, u32 GarrSpecID,
-        // u32 GarrPlotInstanceID}. Sent when a specialization is learned for a building.
+        // 8 bytes, 2 x u32 - CONFIRMED.
+        // NOTE FOR ANYONE COUNTING THIS AS A FEATURE: the client's registered handler for this opcode is
+        // RVA 0x1D80E0, a bare `ret`. The client parses the packet and throws it away. Sending it is correct
+        // and harmless (retail sends it, and Garrison::LearnSpecialization now answers on every path), but it
+        // produces NO observable client behaviour. Do not report it as a player-visible win.
         class GarrisonLearnSpecializationResult final : public ServerPacket
         {
         public:
@@ -475,9 +478,10 @@ namespace WorldPackets
 
             WorldPacket const* Write() override;
 
+            // Two u32 only. The client case body is exactly two reads; TC wrote a third
+            // (GarrPlotInstanceID) that the client never consumes.
             uint32 Result = 0;
             uint32 GarrSpecID = 0;
-            uint32 GarrPlotInstanceID = 0;
         };
 
         // Conservative shape: {u32 Result, u32 GarrPlotInstanceID, u32 GarrSpecID}.
@@ -492,10 +496,32 @@ namespace WorldPackets
             uint32 Result = 0;
             uint32 GarrPlotInstanceID = 0;
             uint32 GarrSpecID = 0;
+            // The client reads a trailing u64 after the three u32s; TC was 8 bytes short. The u64 read
+            // is CONFIRMED, the name is a hypothesis - the server's only u64 in this state is
+            // plot->BuildingInfo.PacketInfo->TimeSpecCooldown, the 1-day cooldown set on spec change.
+            uint64 TimeSpecCooldown = 0;
         };
 
-        // IDA case 4980797 (§8.47): u32 Result, u64 BuildingDbID, u32 GarrPlotInstanceID.
-        // Sent when a building finishes construction (timer expires, becomes activatable).
+        // SUPERSEDED: this used to read "u32 Result, u64 BuildingDbID, u32 GarrPlotInstanceID", and an earlier
+        // audit passed it as matching the client. That audit compared the FIELD LIST - and this packet is 16
+        // bytes in either arrangement, so a symmetric reordering is exactly what a size/shape check cannot
+        // see. Reading the consumer settles it: THE ORDER IS INVERTED.
+        //
+        //   u32 GarrPlotInstanceID
+        //   u64 TimeBuilt
+        //   u32 Result
+        //
+        // Proof (group dispatcher RVA 0x717F70, jump table 0x71B330, index = opcode - 0x4C0000):
+        //   * handler 0x229FBC0 does `cmp dword [rcx+0x30], 0 ; jne bail` on the LAST u32 - that is Result;
+        //   * it passes the FIRST u32 to the building lookup 0x2290DF0, and the 0x4C0006 handler (0x2296E90)
+        //     calls that same lookup with the field we already name GarrPlotInstanceID.
+        // The u64 lands at building+0x30, whose siblings +0x40 / +0x48 are GarrSpecID / spec cooldown,
+        // matching JamGarrisonBuildingInfo{... timeBuilt, currentGarSpecID, timeActivated ...} - so +0x30 is
+        // timeBuilt. That last step is structural analogy rather than a typename proof, but "BuildingDbID" is
+        // the weaker reading precisely because a db id would not occupy the timestamp slot.
+        //
+        // Writing the old order does NOT desync the stream (same 16 bytes) - it silently inverts meaning: the
+        // client reads the non-zero plot id as Result and so treats every success as a failure.
         class GarrisonCompleteBuildingConstructionResult final : public ServerPacket
         {
         public:
@@ -503,9 +529,9 @@ namespace WorldPackets
 
             WorldPacket const* Write() override;
 
-            uint32 Result = 0;
-            uint64 BuildingDbID = 0;
             uint32 GarrPlotInstanceID = 0;
+            uint64 TimeBuilt = 0;
+            uint32 Result = 0;
         };
 
         // IDA case 4980791 (§8.45): PackedGuid NpcGUID, sub-call (likely a small descriptor),
@@ -528,14 +554,31 @@ namespace WorldPackets
         // which the client resolves via GossipNPCOption.db2 to PlayerInteractionType::GarrTalent and fires
         // GARRISON_TALENT_NPC_OPENED. See Player::OnGossipSelect (GarrisonTalent falls through to the generic path).
 
-        // IDA case 4980817 (§8.51): generic byte-block helper. Conservative shape: {u32 NewMinLevel}.
+        // SUPERSEDED: the old shape was a single u32 NewMinLevel, admitted as "conservative" (a guess) because
+        // the generated deserializer for this opcode is the raw-remainder fallback (0x33CC980) and encodes no
+        // field list. Reading the CONSUMER instead recovers it - the payload is 8 bytes, not 4:
+        //
+        //   u32 <lookup key>        - handler 0x22A0BA0 feeds it to 0x22909A0, a DIFFERENT garrison lookup
+        //                             from the GarrTypeID one. Most likely GarrFollowerTypeID. NOT DETERMINED.
+        //   u32 NewMinLevel         - stored at object+0x48, after which GARRISON_FOLLOWER_LIST_UPDATE fires.
+        //
+        // The old single-u32 class would have made the client read the min level out of whatever followed the
+        // packet in the buffer. Corrected here so the class cannot desync if a sender is ever added.
+        //
+        // STILL DO NOT SEND THIS. Two independent blockers remain:
+        //   1. the first field's identity is unknown, so it cannot be populated truthfully; and
+        //   2. the server never populates MinAutoTroopLevel at all (GarrisonInfo carries a constant 0), so
+        //      there is no state change to announce.
+        // Note the opcode is already STATUS_NEVER in Opcodes.cpp, against the RE pass's explicit instruction
+        // to leave it STATUS_UNHANDLED - harmless while nothing sends it, but it is an armed trap.
         class GarrisonAutoTroopMinLevelUpdateResult final : public ServerPacket
         {
         public:
-            explicit GarrisonAutoTroopMinLevelUpdateResult() : ServerPacket(SMSG_GARRISON_AUTO_TROOP_MIN_LEVEL_UPDATE_RESULT, 4) { }
+            explicit GarrisonAutoTroopMinLevelUpdateResult() : ServerPacket(SMSG_GARRISON_AUTO_TROOP_MIN_LEVEL_UPDATE_RESULT, 4 + 4) { }
 
             WorldPacket const* Write() override;
 
+            uint32 UnkLookupKey = 0;    // HYPOTHESIS: GarrFollowerTypeID. Unproven - do not rely on the name.
             uint32 NewMinLevel = 0;
         };
 
@@ -548,9 +591,14 @@ namespace WorldPackets
 
             WorldPacket const* Write() override;
 
+            // 13 bytes: u8 GarrTypeID, u64 StartTime, u32 GarrMssnBonusAbilityID.
+            // There is NO MissionRecID in this packet - the nested reader (RVA 0x72BA90) does
+            // read64 -> +0 then read32 -> +8, matching JamGarrisonMissionBonusAbility
+            // { startTime int64 @0, garrMssnBonusAbilityID int32 @8 }. TC previously wrote
+            // u8 + u32 + u32 = 9 bytes where the client reads 13.
             uint8 GarrTypeID = 0;
-            uint32 MissionRecID = 0;
-            uint32 BonusAbilityID = 0;
+            uint64 StartTime = 0;
+            uint32 GarrMssnBonusAbilityID = 0;
         };
 
         // ============================================================
@@ -566,6 +614,14 @@ namespace WorldPackets
 
             ObjectGuid NpcGUID;
             std::vector<uint64> FollowerDBIDs;
+            // Parallel to FollowerDBIDs: the ally board slot the player dropped each companion into.
+            // Enum GarrAutoBoardIndex (client 12.0.7.68275 reflection, GARRISON_ENUMS_68275.md):
+            // None = -1, AllyLeftBack 0, AllyRightBack 1, AllyLeftFront 2, AllyCenterFront 3,
+            // AllyRightFront 4 (5..12 are the enemy slots). The WoD/Legion mission UIs have no board
+            // and send None; the Shadowlands Adventures UI sends a real slot per follower — it is the
+            // optional third argument of C_Garrison.AddFollowerToMission(missionID, followerID, boardIndex)
+            // (GarrisonInfoDocumentation.lua:11-25, Blizzard_CovenantMissionUI.lua:729).
+            std::vector<int32> FollowerBoardIndexes;
             uint32 MissionRecID = 0;
         };
 
@@ -978,7 +1034,12 @@ namespace WorldPackets
 
             void Read() override;
 
-            ObjectGuid NpcGUID;
+            // Wire (client 12.0.7 serializer @ RVA 0x6A9BCC): opcode then a single write_uint8 sourced from
+            // request+0x20 - and nothing else. The Lua entry point is C_Garrison.RushHealAllFollowers(followerType),
+            // so the byte is the follower type whose roster to heal. It is emphatically NOT an ObjectGuid: a packed
+            // guid's mask alone is 2 bytes, which is why the old ObjectGuid read threw a ByteBufferException on
+            // every press ("size: 2 ... pos: 4 size: 5") and the packet was skipped before the handler ever ran.
+            uint8 FollowerTypeID = 0;
         };
 
         class GarrisonAddFollowerHealth final : public ClientPacket
@@ -988,9 +1049,11 @@ namespace WorldPackets
 
             void Read() override;
 
-            ObjectGuid NpcGUID;
+            // Wire (client 12.0.7 serializer @ RVA 0x6A9B84): opcode then exactly two write_uint32 calls, sourced
+            // from *(request+0x20) and *(request+0x20)+4 - the low and high halves of the 64-bit follower DbID that
+            // C_Garrison.RushHealFollower(followerID) is handed. No guid and no amount on the wire; the heal is
+            // "rush this follower to full", so the server supplies the amount.
             uint64 FollowerDBID = 0;
-            int32 HealthToAdd = 0;
         };
 
         class GarrisonGetClassSpecCategoryInfo final : public ClientPacket
@@ -1221,12 +1284,39 @@ namespace WorldPackets
         };
 
         // ============================================================
-        // Collection / event-list / spec-group SMSG packets (BfA / Shadowlands campaign tracking)
-        // IDA cases 0x4C0045 - 0x4C004C, see SNIFF_AUDIT §8.54-8.61.
+        // Collection / event-list / spec-group SMSG packets (opcodes 0x4C0045 - 0x4C004C)
+        //
+        // SEMANTICS, recovered from the client's handlers rather than guessed. The event names below were
+        // PROVEN by recovering the client's Lua-event-name -> 64-bit-hash table and matching the immediates,
+        // not inferred from spelling:
+        //
+        //  * A "collection" is the SOULBIND CONDUIT collection. All three collection handlers gate their Lua
+        //    notify on `CollectionType == 1`, firing SOULBIND_CONDUIT_COLLECTION_UPDATED / _REMOVED /
+        //    _CLEARED; consumers are C_Soulbinds.GetConduitCollection / GetConduitCollectionData /
+        //    GetConduitCollectionCount / GetConduitRank. An entry is {conduitID, rank}.
+        //    CollectionType 1 is THE ONLY VALUE WITH A CLIENT CONSUMER - every other value is stored into a
+        //    generic map and is inert. The rest of the CollectionType integer set could not be enumerated
+        //    (no such enum exists in the client's data or as a binary string). DO NOT INVENT ONE.
+        //    The server side needed to populate type 1 already exists: Player::m_soulbindConduits
+        //    (conduitId -> rankIndex, persisted). What does NOT exist is any removal or clear path, since
+        //    conduits are never taken away - so REMOVE/CLEAR have a live consumer but no game event to fire
+        //    on, and GarrisonInfo.Collections is currently never populated at all.
+        //
+        //  * An "event list" is the garrison/class-hall TALENT event list (research-completion timestamps).
+        //    ADD_EVENT fires GARRISON_TALENT_EVENT_UPDATE; REMOVE_EVENT and CLEAR_EVENT_LIST fire no Lua
+        //    event at all. Entries are {timestamp, entryID} and EventValue is very likely GarrTalentID.
+        //    The notify is NOT gated on a specific type, so these are not hard-blocked the way collections
+        //    are - but no enum of EventListID values could be found, and the server has no event store.
+        //
+        //  * A "spec group" is the per-ChrSpecialization soulbind memory - see GarrisonAddSpecGroups.
+        //    TC models the active soulbind per COVENANT (Player::m_covenantSoulbinds), not per spec, so
+        //    there is no state to publish here.
         // ============================================================
 
-        // IDA case 4980805 (§8.54): wrapper + 1 byte + varU32 GarrTalentID + JamGarrisonTalentSocket.
-        // Conservative: {u8 GarrTypeID, u8 CollectionEntryFlags, u32 GarrTalentID, GarrisonTalentSocketData}.
+        // SUPERSEDED: this used to be described as "Conservative: {u8 GarrTypeID, u8 CollectionEntryFlags,
+        // u32 GarrTalentID, GarrisonTalentSocketData}" - an admitted guess, and a wrong one (14 bytes
+        // written where the client reads 13). The real shape was read off the client and is documented on
+        // the fields below.
         class GarrisonCollectionUpdateEntry final : public ServerPacket
         {
         public:
@@ -1234,13 +1324,19 @@ namespace WorldPackets
 
             WorldPacket const* Write() override;
 
+            // 13 bytes: u8 GarrTypeID, u32 CollectionType, u32 EntryID, u32 Rank.
+            // The reader at RVA 0x71ABB8 does read8, read32, then a two-u32 helper. There is no
+            // CollectionEntryFlags field - TC's own header called its shape "Conservative", i.e. a guess,
+            // and it was wrong (14 bytes written vs 13 read).
             uint8 GarrTypeID = 0;
-            uint8 CollectionEntryFlags = 0;
-            uint32 GarrTalentID = 0;
-            GarrisonTalentSocketData Socket;
+            uint32 CollectionType = 0;
+            uint32 EntryID = 0;
+            uint32 Rank = 0;
         };
 
-        // IDA case 4980806 (§8.55): u8 GarrTypeID, u32 CollectionType, u32 GarrTalentID.
+        // u8 GarrTypeID, u32 CollectionType, u32 EntryID (9 bytes, CONFIRMED).
+        // The third field was named GarrTalentID, which is misleading: it is the same wire field as
+        // GarrisonCollectionUpdateEntry::EntryID, i.e. a SoulbindConduitID. Renamed.
         class GarrisonCollectionRemoveEntry final : public ServerPacket
         {
         public:
@@ -1250,7 +1346,7 @@ namespace WorldPackets
 
             uint8 GarrTypeID = 0;
             uint32 CollectionType = 0;
-            uint32 GarrTalentID = 0;
+            uint32 EntryID = 0;
         };
 
         // IDA case 4980807 (§8.56): u8 GarrTypeID, u32 CollectionType.
@@ -1304,15 +1400,19 @@ namespace WorldPackets
             uint32 EventListID = 0;
         };
 
-        // IDA case 4980811 (§8.60): u8 GarrTypeID, u32 size, SpecGroup[size].
-        // Conservative SpecGroup shape: {u32 GarrSpecGroupID, u32 SelectedTalentTreeID}.
+        // u8 GarrTypeID, u32 count, count x {u32, u32} stride 8. Wire shape CONFIRMED.
+        // The pair was named {GarrSpecGroupID, SelectedTalentTreeID} - a guess, and the wrong one. The client
+        // keys its map on the first u32 and the consumers are C_Soulbinds.GetSpecsAssignedToSoulbind /
+        // GetActiveSoulbindID, so a "spec group" is the per-ChrSpecialization soulbind memory. Naming is
+        // MEDIUM-HIGH confidence; the wire is byte-identical either way, so renaming is free and stops the
+        // next reader building a talent-tree feature that does not exist.
         class GarrisonAddSpecGroups final : public ServerPacket
         {
         public:
             struct GarrisonSpecGroup
             {
-                uint32 GarrSpecGroupID = 0;
-                uint32 SelectedTalentTreeID = 0;
+                uint32 ChrSpecializationID = 0;
+                uint32 SoulbindID = 0;
             };
 
             explicit GarrisonAddSpecGroups() : ServerPacket(SMSG_GARRISON_ADD_SPEC_GROUPS) { }
@@ -1357,7 +1457,12 @@ namespace WorldPackets
 
             WorldPacket const* Write() override;
 
-            uint32 GarrSiteLevelID = 0;
+            // This is the GarrSite id, NOT the GarrSiteLevel id, despite what the field was previously
+            // called. Four captures carry 2, 161, 299 and 168 - and TC's own GetGarrisonTypeFromSiteId
+            // map (Garrison.cpp) lists 2 = WoD garrison, 161 = Legion order hall, 168 = BfA war campaign.
+            // The war campaign's GarrSiteLevel ids are 599/600/601, so a site-level id could not produce
+            // 168. Sending _siteLevel->ID here would have put the wrong number on the wire.
+            uint32 GarrSiteID = 0;
             uint32 NumActivationsRemaining = 0;
         };
 
@@ -1571,15 +1676,28 @@ namespace WorldPackets
             std::vector<int32> UnlockedTalentTreeIDs;
         };
 
-        // IDA case 4980815: opaque generic-byte-block helper. TC sends u8 GarrTypeID +
-        // size-prefixed array of {u32 GarrTalentID, GarrisonTalentSocketData} pairs. See SNIFF_AUDIT §8.64.
+        // SMSG_GARRISON_APPLY_TALENT_SOCKET_DATA_CHANGES (0x4C004F). Reader RVA 0x717CE0, read in full.
+        //
+        //   u8  GarrTypeID
+        //   u32 changeCount            <- sizes the change vector, but its ELEMENTS come last
+        //   u32 removedCount
+        //   removedCount x u32 GarrTalentID
+        //   changeCount  x { u32 GarrTalentID; bit7 HasSocket + FlushBits;
+        //                    if HasSocket -> u32 SoulbindConduitID, u32 SoulbindConduitRank }
+        //
+        // Note the size-then-other-array-then-elements shape: the client sizes the change vector at
+        // field 2 and does not read its elements until the end.
+        //
+        // TC previously wrote u8, u32 count, count x {u32, Socket} - two independent desyncs: the
+        // removed-list was missing entirely, and the socket was written unconditionally with no
+        // presence bit. The optional socket pair is read by RVA 0x6BE2E0 (two u32 reads).
         class GarrisonApplyTalentSocketDataChanges final : public ServerPacket
         {
         public:
             struct TalentSocketChange
             {
                 uint32 GarrTalentID = 0;
-                GarrisonTalentSocketData Socket;
+                Optional<GarrisonTalentSocketData> Socket;
             };
 
             explicit GarrisonApplyTalentSocketDataChanges() : ServerPacket(SMSG_GARRISON_APPLY_TALENT_SOCKET_DATA_CHANGES) { }
@@ -1588,6 +1706,7 @@ namespace WorldPackets
 
             uint8 GarrTypeID = 0;
             std::vector<TalentSocketChange> Changes;
+            std::vector<uint32> RemovedTalentIDs;
         };
 
         // ============================================================
@@ -1768,10 +1887,33 @@ namespace WorldPackets
         // Trophy / Monument packets
         // ============================================================
 
-        struct GarrisonTrophyData
+        // One entry of SMSG_GET_TROPHY_LIST_RESPONSE - the client's JamTrophyInfo, a 12-byte struct (its
+        // vector grow/copy helpers step in 0xC, and the deserializer at client RVA 0x60BEC0 does three
+        // ReadUInt32 per entry). Field 0 is the Trophy.db2 row id: C_Trophy.MonumentGetTrophyInfoByIndex
+        // (RVA 0x24A0C20) feeds it to a Trophy.db2 row lookup to get the name it shows.
+        //
+        // Unk1/Unk2 are genuinely unnamed. The client's only consumers are that Lua getter, which returns
+        // them raw as return values #2 and #3 - the UI calls them lock_code and lock_reason, and compares
+        // lock_code against MATCH_CONDITION_SUCCESS (57) / MATCH_CONDITION_WRONG_ACHIEVEMENT (34) - and the
+        // vector copy. No C++ code interprets them, and no JAM reflection descriptor exists for this type,
+        // so the mapping of those two constants onto these two fields is not derivable offline. They are
+        // written as 0 until a sniff names them; see WorldSession::HandleGetTrophyList.
+        struct TrophyInfo
         {
             uint32 TrophyID = 0;
             uint32 Unk1 = 0;
+            uint32 Unk2 = 0;
+        };
+
+        // One entry of SMSG_GARRISON_UPDATE_GARRISON_MONUMENT_SELECTIONS - the client's JamGarrisonTrophy,
+        // 8 bytes. This is a per-monument selection map keyed by TrophyInstanceID, NOT by TrophyTypeID: the
+        // monument tooltip builder (client RVA 0x1CAED30) walks this array comparing entry field 0 against
+        // the monument gameobject's own TrophyInstanceID (its Data1), then looks entry field 1 up in
+        // Trophy.db2 to render the name. So one row per physical monument, not per monument category.
+        struct GarrisonMonumentSelection
+        {
+            uint32 TrophyInstanceID = 0;
+            uint32 TrophyID = 0;
         };
 
         class GetTrophyList final : public ClientPacket
@@ -1792,7 +1934,7 @@ namespace WorldPackets
             WorldPacket const* Write() override;
 
             bool Success = false;
-            std::vector<GarrisonTrophyData> Trophies;
+            std::vector<TrophyInfo> Trophies;
         };
 
         class ReplaceTrophy final : public ClientPacket
@@ -1802,6 +1944,7 @@ namespace WorldPackets
 
             void Read() override;
 
+            ObjectGuid MonumentGUID;
             uint32 TrophyID = 0;
         };
 
@@ -1822,7 +1965,10 @@ namespace WorldPackets
 
             void Read() override;
 
-            uint32 TrophyID = 0;
+            // Not a Trophy.db2 id - C_Trophy.MonumentLoadSelectedTrophyID() takes no argument and the client
+            // fills this from the monument gameobject's named-slot 0, which the client's GO field-index table
+            // maps to Data1 = TrophyInstanceID for type 44. It is asking "what is selected on THIS monument".
+            uint32 TrophyInstanceID = 0;
         };
 
         class GetSelectedTrophyIDResponse final : public ServerPacket
@@ -1843,6 +1989,7 @@ namespace WorldPackets
 
             void Read() override;
 
+            ObjectGuid MonumentGUID;
             uint32 TrophyID = 0;
         };
 
@@ -1851,7 +1998,9 @@ namespace WorldPackets
         public:
             explicit RevertMonumentAppearance(WorldPacket&& packet) : ClientPacket(CMSG_REVERT_MONUMENT_APPEARANCE, std::move(packet)) { }
 
-            void Read() override { }
+            void Read() override;
+
+            ObjectGuid MonumentGUID;
         };
 
         class GarrisonUpdateGarrisonMonumentSelections final : public ServerPacket
@@ -1861,7 +2010,28 @@ namespace WorldPackets
 
             WorldPacket const* Write() override;
 
-            std::vector<GarrisonTrophyData> Trophies;
+            std::vector<GarrisonMonumentSelection> Selections;
+        };
+
+        // Incremental push of the "missions started today" counter, mirroring the
+        // GarrisonInfo::NumMissionsStartedToday field that is otherwise only sent on a full
+        // GetGarrisonInfo round trip.
+        //
+        // Wire, read straight off the 68275 client deserializer for SMSG_UPDATE_DAILY_MISSION_COUNTER
+        // (0x4C0021): one 1-byte read stored at +0, then one 2-byte read stored at +2, i.e.
+        //     { uint8 GarrTypeID; uint16 Count; }
+        // The 16-bit reader is the same one SMSG_QUEST_UPDATE_ADD_CREDIT uses for its Count/Required
+        // pair, whose TrinityCore class is live and known-correct - so the width is confirmed here,
+        // not assumed.
+        class UpdateDailyMissionCounter final : public ServerPacket
+        {
+        public:
+            explicit UpdateDailyMissionCounter() : ServerPacket(SMSG_UPDATE_DAILY_MISSION_COUNTER, 1 + 2) { }
+
+            WorldPacket const* Write() override;
+
+            uint8 GarrTypeID = 0;
+            uint16 Count = 0;
         };
     }
 }

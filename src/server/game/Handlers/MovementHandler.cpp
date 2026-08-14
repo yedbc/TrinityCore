@@ -295,11 +295,22 @@ void WorldSession::HandleMoveWorldportAck()
     }
 
     if (!seamlessTeleport)
+    {
         player->SendInitialPacketsAfterAddToMap();
+
+        // Any pending resurrect offer is void once the world port completes; 68275 sends the clear
+        // right after MOVE_UPDATE_TELEPORT on (non-seamless) map entry regardless of pending state.
+        player->ClearResurrectRequestData();
+        player->SendDirectMessage(WorldPackets::Misc::ClearResurrect().Write());
+    }
     else
     {
         player->UpdateVisibilityForPlayer();
-        if (Garrison* garrison = player->GetGarrison())
+        // The non-seamless path (Player::SendInitialPacketsAfterAddToMap) loops every garrison; this branch only
+        // ever announced the WoD one, so an order-hall / covenant owner arriving by a seamless transfer never got
+        // its GarrisonRemoteInfo. Garrison::SendRemoteInfo self-guards on the site's ParentMapID, so looping is
+        // behaviour-identical for a WoD-only owner.
+        for (auto const& [garrType, garrison] : player->GetGarrisons())
             garrison->SendRemoteInfo();
     }
 
@@ -956,9 +967,28 @@ void WorldSession::HandleTimeSyncResponse(WorldPackets::Misc::TimeSyncResponse c
     HandleTimeSync(timeSyncResponse.SequenceIndex, timeSyncResponse.ClientTime, timeSyncResponse.GetReceivedTime());
 }
 
+void WorldSession::HandleDiscardedTimeSyncAcks(WorldPackets::Misc::DiscardedTimeSyncAcks const& discardedTimeSyncAcks)
+{
+    // The client is telling us that it dropped the time sync work it still had queued, so nothing at
+    // or below this sequence index will ever be answered. Without this, those requests sit in
+    // _pendingTimeSyncRequests for the rest of the session - the map is only ever shrunk by a
+    // matching response or by ResetTimeSync - and every one of them is a sample we keep waiting for.
+    // The two special counters live at the top of the range and are deliberately out of reach of
+    // this sweep, which only ever walks up to a real sequence index.
+    _pendingTimeSyncRequests.erase(_pendingTimeSyncRequests.begin(),
+        _pendingTimeSyncRequests.upper_bound(discardedTimeSyncAcks.MaxSequenceIndex));
+}
+
 void WorldSession::HandleQueuedMessagesEnd(WorldPackets::Auth::QueuedMessagesEnd const& queuedMessagesEnd)
 {
     HandleTimeSync(SPECIAL_RESUME_COMMS_TIME_SYNC_COUNTER, queuedMessagesEnd.Timestamp, queuedMessagesEnd.GetRawPacket()->GetReceivedTime());
+}
+
+void WorldSession::HandleSuspendCommsAck(WorldPackets::Auth::SuspendCommsAck const& suspendCommsAck)
+{
+    // Same shape and same clock as CMSG_TIME_SYNC_RESPONSE, so it is one more clock delta sample,
+    // taken at the earliest possible moment on the instance connection.
+    HandleTimeSync(suspendCommsAck.SerialNumber, suspendCommsAck.Timestamp, suspendCommsAck.GetRawPacket()->GetReceivedTime());
 }
 
 void WorldSession::HandleMoveInitActiveMoverComplete(WorldPackets::Movement::MoveInitActiveMoverComplete const& moveInitActiveMoverComplete)

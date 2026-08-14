@@ -16,6 +16,7 @@
  */
 
 #include "Garrison.h"
+#include "ConditionMgr.h"
 #include "Containers.h"
 #include "Creature.h"
 #include "MotionMaster.h"
@@ -27,6 +28,9 @@
 #include "GameTime.h"
 #include "GarrisonAutoCombat.h"
 #include "GarrisonMgr.h"
+#include "AbominationFactory.h"
+#include "PathOfAscension.h"
+#include "QueensConservatory.h"
 #include "Item.h"
 #include "Log.h"
 #include "Mail.h"
@@ -41,8 +45,13 @@
 #include "SpellPackets.h"
 #include "VehicleDefines.h"
 #include "advstd.h"
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <unordered_set>
+#include <vector>
 
-Garrison::Garrison(Player* owner) : _owner(owner), _garrType(GARRISON_TYPE_GARRISON), _siteLevel(nullptr), _followerActivationsRemainingToday(1)
+Garrison::Garrison(Player* owner) : _owner(owner), _garrType(GARRISON_TYPE_GARRISON), _siteLevel(nullptr), _followerActivationsRemainingToday(1), _conservatory(owner), _abominationFactory(owner), _pathOfAscension(owner), _emberCourt(owner)
 {
     // Fire the first periodic pass on the very next tick after login (instead of waiting a full interval),
     // so finished-order crates activate, completed constructions/research resolve, etc. right away.
@@ -172,14 +181,14 @@ bool Garrison::LoadFromDB(PreparedQueryResult garrison, PreparedQueryResult blue
         } while (talents->NextRow());
     }
 
-    //           0
-    // SELECT trophyId FROM character_garrison_trophies WHERE guid = ?
+    //           0                 1
+    // SELECT trophyInstanceId, trophyId FROM character_garrison_trophies WHERE guid = ?
     if (trophies)
     {
         do
         {
             fields = trophies->Fetch();
-            _trophies.insert(fields[0].GetUInt32());
+            _trophies[fields[0].GetUInt32()] = fields[1].GetUInt32();
         } while (trophies->NextRow());
     }
 
@@ -196,8 +205,8 @@ bool Garrison::LoadFromDB(PreparedQueryResult garrison, PreparedQueryResult blue
         } while (archivedMissions->NextRow());
     }
 
-    //           0           1        2      3                4               5   6                7               8       9          10         11
-    // SELECT dbId, followerId, quality, level, itemLevelWeapon, itemLevelArmor, xp, currentBuilding, currentMission, status, durability, customName FROM character_garrison_followers WHERE guid = ?
+    //           0           1        2      3                4               5   6                7               8       9          10         11          12      13
+    // SELECT dbId, followerId, quality, level, itemLevelWeapon, itemLevelArmor, xp, currentBuilding, currentMission, status, durability, customName, health, boardIndex FROM character_garrison_followers WHERE guid = ?
     if (followers)
     {
         do
@@ -223,6 +232,22 @@ bool Garrison::LoadFromDB(PreparedQueryResult garrison, PreparedQueryResult blue
             follower.PacketInfo.FollowerStatus = fields[9].GetUInt32();
             follower.PacketInfo.Durability = fields[10].GetUInt32();
             follower.PacketInfo.CustomName = fields[11].GetString();
+            follower.PacketInfo.Health = fields[12].GetInt32();
+            follower.PacketInfo.BoardIndex = fields[13].GetInt8();
+            // A statline (Adventures) companion that ended a fight at 0 health is DEAD and must stay dead
+            // across relog - the previous unconditional "Health <= 0 -> max" reset was a free auto-revive
+            // that nullified the whole death penalty. It must now be healed (paid, see RushHealFollower).
+            // Durability-model followers have no GarrAutoCombatant statline (GetFollowerMaxHealth == 0) and
+            // are governed by durability, not health; for them a persisted 0 is just "never initialised"
+            // (their Health mirrors Durability), so restore that - and it also repairs legacy rows written
+            // before the health column existed, which only ever affected durability-model followers.
+            if (follower.PacketInfo.Health <= 0)
+            {
+                int32 statlineMaxHealth = GetFollowerMaxHealth(sGarrFollowerStore.LookupEntry(followerId), follower.PacketInfo.FollowerLevel);
+                if (statlineMaxHealth == 0)
+                    follower.PacketInfo.Health = static_cast<int32>(follower.PacketInfo.Durability);
+                // else: statline companion at 0 HP stays dead until paid-healed - no free relog revive.
+            }
             follower.PacketInfo.ZoneSupportSpellID = sGarrisonMgr.GetFollowerZoneSupportSpell(followerId, GetFaction());
             if (!sGarrBuildingStore.LookupEntry(follower.PacketInfo.CurrentBuildingID))
                 follower.PacketInfo.CurrentBuildingID = 0;
@@ -308,6 +333,15 @@ bool Garrison::LoadFromDB(PreparedQueryResult garrison, PreparedQueryResult blue
             mission.PacketInfo.MissionState = fields[8].GetInt32();
             mission.PacketInfo.SuccessChance = fields[9].GetInt32();
 
+            // Register the rec id in the duplicate guard. AddMission consults _activeMissionRecIDs to refuse
+            // re-offering a mission the character already holds, but the set was only ever filled by AddMission
+            // itself - never here. So every restart started with an empty guard, and the next offer roll happily
+            // handed out a rec id that was already IN PROGRESS, producing two rows with the same missionRecID.
+            // GetMissionByRecID then walks an unordered_map and non-deterministically returned the freshly
+            // offered state-0 row instead of the running one, so CompleteMission answered
+            // GARRISON_ERROR_NOT_ON_MISSION and the mission could never be finished nor its followers released.
+            _activeMissionRecIDs.insert(missionRecID);
+
             GarrMissionEntry const* missionEntry = sGarrMissionStore.LookupEntry(missionRecID);
             if (missionEntry)
             {
@@ -342,8 +376,53 @@ bool Garrison::LoadFromDB(PreparedQueryResult garrison, PreparedQueryResult blue
             follower.PacketInfo.CurrentMissionID = 0; // orphaned link — the mission is gone, free the follower
     }
 
+    // Back-fill board slots for missions that were already running before slots were stored: those rows
+    // reload with every companion at None, and the Adventures complete screen cannot resolve a puck
+    // frame for None. AssignMissionBoardIndexes keeps any valid slot it finds, so this is a no-op for
+    // missions started since.
+    for (auto& missionPair : _missions)
+    {
+        Mission& mission = missionPair.second;
+        if (mission.CurrentFollowerDBIDs.empty())
+            continue;
+
+        bool anyUnplaced = false;
+        for (uint64 followerDbId : mission.CurrentFollowerDBIDs)
+            if (Follower const* follower = GetFollower(followerDbId))
+                if (!IsAllyBoardIndex(follower->PacketInfo.BoardIndex))
+                    anyUnplaced = true;
+
+        if (anyUnplaced)
+            AssignMissionBoardIndexes(mission, { });
+    }
+
     // Complete any talent research that finished while offline
     CompleteAllTalentResearch();
+
+    // Queen's Conservatory wildseed plots (Night Fae unique sanctum feature). Only the covenant sanctum has one;
+    // every other garrison type leaves it empty. Loaded synchronously here rather than threaded through the
+    // login query set, so the covenant work stays contained to the sanctum path.
+    if (_garrType == GARRISON_TYPE_COVENANT)
+    {
+        CharacterDatabasePreparedStatement* conservatoryStmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_GARRISON_CONSERVATORY);
+        conservatoryStmt->setUInt64(0, _owner->GetGUID().GetCounter());
+        _conservatory.LoadFromDB(CharacterDatabase.Query(conservatoryStmt));
+
+        // Abomination Factory stable (Necrolord unique sanctum feature) - same story, same synchronous load.
+        CharacterDatabasePreparedStatement* abominationStmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_GARRISON_ABOMINATION);
+        abominationStmt->setUInt64(0, _owner->GetGUID().GetCounter());
+        _abominationFactory.LoadFromDB(CharacterDatabase.Query(abominationStmt));
+
+        // Path of Ascension captured memories (Kyrian unique sanctum feature) - same story, same synchronous load.
+        CharacterDatabasePreparedStatement* ascensionStmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_GARRISON_ASCENSION);
+        ascensionStmt->setUInt64(0, _owner->GetGUID().GetCounter());
+        _pathOfAscension.LoadFromDB(CharacterDatabase.Query(ascensionStmt));
+
+        // Ember Court guest standing and the pending guest list (Venthyr unique sanctum feature) - same story.
+        CharacterDatabasePreparedStatement* emberCourtStmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_CHARACTER_GARRISON_EMBER_COURT);
+        emberCourtStmt->setUInt64(0, _owner->GetGUID().GetCounter());
+        _emberCourt.LoadFromDB(CharacterDatabase.Query(emberCourtStmt));
+    }
 
     return true;
 }
@@ -364,6 +443,14 @@ void Garrison::SaveToDB(CharacterDatabaseTransaction trans)
     stmt->setInt64(6, _cacheLastUsed);
     stmt->setUInt32(7, _shipyardBuilding);
     trans->Append(stmt);
+
+    if (_garrType == GARRISON_TYPE_COVENANT)
+    {
+        _conservatory.SaveToDB(trans);
+        _abominationFactory.SaveToDB(trans);
+        _pathOfAscension.SaveToDB(trans);
+        _emberCourt.SaveToDB(trans);
+    }
 
     for (uint32 building : _knownBuildings)
     {
@@ -420,6 +507,11 @@ void Garrison::SaveToDB(CharacterDatabaseTransaction trans)
         stmt->setUInt32(index++, follower.PacketInfo.Durability);
         stmt->setString(index++, follower.PacketInfo.CustomName);
         stmt->setUInt8(index++, static_cast<uint8>(_garrType));
+        // Adventures companions carry health and a board slot across sessions. Neither used to be
+        // saved, so every relog reset a companion to health 0 and slot 0 - and an in-progress mission
+        // came back with no board at all, which is what the client choked on.
+        stmt->setInt32(index++, follower.PacketInfo.Health);
+        stmt->setInt8(index++, follower.PacketInfo.BoardIndex);
         trans->Append(stmt);
 
         uint8 slot = 0;
@@ -483,12 +575,13 @@ void Garrison::SaveToDB(CharacterDatabaseTransaction trans)
         trans->Append(stmt);
     }
 
-    for (uint32 trophyId : _trophies)
+    for (auto const& [trophyInstanceId, trophyId] : _trophies)
     {
         stmt = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHARACTER_GARRISON_TROPHY);
         stmt->setUInt64(0, _owner->GetGUID().GetCounter());
-        stmt->setUInt32(1, trophyId);
-        stmt->setUInt8(2, static_cast<uint8>(_garrType));
+        stmt->setUInt32(1, trophyInstanceId);
+        stmt->setUInt32(2, trophyId);
+        stmt->setUInt8(3, static_cast<uint8>(_garrType));
         trans->Append(stmt);
     }
 
@@ -524,6 +617,29 @@ void Garrison::DeleteFromDB(ObjectGuid::LowType ownerGuid, GarrisonType garrType
     del(CHAR_DEL_CHARACTER_GARRISON_TALENTS);
     del(CHAR_DEL_CHARACTER_GARRISON_TROPHIES);
     del(CHAR_DEL_CHARACTER_GARRISON_ARCHIVED_MISSIONS);
+
+    // The Queen's Conservatory only exists on the covenant sanctum, so its table is keyed by guid alone and is
+    // purged here rather than through the generic (guid, garrType) sweep above.
+    if (garrType == GARRISON_TYPE_COVENANT)
+    {
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_GARRISON_CONSERVATORY);
+        stmt->setUInt64(0, ownerGuid);
+        trans->Append(stmt);
+
+        // Same for the Abomination Factory stable.
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_GARRISON_ABOMINATION);
+        stmt->setUInt64(0, ownerGuid);
+        trans->Append(stmt);
+
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_GARRISON_ASCENSION);
+        stmt->setUInt64(0, ownerGuid);
+        trans->Append(stmt);
+
+        // And the Ember Court's guest standing / pending guest list.
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_GARRISON_EMBER_COURT);
+        stmt->setUInt64(0, ownerGuid);
+        trans->Append(stmt);
+    }
 }
 
 void Garrison::DeleteFromDB(ObjectGuid::LowType ownerGuid, CharacterDatabaseTransaction trans)
@@ -545,8 +661,11 @@ static GarrisonType GetGarrisonTypeFromSiteId(uint32 garrSiteId)
         case 163: return GARRISON_TYPE_CLASS_ORDER;   // Legion class/order hall - Horde    (shared faction site, all classes)
         case 168: return GARRISON_TYPE_WAR_CAMPAIGN;   // BfA War Campaign - Alliance (GarrSiteLevel 599/600/601, maps 1643/1825/1771)
         case 169: return GARRISON_TYPE_WAR_CAMPAIGN;   // BfA War Campaign - Horde    (GarrSiteLevel 611/612/613, maps 1642/1861/1876)
-        case 173: return GARRISON_TYPE_WAR_CAMPAIGN;   // BfA (legacy alias; real sites are 168/169 per GarrSiteLevel.db2)
-        case 500: return GARRISON_TYPE_COVENANT;       // Shadowlands
+        case GARR_SITE_COVENANT_SANCTUM:               // Shadowlands covenant sanctum (all four covenants share the site)
+                  return GARRISON_TYPE_COVENANT;       // GarrSiteLevel 837/838/839 -> maps 2222/2162/2236; GarrType 111 publishes MapIDs 2222/2162
+        // Sites 173 (BfA "legacy alias") and 500 (Shadowlands) used to be mapped here. Neither has ANY GarrSiteLevel
+        // row in 12.0.7, so Garrison::Create always failed on them - they were dead branches. Do not re-add them:
+        // the real war-campaign sites are 168/169 and the real covenant site is 296.
         default:  return GARRISON_TYPE_GARRISON;
     }
 }
@@ -568,6 +687,9 @@ bool Garrison::Create(uint32 garrSiteId)
     _owner->SendDirectMessage(garrisonCreateResult.Write());
     PhasingHandler::OnConditionChange(_owner);
     SendRemoteInfo();
+
+    // CriteriaType::AcquireGarrison (177) - miscValue1 = the GarrType just acquired.
+    _owner->UpdateCriteria(CriteriaType::AcquireGarrison, GetType());
     return true;
 }
 
@@ -731,6 +853,28 @@ bool Garrison::IsMissionFollowerTypeAvailable(int8 followerTypeId) const
     return false;
 }
 
+int32 Garrison::GetFollowerMaxHealth(GarrFollowerEntry const* followerEntry, uint32 followerLevel)
+{
+    if (!followerEntry || !followerEntry->AutoCombatantID)
+        return 0;
+
+    GarrAutoCombatantEntry const* statline = sGarrisonMgr.GetAutoCombatant(followerEntry->AutoCombatantID);
+    return statline ? GarrisonAutoCombat::ScaleHealth(statline, followerLevel) : 0;
+}
+
+bool Garrison::IsFollowerCovenantAllowed(GarrFollowerEntry const* followerEntry) const
+{
+    if (!followerEntry)
+        return false;
+
+    // 0 = not covenant-bound. Every WoD/Legion/War-Campaign follower is 0, so the other three
+    // garrison types never see this gate do anything.
+    if (!followerEntry->CovenantID)
+        return true;
+
+    return uint32(followerEntry->CovenantID) == _owner->GetActiveCovenant();
+}
+
 void Garrison::Update(uint32 diff)
 {
     _updateTimer += diff;
@@ -763,6 +907,23 @@ void Garrison::Update(uint32 diff)
 
     // Complete talent research that has finished (push rank-ups to the client so the UI updates live)
     CompleteAllTalentResearch(true);
+
+    // Flip Queen's Conservatory wildseeds that have finished maturing to "ready to harvest".
+    if (_garrType == GARRISON_TYPE_COVENANT)
+    {
+        _conservatory.Update();
+        // Re-sync SkillLine 2787 "Abominable Stitching" and its taught recipes to the researched tier count of
+        // GarrTalentTree 321, so a tier that finished while offline (or one just completed by the research pass
+        // above) grants its rank without a relog.
+        _abominationFactory.Update();
+        // Keep Path of Ascension trial progress inside the ceiling the researched tiers of GarrTalentTree 320
+        // still support (a talent reset can lower it). Captures themselves are never dropped.
+        _pathOfAscension.Update();
+        // Keep the Ember Court guest list inside the slots the researched talents of GarrTalentTree 324 still
+        // grant, and drop invitations for guests whose "RSVP: <Guest>" quest no longer stands. Hosting history
+        // is never dropped.
+        _emberCourt.Update();
+    }
 
     // Remove expired unclaimed missions
     RemoveExpiredMissions();
@@ -858,7 +1019,14 @@ void Garrison::LearnBlueprint(uint32 garrBuildingId)
     else if (HasBlueprint(garrBuildingId))
         learnBlueprintResult.Result = GARRISON_ERROR_BLUEPRINT_EXISTS;
     else
+    {
         _knownBuildings.insert(garrBuildingId);
+
+        // CriteriaType::LearnGarrisonBlueprint (179, Asset = GarrBuildingID) and
+        // CriteriaType::LearnAnyGarrisonBlueprint (178, no asset). miscValue1 = GarrBuilding id.
+        _owner->UpdateCriteria(CriteriaType::LearnGarrisonBlueprint, garrBuildingId);
+        _owner->UpdateCriteria(CriteriaType::LearnAnyGarrisonBlueprint, garrBuildingId);
+    }
 
     _owner->SendDirectMessage(learnBlueprintResult.Write());
 }
@@ -942,6 +1110,9 @@ void Garrison::PlaceBuilding(uint32 garrPlotInstanceId, uint32 garrBuildingId)
         }
 
         _owner->UpdateCriteria(CriteriaType::PlaceGarrisonBuilding, garrBuildingId);
+        // CriteriaType::PlaceAnyGarrisonBuilding (166) - counter, no asset. miscValue1 = GarrBuilding id
+        // so ModifierTree building conditions can still discriminate.
+        _owner->UpdateCriteria(CriteriaType::PlaceAnyGarrisonBuilding, garrBuildingId);
     }
 
     _owner->SendDirectMessage(placeBuildingResult.Write());
@@ -1018,6 +1189,8 @@ void Garrison::ActivateBuilding(uint32 garrPlotInstanceId)
             _owner->SendDirectMessage(buildingActivated.Write());
 
             _owner->UpdateCriteria(CriteriaType::ActivateAnyGarrisonBuilding, plot->BuildingInfo.PacketInfo->GarrBuildingID);
+            // CriteriaType::ActivateGarrisonBuilding (169, Asset = GarrBuildingID).
+            _owner->UpdateCriteria(CriteriaType::ActivateGarrisonBuilding, plot->BuildingInfo.PacketInfo->GarrBuildingID);
         }
     }
 }
@@ -1117,39 +1290,87 @@ uint32 Garrison::GetBonusFollowerSlots() const
 
 void Garrison::LearnSpecialization(uint32 garrSpecId)
 {
+    // Every exit answers. This is reached from SPELL_EFFECT_LEARN_GARRISON_SPECIALIZATION, i.e. the player
+    // used an item/ability and previously got nothing back on any path - success only pushed a full blueprint
+    // resend, and all three rejections were silent.
+    auto sendResult = [this, garrSpecId](uint32 result)
+    {
+        WorldPackets::Garrison::GarrisonLearnSpecializationResult learnResult;
+        learnResult.Result = result;
+        learnResult.GarrSpecID = garrSpecId;
+        _owner->SendDirectMessage(learnResult.Write());
+    };
+
     GarrSpecializationEntry const* specEntry = sGarrSpecializationStore.LookupEntry(garrSpecId);
     if (!specEntry)
+    {
+        sendResult(GARRISON_ERROR_INVALID_SPECIALIZATION);
         return;
+    }
 
     if (specEntry->GarrTypeID != static_cast<uint8>(GetType()))
+    {
+        sendResult(GARRISON_ERROR_INVALID_GARRISON_TYPE);
         return;
+    }
 
     if (_knownSpecializations.count(garrSpecId))
+    {
+        sendResult(GARRISON_ERROR_SPECIALIZATION_EXISTS);
         return;
+    }
 
     _knownSpecializations.insert(garrSpecId);
+    // Data first, then the ack: the client resolves the specialization out of its known list when it
+    // handles the result, so the list has to already contain it.
     SendBlueprintAndSpecializationData();
+    sendResult(GARRISON_SUCCESS);
+
+    // CriteriaType::LearnGarrisonSpecialization (181, Asset = GarrSpecializationID) and
+    // CriteriaType::LearnAnyGarrisonSpecialization (180, no asset).
+    _owner->UpdateCriteria(CriteriaType::LearnGarrisonSpecialization, garrSpecId);
+    _owner->UpdateCriteria(CriteriaType::LearnAnyGarrisonSpecialization, garrSpecId);
 }
 
-void Garrison::SetBuildingSpecialization(uint32 garrPlotInstanceId, uint32 garrSpecId)
+GarrisonError Garrison::SetBuildingSpecialization(uint32 garrPlotInstanceId, uint32 garrSpecId)
 {
+    // Every exit answers, and the answer carries the cooldown the client needs to grey the control out.
+    // The cooldown reported on a rejection is the one already running (that is what the player wants to see);
+    // on success it is the freshly armed one.
+    auto sendResult = [this, garrPlotInstanceId, garrSpecId](uint32 result, time_t cooldown) -> GarrisonError
+    {
+        WorldPackets::Garrison::GarrisonBuildingSetActiveSpecializationResult specResult;
+        specResult.Result = result;
+        specResult.GarrPlotInstanceID = garrPlotInstanceId;
+        specResult.GarrSpecID = garrSpecId;
+        specResult.TimeSpecCooldown = uint64(cooldown);
+        _owner->SendDirectMessage(specResult.Write());
+        return GarrisonError(result);
+    };
+
     Plot* plot = GetPlot(garrPlotInstanceId);
-    if (!plot || !plot->BuildingInfo.PacketInfo || !plot->BuildingInfo.PacketInfo->Active)
-        return;
+    if (!plot)
+        return sendResult(GARRISON_ERROR_INVALID_PLOT_INSTANCEID, 0);
+
+    if (!plot->BuildingInfo.PacketInfo)
+        return sendResult(GARRISON_ERROR_NO_BUILDING, 0);
+
+    if (!plot->BuildingInfo.PacketInfo->Active)
+        return sendResult(GARRISON_ERROR_BUILDING_NOT_ACTIVE, time_t(plot->BuildingInfo.PacketInfo->TimeSpecCooldown));
 
     if (garrSpecId != 0)
     {
         GarrSpecializationEntry const* specEntry = sGarrSpecializationStore.LookupEntry(garrSpecId);
         if (!specEntry)
-            return;
+            return sendResult(GARRISON_ERROR_INVALID_SPECIALIZATION, time_t(plot->BuildingInfo.PacketInfo->TimeSpecCooldown));
 
         if (!HasSpecialization(garrSpecId))
-            return;
+            return sendResult(GARRISON_ERROR_INVALID_SPECIALIZATION, time_t(plot->BuildingInfo.PacketInfo->TimeSpecCooldown));
 
         // Check cooldown
         if (plot->BuildingInfo.PacketInfo->CurrentGarSpecID != 0 &&
             plot->BuildingInfo.PacketInfo->TimeSpecCooldown > GameTime::GetGameTime())
-            return;
+            return sendResult(GARRISON_ERROR_SPECIALIZATION_ON_COOLDOWN, time_t(plot->BuildingInfo.PacketInfo->TimeSpecCooldown));
     }
 
     plot->BuildingInfo.PacketInfo->CurrentGarSpecID = garrSpecId;
@@ -1157,6 +1378,8 @@ void Garrison::SetBuildingSpecialization(uint32 garrPlotInstanceId, uint32 garrS
     // Set cooldown for changing specialization (1 day)
     if (garrSpecId != 0)
         plot->BuildingInfo.PacketInfo->TimeSpecCooldown = GameTime::GetGameTime() + DAY;
+
+    return sendResult(GARRISON_SUCCESS, time_t(plot->BuildingInfo.PacketInfo->TimeSpecCooldown));
 }
 
 void Garrison::AddFollower(uint32 garrFollowerId)
@@ -1174,6 +1397,16 @@ void Garrison::AddFollower(uint32 garrFollowerId)
     if (followerEntry->GarrTypeID != static_cast<uint8>(GetType()))
     {
         addFollowerResult.Result = GARRISON_ERROR_INVALID_GARRISON;
+        _owner->SendDirectMessage(addFollowerResult.Write());
+        return;
+    }
+
+    // Covenant ownership. GarrFollower.CovenantID splits the 138 Shadowlands companions
+    // {0: 41 shared, 1: 30 Kyrian, 2: 22 Venthyr, 3: 23 Night Fae, 4: 22 Necrolord} - a
+    // Necrolord companion must not end up in a Kyrian sanctum. 0 means "any covenant".
+    if (!IsFollowerCovenantAllowed(followerEntry))
+    {
+        addFollowerResult.Result = GARRISON_ERROR_INVALID_FOLLOWER;
         _owner->SendDirectMessage(addFollowerResult.Write());
         return;
     }
@@ -1200,6 +1433,10 @@ void Garrison::AddFollower(uint32 garrFollowerId)
     follower.PacketInfo.CurrentMissionID = 0;
     follower.PacketInfo.AbilityID = sGarrisonMgr.RollFollowerAbilities(garrFollowerId, followerEntry, follower.PacketInfo.Quality, GetFaction(), true);
     follower.PacketInfo.FollowerStatus = 0;
+    // Adventures companions carry health between missions; they start at the full value their
+    // GarrAutoCombatant statline gives at their level. Followers without a statline (all of
+    // WoD/Legion/War Campaign) keep the pre-existing durability-driven model untouched.
+    follower.PacketInfo.Health = GetFollowerMaxHealth(followerEntry, follower.PacketInfo.FollowerLevel);
 
     // Respect the active-follower cap: recruit as INACTIVE when the roster is already at MaxFollowers active. Without
     // this, bulk-recruiting a class hall's champions (e.g. all 9 hunter champions at once when the cap is 6) leaves
@@ -1221,7 +1458,14 @@ void Garrison::AddFollower(uint32 garrFollowerId)
     addFollowerResult.Follower = follower.PacketInfo;
     _owner->SendDirectMessage(addFollowerResult.Write());
 
-    _owner->UpdateCriteria(CriteriaType::RecruitGarrisonFollower, follower.PacketInfo.DbID);
+    // Criteria for follower events key on the GarrFollower **record id**, never on the runtime DbID:
+    // CriteriaHandler::RequirementsSatisfied compares miscValue1 against Criteria.Asset.GarrFollowerID and the
+    // garrison ModifierTree evaluators (GarrisonFollowerType 187, GarrisonFollowerItemLevel... 168,
+    // HasGarrisonFollower 157) all resolve miscValue1 through sGarrFollowerStore / PacketInfo.GarrFollowerID.
+    // Passing DbID here meant no RecruitGarrisonFollower criterion could ever match.
+    _owner->UpdateCriteria(CriteriaType::RecruitGarrisonFollower, garrFollowerId);
+    // CriteriaType::RecruitAnyGarrisonFollower (175) - counter, gated by ModifierTree on follower type/quality.
+    _owner->UpdateCriteria(CriteriaType::RecruitAnyGarrisonFollower, garrFollowerId);
 }
 
 void Garrison::AddTroop(uint32 garrFollowerId, uint32 durability)
@@ -1254,6 +1498,9 @@ void Garrison::AddTroop(uint32 garrFollowerId, uint32 durability)
 
     addFollowerResult.Follower = follower.PacketInfo;
     _owner->SendDirectMessage(addFollowerResult.Write());
+
+    // CriteriaType::RecruitAnyGarrisonTroop (200) - counter ("Recruit 20 troops."). miscValue1 = GarrFollower id.
+    _owner->UpdateCriteria(CriteriaType::RecruitAnyGarrisonTroop, garrFollowerId);
 }
 
 Garrison::Follower const* Garrison::GetFollower(uint64 dbId) const
@@ -1689,18 +1936,21 @@ void Garrison::PopulateMissionData(Mission& mission, GarrMissionEntry const* mis
                     encounter.Mechanics.push_back(mechanic->GarrMechanicTypeID);
             }
 
-            // Also add the encounter's environment mechanic type if it has one
-            if (encounterEntry->EnvGarrMechanicTypeID != 0)
-                encounter.Mechanics.push_back(encounterEntry->EnvGarrMechanicTypeID);
+            // GarrEncounter publishes no mechanic column in build 12.0.7.68275 - an encounter's
+            // mechanics come from GarrEncounterXMechanic (above) and the mission-wide environment
+            // mechanic from GarrMission.EnvGarrMechanicTypeID, which the client reads from DB2
+            // itself. The field previously appended here was really GarrEncounter.Flags.
 
-            // Populate auto-combat data from combatant linked to this encounter
+            // Auto-combat statline for this encounter, scaled to the mission's target level. The
+            // board slot comes from GarrMissionXEncounter (GarrAutoCombatant has no board column).
             if (GarrAutoCombatantEntry const* combatant = sGarrisonMgr.GetAutoCombatantForEncounter(encounterEntry->ID))
             {
+                uint32 encounterLevel = uint32(std::max<int32>(missionEntry->TargetLevel, 1));
                 encounter.GarrAutoCombatantID = combatant->ID;
-                encounter.Health = combatant->Health;
-                encounter.MaxHealth = combatant->MaxHealth;
-                encounter.Attack = combatant->Attack;
-                encounter.BoardIndex = static_cast<int8>(combatant->BoardIndex);
+                encounter.MaxHealth = GarrisonAutoCombat::ScaleHealth(combatant, encounterLevel);
+                encounter.Health = encounter.MaxHealth;
+                encounter.Attack = GarrisonAutoCombat::ScaleAttack(combatant, encounterLevel);
+                encounter.BoardIndex = missionEncounter->BoardIndex;
             }
 
             mission.PacketInfo.Encounters.push_back(std::move(encounter));
@@ -1817,8 +2067,18 @@ void Garrison::AddMission(uint32 garrMissionId)
     mission.PacketInfo.MissionRecID = garrMissionId;
     mission.PacketInfo.OfferTime = GameTime::GetGameTime();
     mission.PacketInfo.OfferDuration = Seconds(missionEntry->OfferDuration);
-    mission.PacketInfo.StartTime = time_t(2288912640);
-    mission.PacketInfo.TravelDuration = Seconds(missionEntry->TravelDuration);
+    // Sentinel StartTime for an offered (not-yet-started) mission. The client keys "offered" off
+    // MissionState == 0 and does not render a start timer for it, but the value should still match
+    // retail's far-PAST sentinel (~year 0) rather than the old far-FUTURE ~2042 value (2288912640),
+    // which could render as a bogus future start if a client ever read it.
+    mission.PacketInfo.StartTime = time_t(-62169984000);
+    // Command Table tier 2 (GarrAbility 1273 'Strategic Genius', GarrAbilityEffect 1843: AbilityAction 17,
+    // ActionValueFlat 0.75) multiplies the travel duration of a Shadowlands adventure. Applied at offer time so
+    // the discounted value is what persists and round-trips (character_garrison_missions.travelDuration).
+    // AMBIGUITY (sniff needed): the talent tooltip says total COMPLETION time while the ability text and
+    // AbilityAction 17 say TRAVEL time - this applies the published action (travel only). One retail
+    // SMSG_GARRISON_ADD_MISSION_RESULT capture with the tier-2 talent researched settles which duration shrinks.
+    mission.PacketInfo.TravelDuration = Seconds(int64(missionEntry->TravelDuration * GetTalentAbilityActionMultiplier(GARR_ABILITY_ACTION_MISSION_TRAVEL_TIME)));
     mission.PacketInfo.MissionDuration = Seconds(missionEntry->MissionDuration);
     mission.PacketInfo.MissionState = 0; // Offered
     mission.PacketInfo.SuccessChance = 0;
@@ -1846,6 +2106,10 @@ void Garrison::AddMission(uint32 garrMissionId)
 // on every open (sniff: GET_GARRISON_INFO_RESULT + per-mission ADD_MISSION_RESULT).
 void Garrison::SendOfferedMissions() const
 {
+    // An un-unlocked covenant command table has no board to re-send (see IsMissionBoardUnlocked).
+    if (!IsMissionBoardUnlocked())
+        return;
+
     for (auto const& [dbId, mission] : _missions)
     {
         if (mission.PacketInfo.MissionState != 0) // 0 = offered; skip in-progress/completed
@@ -1861,6 +2125,50 @@ void Garrison::SendOfferedMissions() const
         addMissionResult.CanStartMission = true;
         _owner->SendDirectMessage(addMissionResult.Write());
     }
+}
+
+// Finally a consumer for GARR_TALENT_FEATURE_COMMAND_TABLE: the audit (COVENANT_SANCTUM_AUDIT.md par.1.4) found
+// the covenant mission board served unconditionally while the tier-0 'Tactical Insight' talents gated nothing.
+// The gate is resolved from data, not talent ids: the Command Table tree of the player's ACTIVE covenant
+// (FeatureTypeIndex 3, FeatureSubtypeIndex = CovenantID), its Tier-0 talent, researched to rank >= 1. With no
+// active covenant there is no command table to serve at all.
+bool Garrison::IsMissionBoardUnlocked() const
+{
+    if (GetType() != GARRISON_TYPE_COVENANT)
+        return true;
+
+    std::vector<GarrTalentTreeEntry const*> const* trees = sGarrisonMgr.GetTalentTreesForGarrType(static_cast<int8>(GARRISON_TYPE_COVENANT));
+    if (!trees)
+        return true;
+
+    for (GarrTalentTreeEntry const* treeEntry : *trees)
+    {
+        if (treeEntry->FeatureTypeIndex != GARR_TALENT_FEATURE_COMMAND_TABLE)
+            continue;
+
+        if (uint32(treeEntry->FeatureSubtypeIndex) != _owner->GetActiveCovenant())
+            continue;
+
+        std::vector<GarrTalentEntry const*> const* talents = sGarrisonMgr.GetTalentsForTree(treeEntry->ID);
+        if (!talents)
+            continue;
+
+        for (GarrTalentEntry const* talentEntry : *talents)
+        {
+            if (talentEntry->Tier != 0)
+                continue;
+
+            Talent const* talent = GetTalent(talentEntry->ID);
+            if (talent && talent->Rank >= 1)
+                return true;
+        }
+
+        // The covenant's Command Table tree exists and its unlock tier is not researched.
+        return false;
+    }
+
+    // No Command Table tree matches (e.g. no active covenant yet) - there is no table to operate.
+    return false;
 }
 
 bool Garrison::IsOfferPoolFull() const
@@ -1902,11 +2210,25 @@ Garrison::Mission const* Garrison::GetMissionByRecID(uint32 missionRecID) const
 
 Garrison::Mission* Garrison::GetMissionByRecID(uint32 missionRecID)
 {
+    // A rec id is supposed to be unique per garrison, but rows written before the load-time duplicate guard
+    // existed can still hold two: one in progress and one merely offered. _missions is an unordered_map, so
+    // "first match" was whatever the hash happened to yield - and picking the offered row made the running
+    // mission uncompletable. Prefer a mission that has actually been started; fall back to the first match so a
+    // pure offer still resolves.
+    Mission* offered = nullptr;
     for (auto& p : _missions)
-        if (static_cast<uint32>(p.second.PacketInfo.MissionRecID) == missionRecID)
+    {
+        if (static_cast<uint32>(p.second.PacketInfo.MissionRecID) != missionRecID)
+            continue;
+
+        if (p.second.PacketInfo.MissionState != 0)
             return &p.second;
 
-    return nullptr;
+        if (!offered)
+            offered = &p.second;
+    }
+
+    return offered;
 }
 
 int32 Garrison::CalculateSuccessChance(uint32 missionRecID, std::vector<uint64> const& followerDBIDs) const
@@ -2038,8 +2360,266 @@ int32 Garrison::CalculateSuccessChance(uint32 missionRecID, std::vector<uint64> 
     return int32(std::clamp(chance, 0.0f, cap));
 }
 
-GarrisonError Garrison::StartMission(uint32 missionRecID, std::vector<uint64> const& followerDBIDs)
+// Fills PacketInfo.BoardIndex for every companion assigned to one mission.
+//
+// The Adventures client places each companion in a named slot of the board and sends that slot with
+// CMSG_GARRISON_START_MISSION; it then expects the same slot back so its own follower record - the one
+// C_Garrison.GetFollowerMissionCompleteInfo reads and the complete screen resolves puck frames from -
+// carries a real value. Slots are the client's GarrAutoBoardIndex enum: allies occupy 0..4.
+//
+// Client input is not trusted: a slot outside the ally range, or one already taken by another companion
+// on the same mission, is dropped and refilled. Anything left unplaced (that is every WoD and Legion
+// mission, whose UIs have no board at all, plus missions that were already in progress before board
+// indexes were stored) is filled in retail's own auto-assignment order - AllyLeftFront, AllyCenterFront,
+// AllyRightFront, AllyLeftBack, AllyRightBack (AutoAssignmentFollowerOrder,
+// Blizzard_CovenantMissionUI.lua:612). No companion is ever left at None, because a None slot is exactly
+// what made the complete screen index a nil frame.
+void Garrison::AssignMissionBoardIndexes(Mission const& mission, std::vector<int32> const& boardIndexes)
 {
+    static constexpr std::array<int8, 5> autoAssignmentOrder =
+    {
+        GARR_AUTO_BOARD_ALLY_LEFT_FRONT,
+        GARR_AUTO_BOARD_ALLY_CENTER_FRONT,
+        GARR_AUTO_BOARD_ALLY_RIGHT_FRONT,
+        GARR_AUTO_BOARD_ALLY_LEFT_BACK,
+        GARR_AUTO_BOARD_ALLY_RIGHT_BACK
+    };
+
+    std::array<bool, autoAssignmentOrder.size()> slotTaken = { };
+    std::vector<Follower*> unplaced;
+    unplaced.reserve(mission.CurrentFollowerDBIDs.size());
+
+    for (std::size_t i = 0; i < mission.CurrentFollowerDBIDs.size(); ++i)
+    {
+        Follower* follower = GetFollower(mission.CurrentFollowerDBIDs[i]);
+        if (!follower)
+            continue;
+
+        int32 requested = i < boardIndexes.size() ? boardIndexes[i] : int32(GARR_AUTO_BOARD_NONE);
+        if (IsAllyBoardIndex(requested) && !slotTaken[requested])
+        {
+            slotTaken[requested] = true;
+            follower->PacketInfo.BoardIndex = int8(requested);
+        }
+        else
+        {
+            follower->PacketInfo.BoardIndex = GARR_AUTO_BOARD_NONE;
+            unplaced.push_back(follower);
+        }
+    }
+
+    auto nextFree = autoAssignmentOrder.begin();
+    for (Follower* follower : unplaced)
+    {
+        while (nextFree != autoAssignmentOrder.end() && slotTaken[*nextFree])
+            ++nextFree;
+
+        // More companions than the board has slots cannot happen through StartMission (MaxFollowers is
+        // validated against GarrMission), but a hand-edited character DB could produce it. Leaving the
+        // extras at None is still better than handing out a duplicate slot.
+        if (nextFree == autoAssignmentOrder.end())
+            break;
+
+        slotTaken[*nextFree] = true;
+        follower->PacketInfo.BoardIndex = *nextFree;
+    }
+}
+
+namespace
+{
+// Translates one simulated event into the client's GarrAutoMissionEventType. The simulator's own
+// AutoCombatEffectType says what happened mechanically; the client's enum additionally distinguishes
+// melee from ranged (by the caster's GarrAutoCombatant.Role) and an ability cast from a plain
+// auto-attack, which is why the event carries both.
+uint32 ToClientEventType(AutoCombatEvent const& event)
+{
+    bool const casterIsMelee = event.CasterRole == AUTO_COMBAT_ROLE_MELEE
+        || event.CasterRole == AUTO_COMBAT_ROLE_TANK;
+
+    switch (event.EffectType)
+    {
+        case AUTO_COMBAT_EFFECT_DAMAGE:
+            if (event.IsAutoAttack)
+                return casterIsMelee ? GARR_AUTO_MISSION_EVENT_MELEE_DAMAGE : GARR_AUTO_MISSION_EVENT_RANGE_DAMAGE;
+            return casterIsMelee ? GARR_AUTO_MISSION_EVENT_SPELL_MELEE_DAMAGE : GARR_AUTO_MISSION_EVENT_SPELL_RANGE_DAMAGE;
+        case AUTO_COMBAT_EFFECT_HEAL:
+            return GARR_AUTO_MISSION_EVENT_HEAL;
+        // A DoT/HoT row produces two different events: the cast that applies it, and each later tick.
+        // The client draws them differently (a tick is PeriodicDamage/PeriodicHeal and carries points,
+        // the application is an aura), so IsPeriodicTick is what separates them.
+        case AUTO_COMBAT_EFFECT_DOT:
+            return event.IsPeriodicTick ? GARR_AUTO_MISSION_EVENT_PERIODIC_DAMAGE : GARR_AUTO_MISSION_EVENT_APPLY_AURA;
+        case AUTO_COMBAT_EFFECT_HOT:
+            return event.IsPeriodicTick ? GARR_AUTO_MISSION_EVENT_PERIODIC_HEAL : GARR_AUTO_MISSION_EVENT_APPLY_AURA;
+        default:
+            return GARR_AUTO_MISSION_EVENT_APPLY_AURA;
+    }
+}
+
+// Which coloured bucket the board socket files an aura under. Only read for ApplyAura/RemoveAura.
+uint32 ToClientAuraType(AutoCombatEvent const& event)
+{
+    switch (event.EffectType)
+    {
+        case AUTO_COMBAT_EFFECT_HEAL:
+        case AUTO_COMBAT_EFFECT_HOT:
+            return GARR_AUTO_PREVIEW_TARGET_HEAL;
+        case AUTO_COMBAT_EFFECT_DOT:
+            return GARR_AUTO_PREVIEW_TARGET_DEBUFF;
+        case AUTO_COMBAT_EFFECT_DAMAGE:
+            return GARR_AUTO_PREVIEW_TARGET_DAMAGE;
+        default:
+            return GARR_AUTO_PREVIEW_TARGET_NONE;
+    }
+}
+
+// The client shows a number next to the target for exactly these event types (EventHasPoints,
+// Blizzard_AdventuresCombatLog.lua:22-30); for the rest it must be absent, and the wire has a
+// presence byte for that.
+bool ClientEventHasPoints(uint32 clientEventType)
+{
+    switch (clientEventType)
+    {
+        case GARR_AUTO_MISSION_EVENT_MELEE_DAMAGE:
+        case GARR_AUTO_MISSION_EVENT_RANGE_DAMAGE:
+        case GARR_AUTO_MISSION_EVENT_SPELL_MELEE_DAMAGE:
+        case GARR_AUTO_MISSION_EVENT_SPELL_RANGE_DAMAGE:
+        case GARR_AUTO_MISSION_EVENT_PERIODIC_DAMAGE:
+        case GARR_AUTO_MISSION_EVENT_HEAL:
+        case GARR_AUTO_MISSION_EVENT_PERIODIC_HEAL:
+            return true;
+        default:
+            return false;
+    }
+}
+}
+
+// Fills the two arrays SMSG_GARRISON_COMPLETE_MISSION_RESULT carries beyond the mission itself: where
+// every companion ended up, and the blow-by-blow the Adventures complete screen replays. Both used to
+// be sent empty, which left the screen with a mission it could not play back.
+void Garrison::BuildMissionCompleteResult(Mission const& mission,
+    WorldPackets::Garrison::GarrisonCompleteMissionResult& result) const
+{
+    result.FollowerInfos.reserve(mission.CurrentFollowerDBIDs.size());
+    for (uint64 followerDbId : mission.CurrentFollowerDBIDs)
+    {
+        Follower const* follower = GetFollower(followerDbId);
+        if (!follower)
+            continue;
+
+        WorldPackets::Garrison::GarrisonCompleteMissionFollowerInfo info;
+        info.DbID = followerDbId;
+        info.Health = uint32(std::max<int32>(follower->PacketInfo.Health, 0));
+        info.HealingTimestamp = uint64(follower->PacketInfo.HealingTimestamp);
+        // Shadowlands companions are never removed by a lost adventure: they come back on whatever
+        // health the fight left them and are healed with anima afterwards. Nothing in the simulation
+        // kills a follower, so reporting anything but Alive would be a claim the reward path does not
+        // back up.
+        info.State = GARR_FOLLOWER_MISSION_COMPLETE_ALIVE;
+        result.FollowerInfos.push_back(info);
+    }
+
+    result.Rounds.reserve(mission.CombatResult.CombatLog.size());
+    for (AutoCombatRound const& simulatedRound : mission.CombatResult.CombatLog)
+    {
+        WorldPackets::Garrison::GarrisonAutoMissionRound round;
+        round.Events.reserve(simulatedRound.Events.size());
+
+        for (AutoCombatEvent const& simulatedEvent : simulatedRound.Events)
+        {
+            // Every event the replay receives has to name a GarrAutoSpell. AdventuresCombatLogMixin::
+            // AddCombatEvent (Blizzard_AdventuresCombatLog.lua:117-119) calls
+            // C_Garrison.GetCombatLogSpellInfo(event.spellID) and immediately indexes the result, which
+            // is nil for an id that is not in GarrAutoSpell.db2 - so a zero id is a Lua error in the
+            // middle of the replay, and dropping the event is the only degradation that is not one. The
+            // simulator is not supposed to produce these any more; this is the backstop.
+            GarrAutoSpellEntry const* autoSpell = sGarrAutoSpellStore.LookupEntry(simulatedEvent.SpellID);
+            if (!autoSpell)
+            {
+                TC_LOG_ERROR("garrison", "Garrison::BuildMissionCompleteResult: dropped an auto-combat "
+                    "event from board index {} with GarrAutoSpell {}, which the client cannot resolve",
+                    simulatedEvent.CasterBoardIndex, simulatedEvent.SpellID);
+                continue;
+            }
+
+            uint32 const clientEventType = ToClientEventType(simulatedEvent);
+            // The damage school is published per auto-combat spell, and the replay picks the spell
+            // visual off it (GetTypeFromSchoolMask, Blizzard_AdventuresCompleteScreen.lua:300).
+            uint32 const schoolMask = uint32(std::max<int32>(autoSpell->SchoolMask, 0));
+
+            WorldPackets::Garrison::GarrisonAutoMissionEvent packetEvent;
+            packetEvent.Type = clientEventType;
+            packetEvent.SpellID = simulatedEvent.SpellID;
+            packetEvent.SchoolMask = schoolMask;
+            packetEvent.EffectIndex = simulatedEvent.EffectIndex;
+            packetEvent.CasterBoardIndex = uint32(simulatedEvent.CasterBoardIndex);
+            packetEvent.AuraType = ToClientAuraType(simulatedEvent);
+
+            WorldPackets::Garrison::GarrisonAutoMissionTargetInfo target;
+            target.BoardIndex = uint32(simulatedEvent.TargetBoardIndex);
+            target.OldHealth = uint32(std::max<int32>(simulatedEvent.TargetOldHealth, 0));
+            target.NewHealth = uint32(std::max<int32>(simulatedEvent.TargetNewHealth, 0));
+            target.MaxHealth = uint32(std::max<int32>(simulatedEvent.TargetMaxHealth, 0));
+            if (ClientEventHasPoints(clientEventType))
+                target.Points = uint32(simulatedEvent.Amount < 0 ? -simulatedEvent.Amount : simulatedEvent.Amount);
+            packetEvent.TargetInfo.push_back(std::move(target));
+
+            round.Events.push_back(std::move(packetEvent));
+
+            // A killing blow is two events on the wire: the hit, then the death the board animates
+            // (Blizzard_AdventuresBoard.lua:435 switches on the Died type). The death is attributed to
+            // the same spell as the blow that caused it - the client runs a Died event through the same
+            // AddCombatEvent path as every other one, so it needs a resolvable spellID even though
+            // COVENANT_MISSIONS_COMBAT_LOG_DIED only formats the caster and target names. Leaving these
+            // three fields at their defaults is what put spellID 0 on the wire and faulted the replay.
+            if (simulatedEvent.TargetDied)
+            {
+                WorldPackets::Garrison::GarrisonAutoMissionEvent deathEvent;
+                deathEvent.Type = GARR_AUTO_MISSION_EVENT_DIED;
+                deathEvent.SpellID = simulatedEvent.SpellID;
+                deathEvent.SchoolMask = schoolMask;
+                deathEvent.EffectIndex = simulatedEvent.EffectIndex;
+                deathEvent.CasterBoardIndex = uint32(simulatedEvent.CasterBoardIndex);
+
+                WorldPackets::Garrison::GarrisonAutoMissionTargetInfo deathTarget;
+                deathTarget.BoardIndex = uint32(simulatedEvent.TargetBoardIndex);
+                deathTarget.OldHealth = uint32(std::max<int32>(simulatedEvent.TargetOldHealth, 0));
+                deathTarget.NewHealth = 0;
+                deathTarget.MaxHealth = uint32(std::max<int32>(simulatedEvent.TargetMaxHealth, 0));
+                deathEvent.TargetInfo.push_back(std::move(deathTarget));
+
+                round.Events.push_back(std::move(deathEvent));
+            }
+        }
+
+        // Never publish a round with no events. AdventuresCompleteScreenMixin::StartReplayRound
+        // (Blizzard_AdventuresCompleteScreen.lua:276) walks straight into StartReplayEvent(roundIndex, 1)
+        // for every round it is handed, and that indexes round.events[1] unconditionally - so an empty
+        // round is a nil deref inside AddCombatEvent and the whole replay dies with
+        //   Blizzard_AdventuresCombatLog.lua:117: attempt to index local 'combatLogEvent' (a nil value)
+        // taking the completion UI with it, which leaves the mission stuck at state 2 and its companions
+        // still bound. A round can end up empty either because the simulator produced no events for it or
+        // because every event it did produce named a GarrAutoSpell the client cannot resolve and was
+        // dropped above. Skipping it loses one round of replay animation; emitting it loses the mission.
+        if (round.Events.empty())
+        {
+            TC_LOG_DEBUG("garrison", "Garrison::BuildMissionCompleteResult: skipped an auto-combat round with no "
+                "publishable events (mission rec {})", mission.PacketInfo.MissionRecID);
+            continue;
+        }
+
+        result.Rounds.push_back(std::move(round));
+    }
+}
+
+GarrisonError Garrison::StartMission(uint32 missionRecID, std::vector<uint64> const& followerDBIDs,
+    std::vector<int32> const& boardIndexes)
+{
+    // A locked covenant command table can hold stale offers generated before the gate existed (they persist);
+    // refuse to start them rather than let a client bypass the Tactical Insight unlock.
+    if (!IsMissionBoardUnlocked())
+        return GARRISON_ERROR_MISSION_START_CONDITION_FAILED;
+
     GarrMissionEntry const* missionEntry = sGarrMissionStore.LookupEntry(missionRecID);
     if (!missionEntry)
         return GARRISON_ERROR_INVALID_MISSION;
@@ -2058,8 +2638,19 @@ GarrisonError Garrison::StartMission(uint32 missionRecID, std::vector<uint64> co
         return GARRISON_ERROR_MISSION_SIZE_INVALID;
 
     // Validate all followers
+    // Reject duplicate follower dbIDs up front. The not-already-on-mission check below only reads
+    // CurrentMissionID, which is still 0 for every entry here (it is set AFTER this loop, at the
+    // "Assign followers to mission" step), so it cannot catch the same follower listed twice. Without
+    // this guard one companion could fill every slot: CalculateSuccessChance would count its bias N
+    // times (success ~100%), RollMissionOutcome would build N combatants from it, and FinalizeMission
+    // would award its follower XP / decrement its troop durability N times — a guaranteed-win XP farm
+    // from a single follower. De-dup before any other check.
+    std::unordered_set<uint64> seenFollowerDbIds;
     for (uint64 followerDbId : followerDBIDs)
     {
+        if (!seenFollowerDbIds.insert(followerDbId).second)
+            return GARRISON_ERROR_INVALID_FOLLOWER;
+
         Follower const* follower = GetFollower(followerDbId);
         if (!follower)
             return GARRISON_ERROR_INVALID_FOLLOWER;
@@ -2073,9 +2664,20 @@ GarrisonError Garrison::StartMission(uint32 missionRecID, std::vector<uint64> co
         // The follower must match the mission's follower type: garrison followers crew garrison missions,
         // ships (GarrFollowerType 2) crew naval missions. Without this a ship could be slotted on a land
         // mission (or vice versa) - the client filters by type, but validate server-side too.
-        if (GarrFollowerEntry const* followerEntry = sGarrFollowerStore.LookupEntry(follower->PacketInfo.GarrFollowerID))
-            if (followerEntry->GarrFollowerTypeID != missionEntry->GarrFollowerTypeID)
-                return GARRISON_ERROR_INVALID_FOLLOWER;
+        GarrFollowerEntry const* followerEntry = sGarrFollowerStore.LookupEntry(follower->PacketInfo.GarrFollowerID);
+        if (followerEntry && followerEntry->GarrFollowerTypeID != missionEntry->GarrFollowerTypeID)
+            return GARRISON_ERROR_INVALID_FOLLOWER;
+
+        // Health / exhaustion deploy gate. A statline (Adventures) companion at 0 health is DEAD and an
+        // EXHAUSTED follower is spent - neither may be sent on a mission; they must be healed first (paid,
+        // RushHealFollower). GetFollowerMaxHealth is > 0 only for followers that publish a GarrAutoCombatant
+        // statline, so durability-model followers (WoD garrison / order hall, max 0) are governed by
+        // durability rather than health and are never blocked here for a 0 Health.
+        if (GetFollowerMaxHealth(followerEntry, follower->PacketInfo.FollowerLevel) > 0 && follower->PacketInfo.Health <= 0)
+            return GARRISON_ERROR_INVALID_FOLLOWER;
+
+        if (follower->PacketInfo.FollowerStatus & FOLLOWER_STATUS_EXHAUSTED)
+            return GARRISON_ERROR_INVALID_FOLLOWER;
     }
 
     // Check required followers (GarrMissionXFollower.db2)
@@ -2125,6 +2727,12 @@ GarrisonError Garrison::StartMission(uint32 missionRecID, std::vector<uint64> co
             follower->PacketInfo.CurrentMissionID = missionRecID;
     }
 
+    // Record where on the Adventures board each companion stands. Everything downstream reads this:
+    // the auto-combat simulation's turn order and targeting, the board slot echoed in
+    // SMSG_GARRISON_START_MISSION_RESULT, and the follower record the mission-complete screen resolves
+    // its puck frames from.
+    AssignMissionBoardIndexes(*mission, boardIndexes);
+
     // Calculate success chance using encounter-based mechanic system
     int32 successChance = CalculateSuccessChance(missionRecID, followerDBIDs);
 
@@ -2140,6 +2748,19 @@ GarrisonError Garrison::StartMission(uint32 missionRecID, std::vector<uint64> co
         _lastMissionStartDay = today;
     }
     ++_missionsStartedToday;
+
+    // Keep the client's daily counter in step. Without this the value only refreshes on a full
+    // GetGarrisonInfo round trip, so the mission-list cap reads stale for the rest of the session.
+    WorldPackets::Garrison::UpdateDailyMissionCounter dailyCounter;
+    dailyCounter.GarrTypeID = static_cast<uint8>(GetType());
+    dailyCounter.Count = static_cast<uint16>(std::min<uint32>(_missionsStartedToday, std::numeric_limits<uint16>::max()));
+    _owner->SendDirectMessage(dailyCounter.Write());
+
+    // CriteriaType::StartGarrisonMission (172, Asset = GarrMissionID) and
+    // CriteriaType::StartAnyGarrisonMissionWithFollowerType (171, Asset = GarrFollowerTypeID).
+    // miscValue2 carries the GarrMission record id so mission-scoped ModifierTree conditions can discriminate.
+    _owner->UpdateCriteria(CriteriaType::StartGarrisonMission, missionRecID);
+    _owner->UpdateCriteria(CriteriaType::StartAnyGarrisonMissionWithFollowerType, missionEntry->GarrFollowerTypeID, missionRecID);
 
     return GARRISON_SUCCESS;
 }
@@ -2176,8 +2797,10 @@ GarrisonError Garrison::CompleteMission(uint32 missionRecID)
 }
 
 // Rolls a mission's success outcome: auto-combat simulation for adventure missions, otherwise a
-// straight roll against the pre-computed SuccessChance. Pure computation — no state change, no grants.
-bool Garrison::RollMissionOutcome(Mission const& mission, uint32 missionRecID) const
+// straight roll against the pre-computed SuccessChance. No grants and no persisted state change; the
+// one thing it does record is mission.CombatResult, the round-by-round replay the Adventures complete
+// screen plays back and the source of each companion's post-battle health.
+bool Garrison::RollMissionOutcome(Mission& mission, uint32 missionRecID)
 {
     bool isAutoCombatMission = false;
     for (auto const& encounter : mission.PacketInfo.Encounters)
@@ -2191,21 +2814,35 @@ bool Garrison::RollMissionOutcome(Mission const& mission, uint32 missionRecID) c
 
     if (isAutoCombatMission)
     {
+        // Board slots are assigned once, at StartMission, from what the client sent. Reading them back
+        // here (instead of renumbering 0,1,2... as before) is what makes the simulated fight happen on
+        // the same board the player laid out and the replay he is shown.
         std::vector<AutoCombatCombatant> playerUnits;
-        int8 boardIdx = 0;
         for (uint64 followerDbId : mission.CurrentFollowerDBIDs)
         {
             if (Follower const* follower = GetFollower(followerDbId))
             {
                 AutoCombatCombatant unit = GarrisonAutoCombat::BuildFollowerCombatant(
+                    sGarrFollowerStore.LookupEntry(follower->PacketInfo.GarrFollowerID),
                     follower->PacketInfo.FollowerLevel, follower->PacketInfo.Quality,
                     follower->PacketInfo.ItemLevelWeapon, follower->PacketInfo.ItemLevelArmor,
-                    follower->PacketInfo.BoardIndex >= 0 ? follower->PacketInfo.BoardIndex : boardIdx,
-                    followerDbId);
+                    follower->PacketInfo.BoardIndex, followerDbId);
+                // Companions carry damage between missions: they enter the fight on the health they
+                // ended the last one with, not at full. This includes 0 = dead: a statline companion that
+                // was killed does NOT silently come back at full (unit.MaxHealth is the statline max, > 0
+                // only for Adventures companions, so durability-model followers are untouched and fight at
+                // the combatant default). The StartMission health gate normally stops a dead follower being
+                // deployed at all; carrying 0 here is defence-in-depth for any already-in-flight mission.
+                if (unit.MaxHealth > 0 && follower->PacketInfo.Health >= 0 && follower->PacketInfo.Health < unit.MaxHealth)
+                    unit.CurrentHealth = follower->PacketInfo.Health;
                 playerUnits.push_back(std::move(unit));
-                ++boardIdx;
             }
         }
+
+        // Enemies scale to the mission's own target level, the same statline curve the companions
+        // use. The board slot and the level both come from the mission, never from the statline.
+        GarrMissionEntry const* missionEntry = sGarrMissionStore.LookupEntry(missionRecID);
+        uint32 encounterLevel = missionEntry ? uint32(std::max<int32>(missionEntry->TargetLevel, 1)) : 1u;
 
         std::vector<AutoCombatCombatant> enemyUnits;
         for (auto const& encounter : mission.PacketInfo.Encounters)
@@ -2217,15 +2854,23 @@ bool Garrison::RollMissionOutcome(Mission const& mission, uint32 missionRecID) c
             if (!combatant)
                 continue;
 
-            enemyUnits.push_back(GarrisonAutoCombat::BuildEnemyCombatant(combatant));
+            enemyUnits.push_back(GarrisonAutoCombat::BuildEnemyCombatant(combatant, encounterLevel, encounter.BoardIndex));
         }
 
-        AutoCombatResult combatResult = GarrisonAutoCombat::SimulateCombat(playerUnits, enemyUnits);
+        mission.CombatResult = GarrisonAutoCombat::SimulateCombat(playerUnits, enemyUnits);
         TC_LOG_DEBUG("garrison", "Auto-combat for mission {}: {} in {} rounds",
-            missionRecID, combatResult.PlayerWon ? "WON" : "LOST", combatResult.TotalRounds);
-        return combatResult.PlayerWon;
+            missionRecID, mission.CombatResult.PlayerWon ? "WON" : "LOST", mission.CombatResult.TotalRounds);
+
+        // Damage taken sticks to the companion. That value is what the complete screen shows, what the
+        // next mission starts from, and what the healing UI charges anima to undo.
+        for (AutoCombatCombatant const& unit : playerUnits)
+            if (Follower* follower = GetFollower(unit.FollowerDbID))
+                follower->PacketInfo.Health = unit.CurrentHealth;
+
+        return mission.CombatResult.PlayerWon;
     }
 
+    mission.CombatResult = { };
     return static_cast<int32>(urand(0, 99)) < mission.PacketInfo.SuccessChance;
 }
 
@@ -2253,6 +2898,19 @@ GarrisonError Garrison::FinalizeMission(uint32 missionRecID, bool grantOvermax)
     }
     bool succeeded = mission->Succeeded;
 
+    // Idempotent grant (SRV-G4): persist the mission's removal NOW, before granting anything, rather than
+    // relying on the next character SaveToDB to wipe+reinsert the mission rows. Some rewards below commit to
+    // the DB on their own (mail overflow, currency), so without this a crash after such a commit but before
+    // the next SaveToDB would reload the still-present MissionState==2 row and let BONUS_ROLL/GET_REWARD
+    // re-grant it. Deleting the row up front closes that window: a reload can no longer find the mission, so
+    // it cannot be finalized twice. If we crash between this delete and the grant the player simply loses the
+    // reward (rare) - never a double grant, which is the property we must guarantee. In-memory removal still
+    // happens at the end of this function for the live session.
+    CharacterDatabasePreparedStatement* delMissionStmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_GARRISON_MISSION);
+    delMissionStmt->setUInt64(0, _owner->GetGUID().GetCounter());
+    delMissionStmt->setUInt64(1, mission->PacketInfo.DbID);
+    CharacterDatabase.Execute(delMissionStmt);
+
     // Award follower XP (awarded regardless of success) and handle troop durability
     std::vector<uint64> troopsToRemove;
     uint32 followerXP = missionEntry->BaseFollowerXP;
@@ -2261,6 +2919,8 @@ GarrisonError Garrison::FinalizeMission(uint32 missionRecID, bool grantOvermax)
         if (Follower* follower = GetFollower(followerDbId))
         {
             follower->PacketInfo.CurrentMissionID = 0;
+            // The slot only means something while the companion is deployed; free it with the mission.
+            follower->PacketInfo.BoardIndex = GARR_AUTO_BOARD_NONE;
 
             // Troops lose 1 durability per mission
             if (follower->PacketInfo.FollowerStatus & FOLLOWER_STATUS_TROOP)
@@ -2291,6 +2951,9 @@ GarrisonError Garrison::FinalizeMission(uint32 missionRecID, bool grantOvermax)
                     follower->PacketInfo.Xp -= levelXP->XpToNextLevel;
                     follower->PacketInfo.FollowerLevel++;
                     levelXP = sGarrisonMgr.GetFollowerLevelXP(followerTypeID, follower->PacketInfo.FollowerLevel);
+                    // CriteriaType::LevelChangedForGarrisonFollower (184). Fired once per level gained; the
+                    // ModifierTree (GarrisonFollowerLevelEqual 146) only matches the level it asks for.
+                    _owner->UpdateCriteria(CriteriaType::LevelChangedForGarrisonFollower, follower->PacketInfo.GarrFollowerID, follower->PacketInfo.FollowerLevel);
                 }
 
                 // Only a follower at its TRUE terminal level rolls excess XP into quality (iLvl). The DB2
@@ -2315,6 +2978,10 @@ GarrisonError Garrison::FinalizeMission(uint32 missionRecID, bool grantOvermax)
                         }
 
                         qualityEntry = sGarrisonMgr.GetFollowerQuality(followerTypeID, follower->PacketInfo.Quality);
+
+                        // CriteriaType::QualityUpgradedForGarrisonFollower (187). miscValue1 = GarrFollower id,
+                        // miscValue2 = the new quality.
+                        _owner->UpdateCriteria(CriteriaType::QualityUpgradedForGarrisonFollower, follower->PacketInfo.GarrFollowerID, follower->PacketInfo.Quality);
                     }
 
                     // Fully maxed (top level AND top quality): no bar left to fill.
@@ -2451,6 +3118,15 @@ GarrisonError Garrison::FinalizeMission(uint32 missionRecID, bool grantOvermax)
         }
     }
 
+    // CriteriaType::SucceedGarrisonMission (174, Asset = GarrMissionID) and
+    // CriteriaType::SucceedAnyGarrisonMissionWithFollowerType (173, Asset = GarrFollowerTypeID). Only a
+    // SUCCESSFUL mission counts - a failed run must not advance "Complete N garrison missions".
+    if (succeeded)
+    {
+        _owner->UpdateCriteria(CriteriaType::SucceedGarrisonMission, missionRecID);
+        _owner->UpdateCriteria(CriteriaType::SucceedAnyGarrisonMissionWithFollowerType, missionEntry->GarrFollowerTypeID, missionRecID);
+    }
+
     // Archive the completed mission
     _archivedMissions.push_back(static_cast<int32>(missionRecID));
 
@@ -2500,8 +3176,13 @@ void Garrison::RemoveMission(uint32 missionRecID)
         {
             // Unassign followers
             for (uint64 followerDbId : itr->second.CurrentFollowerDBIDs)
+            {
                 if (Follower* follower = GetFollower(followerDbId))
+                {
                     follower->PacketInfo.CurrentMissionID = 0;
+                    follower->PacketInfo.BoardIndex = GARR_AUTO_BOARD_NONE;
+                }
+            }
 
             _activeMissionRecIDs.erase(missionRecID);
             _missions.erase(itr);
@@ -2552,6 +3233,11 @@ void Garrison::RemoveExpiredMissions()
 void Garrison::GenerateAvailableMissions()
 {
     if (!_siteLevel)
+        return;
+
+    // Adventures are gated on the covenant's tier-0 Command Table talent - generate no offers before it is
+    // researched, so the board a locked table would show (and could start from) simply does not exist.
+    if (!IsMissionBoardUnlocked())
         return;
 
     // Use the garrison's own type for mission lookups
@@ -2630,10 +3316,18 @@ void Garrison::GenerateAvailableMissions()
         // scale against. Retail offers the standard mission pool to a garrison with no active followers (sniff
         // "garrison and hall of class table quest.pkt": 42 missions offered), so a type with no roster yet must
         // not be starved to zero - a just-built shipyard with no ships still offers the full naval pool.
-        if (int32 avgLevel = avgLevelForType(mission->GarrFollowerTypeID); avgLevel >= 0)
+        // Shadowlands Adventures (GarrTypeID 111) are exempt: all 175 covenant missions are
+        // TargetLevel 60 while 87 of the 138 companions start at FollowerLevel 1, so a +/-5 window
+        // against the roster average would leave the Adventures board permanently empty. Retail
+        // gates those missions on renown and each mission's own difficulty, never on the average
+        // level of the roster. The window still applies to GarrTypes 2/3/9 exactly as before.
+        if (GetType() != GARRISON_TYPE_COVENANT)
         {
-            if (std::abs(avgLevel - static_cast<int32>(mission->TargetLevel)) > 5)
-                continue;
+            if (int32 avgLevel = avgLevelForType(mission->GarrFollowerTypeID); avgLevel >= 0)
+            {
+                if (std::abs(avgLevel - static_cast<int32>(mission->TargetLevel)) > 5)
+                    continue;
+            }
         }
 
         // NOTE: intentionally NOT gating the OFFER on current idle-follower count.
@@ -2759,6 +3453,11 @@ void Garrison::GenerateRecruits(uint32 faction)
 
         // Skip unique followers that are faction-specific
         if (follower->Flags & GARRISON_FOLLOWER_FLAG_UNIQUE)
+            continue;
+
+        // Never offer another covenant's companion (no-op for GarrTypes 2/3/9 - all their
+        // followers have CovenantID 0).
+        if (!IsFollowerCovenantAllowed(follower))
             continue;
 
         eligibleFollowers.push_back(follower);
@@ -2943,11 +3642,84 @@ GarrisonError Garrison::BuildShip(uint32 garrFollowerId)
     return GARRISON_SUCCESS;
 }
 
+// TODO(GarrAbility 1274 'Forward Planning'): the Command Table tier-1 talents publish a companion heal-RATE
+// multiplier (GarrAbilityEffect 1844: AbilityAction 14, ActionValueFlat 1.25), readable via
+// GetTalentAbilityActionMultiplier(GARR_ABILITY_ACTION_COMPANION_HEAL_RATE). The core has NO base heal-over-time
+// mechanic for it to scale: companion health only moves through this full-heal and through the client-driven
+// CMSG_GARRISON_ADD_FOLLOWER_HEALTH flat amount (WorldSession::HandleGarrisonAddFollowerHealth) - multiplying a
+// full heal is meaningless and multiplying the client's own amount would double-apply whatever the client already
+// computed. When a base regen tick exists (needs retail GarrisonFollowerChanged health-delta sniffs over time, or
+// a deliberately authored base rate labeled as such), multiply its per-tick amount by that accessor - the data
+// side is done, only the base mechanic is missing.
+GarrisonError Garrison::HealFollower(uint64 followerDbId)
+{
+    Follower* follower = GetFollower(followerDbId);
+    if (!follower)
+        return GARRISON_ERROR_INVALID_FOLLOWER;
+
+    GarrFollowerEntry const* followerEntry = sGarrFollowerStore.LookupEntry(follower->PacketInfo.GarrFollowerID);
+    // Adventures companions heal back to their statline maximum; everyone else keeps the durability-driven
+    // value this path has always restored.
+    int32 maxHealth = GetFollowerMaxHealth(followerEntry, follower->PacketInfo.FollowerLevel);
+    if (!maxHealth)
+        maxHealth = static_cast<int32>(follower->PacketInfo.Durability);
+
+    // Nothing to undo: a follower already at full and not exhausted is a no-op, and must not be charged.
+    if (follower->PacketInfo.Health >= maxHealth && !(follower->PacketInfo.FollowerStatus & FOLLOWER_STATUS_EXHAUSTED))
+        return GARRISON_SUCCESS;
+
+    // --- Rush-heal cost (SRV-G2) --------------------------------------------------------------------
+    // Retail RushHealFollower / RushHealAllFollowers charge a currency to undo companion attrition
+    // (Legion order halls: Order Resources 1220; Shadowlands Adventures: Reservoir Anima 1813; WoD
+    // garrison falls back to Garrison Resources 824). Currency ids are from GARRISON_CONSTANTS_68275.
+    // The per-follower AMOUNT is a DATA value we have no sniff/DB2 source for yet, so it is a documented
+    // PLACEHOLDER: the mechanic (charge-before-heal, refuse when unaffordable, no free heal) is the
+    // correct fix; only the magnitude still needs the real number from a heal-interaction sniff (audit
+    // gap SNF-G-D) or a constants source before it can be called balanced. Do NOT treat this as final.
+    uint32 healCurrencyId;
+    switch (_garrType)
+    {
+        case GARRISON_TYPE_COVENANT:    healCurrencyId = 1813; break; // Reservoir Anima
+        case GARRISON_TYPE_CLASS_ORDER: healCurrencyId = 1220; break; // Order Resources
+        default:                        healCurrencyId = 824;  break; // Garrison Resources
+    }
+    constexpr uint32 GARRISON_FOLLOWER_RUSH_HEAL_COST_PLACEHOLDER = 100; // per follower - PLACEHOLDER, needs sniff/constants source
+
+    if (GARRISON_FOLLOWER_RUSH_HEAL_COST_PLACEHOLDER > 0)
+    {
+        if (!_owner->HasCurrency(healCurrencyId, GARRISON_FOLLOWER_RUSH_HEAL_COST_PLACEHOLDER))
+            return GARRISON_ERROR_NOT_ENOUGH_CURRENCY;
+        _owner->RemoveCurrency(healCurrencyId, GARRISON_FOLLOWER_RUSH_HEAL_COST_PLACEHOLDER, CurrencyDestroyReason::Garrison);
+    }
+
+    follower->PacketInfo.Health = maxHealth;
+    follower->PacketInfo.FollowerStatus &= ~FOLLOWER_STATUS_EXHAUSTED;
+    return GARRISON_SUCCESS;
+}
+
+void Garrison::RushHealAllFollowers()
+{
+    // PAID heal-all (UI button). Charge per wounded follower. HealFollower skips those already full (no
+    // charge) and returns NOT_ENOUGH_CURRENCY once the owner can no longer pay; stop there so the rest stay
+    // wounded rather than being healed for free.
+    for (auto& p : _followers)
+        if (HealFollower(p.second.PacketInfo.DbID) == GARRISON_ERROR_NOT_ENOUGH_CURRENCY)
+            break;
+}
+
 void Garrison::HealAllFollowers()
 {
+    // FREE full restore - used only by the script/spell-driven vitality restore, where the spell is the
+    // cost. The UI rush-heal button must NOT reach this; it goes through RushHealAllFollowers (paid).
     for (auto& p : _followers)
     {
-        p.second.PacketInfo.Health = static_cast<int32>(p.second.PacketInfo.Durability);
+        GarrFollowerEntry const* followerEntry = sGarrFollowerStore.LookupEntry(p.second.PacketInfo.GarrFollowerID);
+        // Adventures companions heal back to their statline maximum; everyone else keeps the
+        // durability-driven value this function has always restored.
+        if (int32 maxHealth = GetFollowerMaxHealth(followerEntry, p.second.PacketInfo.FollowerLevel))
+            p.second.PacketInfo.Health = maxHealth;
+        else
+            p.second.PacketInfo.Health = static_cast<int32>(p.second.PacketInfo.Durability);
         p.second.PacketInfo.FollowerStatus &= ~FOLLOWER_STATUS_EXHAUSTED;
     }
 }
@@ -2975,6 +3747,29 @@ void Garrison::FinishMission(uint32 garrMissionRecID)
 
     mission->PacketInfo.MissionState = 2; // Completed
     mission->PacketInfo.SuccessChance = 100; // Instant complete = guaranteed success
+
+    // Lock in the win. Setting SuccessChance alone is NOT enough for an auto-combat (Adventures) mission:
+    // FinalizeMission re-rolls the outcome via RollMissionOutcome whenever ResultDetermined is false, and
+    // that simulation can still LOSE regardless of SuccessChance. Nail the result here so a force-completed
+    // mission is genuinely guaranteed to succeed, matching the "instant complete" intent.
+    mission->ResultDetermined = true;
+    mission->Succeeded = true;
+
+    // The client's mission timer is a purely local computation over StartTime + TravelDuration +
+    // MissionDuration - MissionState alone is not enough. Leaving StartTime where it was made an
+    // instant-completed mission keep counting down in the UI until the next full garrison info, so the
+    // "instantly complete" spell (SPELL_EFFECT_FINISH_GARRISON_MISSION) appeared to do nothing.
+    // Backdate the start so the timer reads as elapsed, and announce the move with the opcode that exists
+    // for exactly this - SMSG_GARRISON_CHANGE_MISSION_START_TIME_RESULT.
+    mission->PacketInfo.StartTime = GameTime::GetGameTime()
+        - Seconds(mission->PacketInfo.TravelDuration).count()
+        - Seconds(mission->PacketInfo.MissionDuration).count();
+
+    WorldPackets::Garrison::GarrisonChangeMissionStartTimeResult startTimeResult;
+    startTimeResult.Result = GARRISON_SUCCESS;
+    startTimeResult.MissionRecID = garrMissionRecID;
+    startTimeResult.Mission = mission->PacketInfo;
+    _owner->SendDirectMessage(startTimeResult.Write());
 }
 
 void Garrison::FinishShipment(uint32 plotInstanceId)
@@ -3018,6 +3813,10 @@ void Garrison::SetFollowerQuality(uint64 dbId, uint32 quality)
     changedQuality.OldFollower = oldFollowerState;
     changedQuality.Follower = follower->PacketInfo;
     _owner->SendDirectMessage(changedQuality.Write());
+
+    // CriteriaType::QualityUpgradedForGarrisonFollower (187) - only an actual upgrade counts.
+    if (quality > oldFollowerState.Quality)
+        _owner->UpdateCriteria(CriteriaType::QualityUpgradedForGarrisonFollower, follower->PacketInfo.GarrFollowerID, quality);
 }
 
 void Garrison::SetFollowerLevel(uint64 dbId, uint32 level)
@@ -3026,6 +3825,8 @@ void Garrison::SetFollowerLevel(uint64 dbId, uint32 level)
     if (!follower)
         return;
 
+    uint32 const oldLevel = follower->PacketInfo.FollowerLevel;
+
     follower->PacketInfo.FollowerLevel = level;
     follower->PacketInfo.Xp = 0;
 
@@ -3033,6 +3834,11 @@ void Garrison::SetFollowerLevel(uint64 dbId, uint32 level)
     updateFollower.Result = GARRISON_SUCCESS;
     updateFollower.Follower = follower->PacketInfo;
     _owner->SendDirectMessage(updateFollower.Write());
+
+    // CriteriaType::LevelChangedForGarrisonFollower (184). miscValue1 = GarrFollower id (what the
+    // GarrisonFollowerType/-Level ModifierTree evaluators resolve), miscValue2 = the new level.
+    if (level != oldLevel)
+        _owner->UpdateCriteria(CriteriaType::LevelChangedForGarrisonFollower, follower->PacketInfo.GarrFollowerID, level);
 }
 
 void Garrison::AddFollowerXP(uint64 dbId, uint32 xp)
@@ -3119,6 +3925,37 @@ void Garrison::LearnFollowerAbility(uint64 dbId, uint32 abilityId)
     _owner->SendDirectMessage(updateFollower.Write());
 }
 
+GarrisonError Garrison::RemoveFollowerAbility(uint64 dbId, uint32 abilityId)
+{
+    Follower* follower = GetFollower(dbId);
+    if (!follower)
+        return GARRISON_ERROR_INVALID_FOLLOWER;
+
+    GarrAbilityEntry const* ability = sGarrAbilityStore.LookupEntry(abilityId);
+    if (!ability)
+        return GARRISON_ERROR_INVALID_FOLLOWER_ABILITY;
+
+    std::list<GarrAbilityEntry const*>& abilities = follower->PacketInfo.AbilityID;
+    auto itr = std::find(abilities.begin(), abilities.end(), ability);
+    if (itr == abilities.end())
+        return GARRISON_ERROR_INVALID_FOLLOWER_ABILITY;
+
+    // GarrAbility.Flags 0x10 marks an ability the follower may never lose (its authored innate trait).
+    // Honouring it here is what keeps this primitive from being a way to strip a unique follower bare.
+    if (ability->Flags & GARRISON_ABILITY_FLAG_CANNOT_REMOVE)
+        return GARRISON_ERROR_INVALID_FOLLOWER_ABILITY;
+
+    abilities.erase(itr);
+
+    // The dedicated result carries the whole follower, so the client rebuilds the ability row from it
+    // without a second round trip.
+    WorldPackets::Garrison::GarrisonRemoveFollowerAbilityResult abilityResult;
+    abilityResult.Follower = follower->PacketInfo;
+    _owner->SendDirectMessage(abilityResult.Write());
+
+    return GARRISON_SUCCESS;
+}
+
 void Garrison::RandomizeFollowerAbilities(uint64 dbId)
 {
     Follower* follower = GetFollower(dbId);
@@ -3139,18 +3976,63 @@ void Garrison::RandomizeFollowerAbilities(uint64 dbId)
     _owner->SendDirectMessage(updateFollower.Write());
 }
 
-void Garrison::EndBuildingConstruction(uint32 garrPlotInstanceId)
+GarrisonError Garrison::EndBuildingConstruction(uint32 garrPlotInstanceId)
 {
+    // Every exit answers. This runs from SPELL_EFFECT_END_GARRISON_BUILDING_CONSTRUCTION (239) - a live,
+    // player-facing "finish this building now" effect that until now confirmed nothing.
+    auto sendResult = [this, garrPlotInstanceId](uint32 result, time_t timeBuilt) -> GarrisonError
+    {
+        WorldPackets::Garrison::GarrisonCompleteBuildingConstructionResult constructionResult;
+        constructionResult.GarrPlotInstanceID = garrPlotInstanceId;
+        constructionResult.TimeBuilt = uint64(timeBuilt);
+        constructionResult.Result = result;
+        _owner->SendDirectMessage(constructionResult.Write());
+        return GarrisonError(result);
+    };
+
     Plot* plot = GetPlot(garrPlotInstanceId);
-    if (!plot || !plot->BuildingInfo.PacketInfo)
-        return;
+    if (!plot)
+        return sendResult(GARRISON_ERROR_INVALID_PLOT_INSTANCEID, 0);
+
+    if (!plot->BuildingInfo.PacketInfo)
+        return sendResult(GARRISON_ERROR_NO_BUILDING, 0);
 
     if (plot->BuildingInfo.PacketInfo->Active)
-        return;
+        return sendResult(GARRISON_ERROR_CONSTRUCTION_COMPLETE, time_t(plot->BuildingInfo.PacketInfo->TimeBuilt));
 
     // Set time built to the past so CanActivate() returns true
     plot->BuildingInfo.PacketInfo->TimeBuilt = GameTime::GetGameTime() - DAY;
     ActivateBuilding(garrPlotInstanceId);
+
+    return sendResult(GARRISON_SUCCESS, time_t(plot->BuildingInfo.PacketInfo->TimeBuilt));
+}
+
+GarrisonError Garrison::SetMissionStateCheat(uint32 garrMissionRecID, uint32 newState)
+{
+    // GM/dev only. Wire mission states are 0 offered / 1 in progress / 2 completed; anything else would put
+    // the client's mission frame into a state its own Lua cannot describe, so it is refused rather than sent.
+    if (newState > 2)
+        return GARRISON_ERROR_INVALID_MISSION;
+
+    Mission* mission = GetMissionByRecID(garrMissionRecID);
+    if (!mission)
+        return GARRISON_ERROR_INVALID_MISSION;
+
+    mission->PacketInfo.MissionState = int32(newState);
+
+    // Moving a mission INTO "in progress" without a start time leaves the client counting from the 1906
+    // sentinel, so anchor it here - the same reason FinishMission backdates.
+    if (newState == 1 && time_t(mission->PacketInfo.StartTime) > GameTime::GetGameTime())
+        mission->PacketInfo.StartTime = GameTime::GetGameTime();
+
+    WorldPackets::Garrison::GarrisonUpdateMissionCheatResult cheatResult;
+    cheatResult.Result = GARRISON_SUCCESS;
+    cheatResult.MissionRecID = garrMissionRecID;
+    cheatResult.NewState = newState;
+    cheatResult.Mission = mission->PacketInfo;
+    _owner->SendDirectMessage(cheatResult.Write());
+
+    return GARRISON_SUCCESS;
 }
 
 void Garrison::SetGarrisonCacheSize(uint32 size)
@@ -3250,6 +4132,12 @@ GarrisonError Garrison::UpgradeFollowerItemLevel(uint64 dbId, int32 amount, int3
     changedItemLevel.OldFollower = oldFollowerState;
     changedItemLevel.Follower = follower->PacketInfo;
     _owner->SendDirectMessage(changedItemLevel.Write());
+
+    // CriteriaType::ItemLevelChangedForGarrisonFollower (183). miscValue1 = GarrFollower id, which is what
+    // ModifierTreeType::GarrisonFollowerItemLevelEqualOrGreaterThan (168) resolves; miscValue2 = new iLvl.
+    if (follower->PacketInfo.ItemLevelWeapon != oldFollowerState.ItemLevelWeapon
+        || follower->PacketInfo.ItemLevelArmor != oldFollowerState.ItemLevelArmor)
+        _owner->UpdateCriteria(CriteriaType::ItemLevelChangedForGarrisonFollower, follower->PacketInfo.GarrFollowerID, follower->GetItemLevel());
 
     return GARRISON_SUCCESS;
 }
@@ -3931,6 +4819,11 @@ void Garrison::CompleteShipment(uint64 dbId)
         // persisted with the other followers by SaveToDB.
         if (shipmentEntry->GarrFollowerID)
             AddTroop(shipmentEntry->GarrFollowerID, GARRISON_TROOP_DEFAULT_DURABILITY);
+
+        // CriteriaType::CollectGarrisonShipment (182, Asset = CharShipmentContainerID). Real Criteria rows
+        // carry container ids (31/37/51...), so miscValue1 must be the container, not the shipment record.
+        // miscValue2 carries the CharShipment record id for ModifierTree discrimination.
+        _owner->UpdateCriteria(CriteriaType::CollectGarrisonShipment, shipmentEntry->ContainerID, shipmentEntry->ID);
     }
 
     WorldPackets::Garrison::CompleteShipmentResponse response;
@@ -4420,6 +5313,456 @@ Garrison::Talent const* Garrison::GetTalent(uint32 garrTalentID) const
     return nullptr;
 }
 
+// Generic GarrAbilityEffect dispatch for talent-carried abilities. GarrTalent.GarrAbilityID was loaded but never
+// read, and sGarrAbilityEffectStore was loaded but never iterated - so the Command Table tier 1/2 talents (shared
+// GarrAbility 1274 'Forward Planning' and 1273 'Strategic Genius' across trees 316/317/315/318) published real
+// multipliers that nothing consumed. This accumulates the ActionValueFlat of every published effect matching
+// `abilityAction` across the researched talents of THIS garrison, so a caller multiplies exactly what the data
+// says and nothing more.
+float Garrison::GetTalentAbilityActionMultiplier(uint8 abilityAction) const
+{
+    float multiplier = 1.0f;
+    for (auto const& [talentId, talent] : _talents)
+    {
+        if (talent.Rank < 1)
+            continue;
+
+        GarrTalentEntry const* talentEntry = sGarrTalentStore.LookupEntry(talentId);
+        if (!talentEntry || !talentEntry->GarrAbilityID)
+            continue;
+
+        // A covenant-scoped tree's modifiers follow the active covenant, exactly like its PerkSpellID grants
+        // (see ApplyTalentRankPerk / RefreshCovenantTalentPerks): a researched Kyrian 'Wings of Light' must not
+        // keep discounting travel time after the player defects to the Venthyr.
+        GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
+        if (!IsTalentTreeOwnedByPlayerCovenant(treeEntry))
+            continue;
+
+        std::vector<GarrAbilityEffectEntry const*> const* effects = sGarrisonMgr.GetGarrAbilityEffects(talentEntry->GarrAbilityID);
+        if (!effects)
+            continue;
+
+        for (GarrAbilityEffectEntry const* effect : *effects)
+            if (effect->AbilityAction == abilityAction && effect->ActionValueFlat > 0.0f)
+                multiplier *= effect->ActionValueFlat;
+    }
+
+    return multiplier;
+}
+
+// GarrTalentRank.PerkSpellID is what turns a researched talent from a stored row into a real effect: the covenant
+// ability trees (393/396/397/395) publish the class + signature abilities there, and the soulbind trees publish
+// their non-conduit trait nodes there. Nothing in the core read the column before this.
+//
+// Two routing rules, both taken from the data:
+//  * GarrTalentRank.PerkPlayerConditionID filters the perk. The covenant "class ability" grant spells each carry
+//    13 SPELL_EFFECT_LEARN_GARR_TALENT effects (one per class talent) and every class talent's perk condition is a
+//    ClassMask test - e.g. talent 1564 Divine Toll -> PlayerCondition 42792 (ClassMask 2 = Paladin). Applying the
+//    condition is what makes one grant spell hand every class exactly its own ability.
+//  * Soulbind trait perks are transient. All 12 soulbind trees live in the same garrison, but only the ACTIVE
+//    soulbind's traits may be running, so they are applied as auras (like socketed conduits) and re-applied on
+//    login / soulbind switch. Every other tree's perk is a permanently learned spell.
+void Garrison::ApplyTalentRankPerk(uint32 garrTalentID, int32 rankIndex)
+{
+    GarrTalentEntry const* talentEntry = sGarrTalentStore.LookupEntry(garrTalentID);
+    if (!talentEntry)
+        return;
+
+    GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
+
+    // A covenant-scoped tree only grants while its own covenant is the active one. The talent row itself survives a
+    // covenant switch untouched (see RefreshCovenantTalentPerks); what a switch takes away is the effect, exactly as
+    // it already works for the soulbind trees below, where only the ACTIVE soulbind's traits may be running.
+    if (!IsTalentTreeOwnedByPlayerCovenant(treeEntry))
+        return;
+
+    // Transport Network tiers publish no PerkSpellID at all (all 12 rank rows are zero - audit-verified), so
+    // their effect is the authored spell set of `garrison_transport_network` instead of the rank perk below.
+    // The talents are single-rank; the covenant/soulbind refresh paths re-call this with rankIndex 0 too, so
+    // the grants follow covenant switches exactly like PerkSpellID grants do.
+    if (treeEntry && treeEntry->FeatureTypeIndex == GARR_TALENT_FEATURE_TRANSPORT_NETWORK && rankIndex == 0)
+        ApplyTransportNetworkPerks(garrTalentID);
+
+    std::vector<GarrTalentRankEntry const*> const* ranks = sGarrisonMgr.GetTalentRanksForTalent(garrTalentID);
+    if (!ranks || rankIndex < 0 || rankIndex >= static_cast<int32>(ranks->size()))
+        return;
+
+    GarrTalentRankEntry const* rankEntry = (*ranks)[rankIndex];
+    if (rankEntry->PerkSpellID <= 0)
+        return;
+
+    uint32 const perkSpellId = uint32(rankEntry->PerkSpellID);
+    if (!sSpellMgr->GetSpellInfo(perkSpellId, DIFFICULTY_NONE))
+        return;
+
+    if (rankEntry->PerkPlayerConditionID > 0)
+        if (PlayerConditionEntry const* perkCondition = sPlayerConditionStore.LookupEntry(uint32(rankEntry->PerkPlayerConditionID)))
+            if (!ConditionMgr::IsPlayerMeetingCondition(_owner, perkCondition))
+                return;
+
+    if (treeEntry && treeEntry->FeatureTypeIndex == GARR_TALENT_FEATURE_SOULBIND)
+    {
+        SoulbindEntry const* soulbind = sSoulbindStore.LookupEntry(_owner->GetActiveSoulbind());
+        if (!soulbind || uint32(soulbind->GarrTalentTreeID) != talentEntry->GarrTalentTreeID)
+            return;
+
+        if (!_owner->HasAura(perkSpellId))
+            _owner->CastSpell(_owner, perkSpellId, true);
+        return;
+    }
+
+    _owner->LearnSpell(perkSpellId, false);
+}
+
+// Strip every perk a talent had granted. `completedRanks` is the talent's Rank, i.e. rank indices [0, Rank).
+// Deliberately NOT gated on PerkPlayerConditionID - a condition that has since stopped passing must not leave a
+// perk stuck on the player.
+void Garrison::RemoveTalentRankPerks(uint32 garrTalentID, int32 completedRanks)
+{
+    GarrTalentEntry const* talentEntry = sGarrTalentStore.LookupEntry(garrTalentID);
+    if (!talentEntry)
+        return;
+
+    std::vector<GarrTalentRankEntry const*> const* ranks = sGarrisonMgr.GetTalentRanksForTalent(garrTalentID);
+    if (!ranks)
+        return;
+
+    GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
+    bool const isSoulbindTrait = treeEntry && treeEntry->FeatureTypeIndex == GARR_TALENT_FEATURE_SOULBIND;
+
+    // Strip the authored Transport Network grants symmetrically with how ApplyTalentRankPerk seats them.
+    if (treeEntry && treeEntry->FeatureTypeIndex == GARR_TALENT_FEATURE_TRANSPORT_NETWORK && completedRanks > 0)
+        RemoveTransportNetworkPerks(garrTalentID);
+
+    int32 const last = std::min<int32>(completedRanks, static_cast<int32>(ranks->size()));
+    for (int32 i = 0; i < last; ++i)
+    {
+        GarrTalentRankEntry const* rankEntry = (*ranks)[i];
+        if (rankEntry->PerkSpellID <= 0)
+            continue;
+
+        uint32 const perkSpellId = uint32(rankEntry->PerkSpellID);
+        if (isSoulbindTrait)
+            _owner->RemoveAurasDueToSpell(perkSpellId);
+        else
+            _owner->RemoveSpell(perkSpellId);
+    }
+}
+
+// Transport Network research payoff. The client publishes zero effect fields for these talents, so the spell
+// set per tier is authored in `garrison_transport_network` (validated at load; see GarrisonMgr). Two grant
+// modes, decided by the spell's own published effects rather than an authored flag:
+//   * SPELL_EFFECT_DISCOVER_TAXI carriers (the Kyrian/Venthyr "Teach Taxi Node: ..." spells) are one-shot
+//     casts - the taught TaxiNodes row is the persistent capability, the spell itself is not learnable.
+//     Re-casting on login/covenant re-activation is a no-op for an already-known node.
+//   * Everything else (the verified "Traverse to ..." / "Mirror Teleport: ..." / "Teleport: Seat of the
+//     Primus" teleports) is learned as a castable spell - the honest scale of this implementation: retail
+//     drives these from world objects (mushroom rings, mirrors, ziggurat portals) that are not spawned or
+//     scripted yet, so the capability is granted directly until that world content exists.
+void Garrison::ApplyTransportNetworkPerks(uint32 garrTalentID)
+{
+    std::vector<uint32> const* spells = sGarrisonMgr.GetTransportNetworkSpells(garrTalentID);
+    if (!spells)
+        return;
+
+    for (uint32 spellId : *spells)
+    {
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+        if (!spellInfo)
+            continue;   // validated at load; belt and braces against reloads
+
+        if (spellInfo->HasEffect(SPELL_EFFECT_DISCOVER_TAXI))
+        {
+            _owner->CastSpell(_owner, spellId, true);
+            continue;
+        }
+
+        _owner->LearnSpell(spellId, false);
+    }
+}
+
+void Garrison::RemoveTransportNetworkPerks(uint32 garrTalentID)
+{
+    std::vector<uint32> const* spells = sGarrisonMgr.GetTransportNetworkSpells(garrTalentID);
+    if (!spells)
+        return;
+
+    for (uint32 spellId : *spells)
+    {
+        SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE);
+        if (!spellInfo)
+            continue;
+
+        // Discovered taxi nodes are deliberately kept: there is no retail precedent for stripping a known
+        // flight point on a covenant switch, and the taxi mask is not a spell to unlearn.
+        if (spellInfo->HasEffect(SPELL_EFFECT_DISCOVER_TAXI))
+            continue;
+
+        _owner->RemoveSpell(spellId);
+    }
+}
+
+bool Garrison::IsChannelAnimaTalent(GarrTalentEntry const* talentEntry)
+{
+    if (!talentEntry)
+        return false;
+
+    GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
+    return treeEntry && treeEntry->GarrTypeID == static_cast<int8>(GARRISON_TYPE_COVENANT)
+        && treeEntry->FeatureTypeIndex == GARR_TALENT_FEATURE_CHANNEL_ANIMA;
+}
+
+// Paying for an Anima Conductor channel.
+//
+// The client offers exactly two ways to light a destination up, and GarrTalentRank publishes exactly two costs
+// for the six Channel Anima talents of each covenant (trees 345 Kyrian / 348 Venthyr / 346 Night Fae /
+// 347 Necrolord, six destinations each):
+//
+//   ResearchCost           = 25 x 1813 Reservoir Anima   -> C_AnimaDiversion.SelectAnimaNode(talentID, true)
+//                                                           the "Channel" popup; GarrTalent.ActiveDurationSecs
+//                                                           is 86400 and the popup counts down
+//                                                           C_DateAndTime.GetSecondsUntilDailyReset(), so the
+//                                                           channel lasts until the daily reset.
+//   AlternateResearchCost  = 10 x 1808 Channeled Anima   -> C_AnimaDiversion.SelectAnimaNode(talentID, false)
+//                                                           the "Reinforce" popup; the reinforce bar is ten gems
+//                                                           (MAX_ANIMA_GEM_COUNT) and the resulting node state is
+//                                                           Enum.AnimaDiversionNodeState.SelectedPermanent.
+//
+// The flag that picks between them reaches the server as the IsTemporary bit of CMSG_GARRISON_LEARN_TALENT,
+// which is the packet SelectAnimaNode(talentID, temporary) sends - the two have the same (int32, bool) shape and
+// the same meaning. (CMSG_GARRISON_RESEARCH_TALENT is a different opcode and is not what the Anima Diversion UI
+// uses; the Channel Anima ranks have ResearchDurationSecs 0 and are never "researched".)
+//
+// Costs, currencies and durations here are all read from GarrTalentRank - nothing is hardcoded.
+uint32 Garrison::TakeChannelAnimaCost(GarrTalentEntry const* talentEntry, bool permanent)
+{
+    std::vector<GarrTalentRankEntry const*> const* ranks = sGarrisonMgr.GetTalentRanksForTalent(talentEntry->ID);
+    if (!ranks || ranks->empty())
+        return GARRISON_ERROR_INVALID_TALENT;
+
+    GarrTalentRankEntry const* rankEntry = (*ranks)[0];
+
+    int32 const costCurrency = permanent ? rankEntry->AlternateResearchCostCurrencyTypesID : rankEntry->ResearchCostCurrencyTypesID;
+    int32 const cost = permanent ? rankEntry->AlternateResearchCost : rankEntry->ResearchCost;
+    int32 const goldCost = permanent ? rankEntry->AlternateResearchGoldCost : rankEntry->ResearchGoldCost;
+
+    // A branch the data does not publish is a branch the client cannot have meant. Refusing beats charging the
+    // primary cost for a request that asked for the other one.
+    if (cost <= 0 && goldCost <= 0)
+        return GARRISON_ERROR_INVALID_TALENT;
+
+    if (costCurrency && cost > 0 && !_owner->HasCurrency(uint32(costCurrency), uint32(cost)))
+        return GARRISON_ERROR_NOT_ENOUGH_CURRENCY;
+
+    if (goldCost > 0 && !_owner->HasEnoughMoney(uint64(goldCost) * GOLD))
+        return GARRISON_ERROR_NOT_ENOUGH_GOLD;
+
+    // Only one destination is channelled at a time. Selecting a new one takes the old temporary channel down -
+    // that is what the client previews when it greys every other Available pin to Cooldown while the confirm
+    // popup is open (AnimaDiversionFrameMixin:SetExclusiveSelectionNode). Permanently reinforced destinations
+    // are additive and are never removed by a later selection.
+    GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
+    std::vector<uint32> displaced;
+    for (auto const& [talentId, talent] : _talents)
+    {
+        if (talentId == talentEntry->ID || !talent.IsTemporary())
+            continue;
+
+        GarrTalentEntry const* otherEntry = sGarrTalentStore.LookupEntry(talentId);
+        if (!otherEntry || !IsChannelAnimaTalent(otherEntry))
+            continue;
+
+        if (treeEntry && otherEntry->GarrTalentTreeID != treeEntry->ID)
+            continue;
+
+        displaced.push_back(talentId);
+    }
+
+    // Charge only once the request is known to be servable.
+    if (costCurrency && cost > 0)
+        _owner->RemoveCurrency(uint32(costCurrency), uint32(cost), CurrencyDestroyReason::Garrison);
+
+    if (goldCost > 0)
+        _owner->ModifyMoney(-int64(uint64(goldCost) * GOLD));
+
+    for (uint32 talentId : displaced)
+        RemoveChannelAnimaTalent(talentId);
+
+    // Re-selecting the destination that is already channelled temporarily (the temporary -> permanent upgrade)
+    // replaces its own entry, so clear it too and let the caller seat a fresh one.
+    RemoveChannelAnimaTalent(talentEntry->ID);
+
+    return GARRISON_SUCCESS;
+}
+
+void Garrison::RemoveChannelAnimaTalent(uint32 garrTalentID)
+{
+    auto itr = _talents.find(garrTalentID);
+    if (itr == _talents.end())
+        return;
+
+    RemoveTalentRankPerks(garrTalentID, itr->second.Rank);
+    _talents.erase(itr);
+
+    // Tell the client the node went dark. GarrisonTalentCompleted with Rank 0 is the same message the respec
+    // path uses (Garrison::ResetTalentTree), so no new wire is involved.
+    WorldPackets::Garrison::GarrisonTalentCompleted removed;
+    removed.GarrTypeID = static_cast<int32>(GetType());
+    removed.GarrTalentID = garrTalentID;
+    removed.Rank = 0;
+    removed.ResearchStartTime = 0;
+    _owner->SendDirectMessage(removed.Write());
+
+    CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_GARRISON_TALENT);
+    stmt->setUInt64(0, _owner->GetGUID().GetCounter());
+    stmt->setUInt32(1, garrTalentID);
+    CharacterDatabase.Execute(stmt);
+}
+
+void Garrison::ExpireTemporaryChannelAnima()
+{
+    if (GetType() != GARRISON_TYPE_COVENANT)
+        return;
+
+    std::vector<uint32> expired;
+    for (auto const& [talentId, talent] : _talents)
+        if (talent.IsTemporary())
+            if (GarrTalentEntry const* talentEntry = sGarrTalentStore.LookupEntry(talentId))
+                if (IsChannelAnimaTalent(talentEntry))
+                    expired.push_back(talentId);
+
+    for (uint32 talentId : expired)
+        RemoveChannelAnimaTalent(talentId);
+}
+
+// GarrTalent.PlayerConditionID enforcement. Originally only the Channel Anima destinations (FeatureTypeIndex 7)
+// evaluated their condition; every other sanctum tree's published gate was ignored, which let any covenant member
+// research Reservoir tier 2/3 with no renown and no tier 1 (the audit's ungated-tier-2 hole - PrerequisiteTalentID
+// is 0 on all 12 Reservoir talents, so the renown PlayerConditions ARE the tier ladder). Every condition the 24
+// sanctum trees publish is faithfully evaluable here (verified against wago @68887 + this core):
+//   84025 (tier-0 gates)     -> MT 156100: level >= 60 (type 69) AND covenant-choice quest 62000/57878 rewarded
+//                               (type 110); both types implemented, both quests shipped in the world DB
+//   82863 / 82871 (Reservoir) -> "Requires Renown 11/19": MT 145848/145864, type 119 on currency 1822 (synced)
+//   70102 / 70104 (Reservoir) -> plain PlayerCondition.CovenantID membership tests
+// Deliberately still unenforced, each for a stated reason:
+//   * non-covenant garrison types: the legacy order-hall/war-campaign trees carry level/ContentTuning and
+//     campaign-quest conditions that cannot be evaluated faithfully for a 12.0.7 character;
+//   * GARR_TALENT_FEATURE_ABILITIES: tree 396 (alone of the four) publishes per-class masks at TALENT level; the
+//     grant design seats all 14 rows and filters by class at the PerkPlayerConditionID layer (see
+//     GrantCovenantAbilityTalents), so enforcing here would asymmetrically break the Venthyr grant;
+//   * GARR_TALENT_FEATURE_SOULBIND: the soulbind rows mix evaluable renown gates with per-soulbind campaign
+//     ModifierTrees ("Continue the campaign to unlock X", e.g. PC 84478 -> MT 146013) whose quest chains are not
+//     audited on this core - enforcing unverified campaign state could brick trait selection entirely.
+bool Garrison::IsTalentAvailableForPlayer(GarrTalentEntry const* talentEntry) const
+{
+    if (!talentEntry || !talentEntry->PlayerConditionID)
+        return true;
+
+    GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
+    if (!treeEntry || treeEntry->GarrTypeID != static_cast<int8>(GARRISON_TYPE_COVENANT))
+        return true;
+
+    if (treeEntry->FeatureTypeIndex == GARR_TALENT_FEATURE_ABILITIES || treeEntry->FeatureTypeIndex == GARR_TALENT_FEATURE_SOULBIND)
+        return true;
+
+    PlayerConditionEntry const* condition = sPlayerConditionStore.LookupEntry(talentEntry->PlayerConditionID);
+    if (!condition)
+        return true;
+
+    return ConditionMgr::IsPlayerMeetingCondition(_owner, condition);
+}
+
+// Every covenant-scoped sanctum tree is keyed FeatureTypeIndex (the feature) x FeatureSubtypeIndex (the CovenantID):
+// e.g. Reservoir Upgrades 327/326/328/329 -> covenants 1/2/3/4, unique features 320/324/319/321, the four ability
+// trees and the 12 soulbind trees. The type-111 trees that are NOT covenant content (Box of Many Things, Cypher
+// Research, Dragonriding, ...) all publish FeatureSubtypeIndex 0, so a non-zero value is an exact covenant tag.
+// Without this check any client could research another covenant's sanctum or take a foreign soulbind's traits -
+// the same class of hole as the covenant-flip through HandleActivateSoulbind.
+bool Garrison::IsTalentTreeOwnedByPlayerCovenant(GarrTalentTreeEntry const* treeEntry) const
+{
+    if (!treeEntry || treeEntry->GarrTypeID != static_cast<int8>(GARRISON_TYPE_COVENANT) || !treeEntry->FeatureSubtypeIndex)
+        return true;
+
+    return uint32(treeEntry->FeatureSubtypeIndex) == _owner->GetActiveCovenant();
+}
+
+void Garrison::ApplyAllTalentPerks()
+{
+    for (auto const& [talentId, talent] : _talents)
+        for (int32 rankIndex = 0; rankIndex < talent.Rank; ++rankIndex)
+            ApplyTalentRankPerk(talentId, rankIndex);
+}
+
+// Covenant switching, talent side.
+//
+// The DECISION this encodes (the P3.0 "sanctum talents are GarrType-scoped, not covenant-scoped" limitation):
+// researched sanctum talents are PER COVENANT and are KEPT across a switch; only the perks they grant follow the
+// active covenant. That is not a compromise, it is what the data says. Every covenant-scoped tree of GarrTypeID 111
+// names its owner in GarrTalentTree.FeatureSubtypeIndex (= Covenant.db2 id) and the four covenants never share a
+// tree: Anima Conductor 312/314/311/313, Transport Network 308/309/307/310, Command Table 316/317/315/318,
+// Reservoir 327/326/328/329, unique feature 320/324/319/321, Channel Anima 345/348/346/347, abilities 393/396/397/395
+// and the twelve soulbind trees are each owned by exactly one covenant. character_garrison_talents is keyed by
+// GarrTalentID, so a Kyrian Transport Network row and a Night Fae one are already different rows - the storage is
+// covenant-partitioned for free and there is nothing to delete or migrate. A returning member finds its sanctum
+// exactly as it left it.
+//
+// (The 24 FeatureSubtypeIndex 0 trees of GarrTypeID 111 are not covenant-scoped and are deliberately untouched.)
+void Garrison::RefreshCovenantTalentPerks()
+{
+    if (GetType() != GARRISON_TYPE_COVENANT)
+        return;
+
+    for (auto const& [talentId, talent] : _talents)
+    {
+        if (talent.Rank < 1)
+            continue;
+
+        GarrTalentEntry const* talentEntry = sGarrTalentStore.LookupEntry(talentId);
+        if (!talentEntry)
+            continue;
+
+        GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
+        if (!treeEntry || !treeEntry->FeatureSubtypeIndex || treeEntry->GarrTypeID != static_cast<int8>(GARRISON_TYPE_COVENANT))
+            continue;   // not covenant-scoped - never touched by a switch
+
+        if (IsTalentTreeOwnedByPlayerCovenant(treeEntry))
+        {
+            for (int32 rankIndex = 0; rankIndex < talent.Rank; ++rankIndex)
+                ApplyTalentRankPerk(talentId, rankIndex);
+        }
+        else
+            RemoveTalentRankPerks(talentId, talent.Rank);
+    }
+}
+
+void Garrison::GrantCovenantAbilityTalents(uint32 covenantId)
+{
+    if (GetType() != GARRISON_TYPE_COVENANT || !covenantId)
+        return;
+
+    std::vector<GarrTalentTreeEntry const*> const* trees = sGarrisonMgr.GetTalentTreesForGarrType(static_cast<int8>(GARRISON_TYPE_COVENANT));
+    if (!trees)
+        return;
+
+    for (GarrTalentTreeEntry const* treeEntry : *trees)
+    {
+        if (treeEntry->FeatureTypeIndex != GARR_TALENT_FEATURE_ABILITIES || uint32(treeEntry->FeatureSubtypeIndex) != covenantId)
+            continue;
+
+        std::vector<GarrTalentEntry const*> const* talents = sGarrisonMgr.GetTalentsForTree(treeEntry->ID);
+        if (!talents)
+            continue;
+
+        for (GarrTalentEntry const* talentEntry : *talents)
+        {
+            if (_talents.count(talentEntry->ID))
+                continue;   // already seated - LearnTalent would only answer GARRISON_ERROR_INVALID_TALENT
+
+            LearnTalent(talentEntry->ID, false);
+        }
+    }
+}
+
 void Garrison::CompleteAllTalentResearch(bool sendUpdate /*= false*/)
 {
     for (auto& [talentId, talent] : _talents)
@@ -4432,6 +5775,15 @@ void Garrison::CompleteAllTalentResearch(bool sendUpdate /*= false*/)
 
         talent.Rank++;
         talent.ResearchStartTime = 0;
+
+        // The rank that just finished is what grants its GarrTalentRank.PerkSpellID.
+        ApplyTalentRankPerk(talentId, talent.Rank - 1);
+
+        // CriteriaType::CompleteResearchGarrisonTalent (198, Asset = GarrTalentID) and
+        // CriteriaType::CompleteResearchAnyGarrisonTalent (197, no asset - gated by ModifierTree
+        // GarrisonTalentSelected/Researched). miscValue2 = the rank that just finished researching.
+        _owner->UpdateCriteria(CriteriaType::CompleteResearchGarrisonTalent, talentId, talent.Rank);
+        _owner->UpdateCriteria(CriteriaType::CompleteResearchAnyGarrisonTalent, talentId, talent.Rank);
 
         TC_LOG_DEBUG("garrison", "Garrison::CompleteAllTalentResearch: Player {} talent {} completed research to rank {}",
             _owner->GetGUID().ToString().c_str(), talentId, talent.Rank);
@@ -4466,9 +5818,19 @@ uint32 Garrison::LearnTalent(uint32 garrTalentID, bool isTemporary)
     if (!treeEntry || treeEntry->GarrTypeID != static_cast<int8>(GetType()))
         return GARRISON_ERROR_INVALID_TALENT;
 
-    // Check if already learned
+    // An Anima Conductor destination is not a talent you learn once - it is a channel you switch on, pay for,
+    // and can switch on again after it lapses (or upgrade from temporary to permanent). So it is the one talent
+    // kind for which "already known" is not an error; everything else keeps the one-shot rule.
+    bool const channelAnima = IsChannelAnimaTalent(talentEntry);
+
     auto itr = _talents.find(garrTalentID);
-    if (itr != _talents.end())
+    if (itr != _talents.end() && !channelAnima)
+        return GARRISON_ERROR_INVALID_TALENT;
+
+    // A destination already channelled permanently cannot be bought again - the client refuses to offer it
+    // (AnimaDiversionPinMixin:OnClick returns early on Enum.AnimaDiversionNodeState.SelectedPermanent) and it
+    // would otherwise be a way to burn a player's currency for nothing.
+    if (channelAnima && itr != _talents.end() && itr->second.Rank > 0 && !itr->second.IsTemporary())
         return GARRISON_ERROR_INVALID_TALENT;
 
     // Check prerequisite talent
@@ -4479,14 +5841,78 @@ uint32 Garrison::LearnTalent(uint32 garrTalentID, bool isTemporary)
             return GARRISON_ERROR_INVALID_TALENT;
     }
 
+    // Published sanctum gate: GarrTalent.PlayerConditionID. For the Channel Anima destinations this is the
+    // Anima Conductor tier test (talent 1237 Purity's Pinnacle -> PC 79227 -> ModifierTree 132493 -> "talent 1062
+    // researched": tier 1 opens 2 destinations, tier 2 the next 2, tier 3 the last 2); for the other sanctum
+    // research trees it is the tier-0 covenant gate and the Reservoir renown/covenant gates. See
+    // IsTalentAvailableForPlayer for exactly what is enforced and what is deliberately exempt.
+    if (!IsTalentAvailableForPlayer(talentEntry))
+        return GARRISON_ERROR_FAILED_CONDITION;
+
+    // A covenant-scoped tree belongs to exactly one covenant.
+    if (!IsTalentTreeOwnedByPlayerCovenant(treeEntry))
+        return GARRISON_ERROR_INVALID_TALENT;
+
+    // Charge the channel and take the previous one down. This may erase entries from _talents, so nothing may
+    // hold an iterator into it across the call.
+    if (channelAnima)
+        if (uint32 error = TakeChannelAnimaCost(talentEntry, !isTemporary))
+            return error;
+
     // Learn the talent at rank 0 (researching to rank 1 happens via ResearchTalent)
     Talent& talent = _talents[garrTalentID];
     talent.GarrTalentID = garrTalentID;
     talent.Rank = 0;
     talent.ResearchStartTime = 0;
-    talent.Flags = isTemporary ? GARRISON_TALENT_FLAG_TEMPORARY : GARRISON_TALENT_FLAG_NONE;
+    // The TEMPORARY flag is only ever meaningful for an Anima Conductor channel in a covenant sanctum, and the
+    // daily-reset sweep (World::DailyReset) deletes type-111 talents carrying it. Refusing to set it on anything
+    // else is what makes that sweep safe: a client cannot get a researched sanctum tier deleted every night by
+    // sending IsTemporary on it.
+    talent.Flags = (isTemporary && channelAnima) ? GARRISON_TALENT_FLAG_TEMPORARY : GARRISON_TALENT_FLAG_NONE;
     talent.SoulbindConduitID = 0;
     talent.SoulbindConduitRank = 0;
+
+    // A channel is switched on, not researched: it is active the moment it is paid for. Its rank ALSO costs
+    // currency, so it does not qualify for the free-rank shortcut below and has to be seated here.
+    if (channelAnima)
+    {
+        talent.Rank = 1;
+        ApplyTalentRankPerk(garrTalentID, 0);
+        _owner->UpdateCriteria(CriteriaType::CompleteResearchGarrisonTalent, garrTalentID, talent.Rank);
+        _owner->UpdateCriteria(CriteriaType::CompleteResearchAnyGarrisonTalent, garrTalentID, talent.Rank);
+
+        WorldPackets::Garrison::GarrisonResearchTalentResult channelResult;
+        channelResult.Result = GARRISON_SUCCESS;
+        channelResult.GarrTypeID = static_cast<uint8>(GetType());
+        channelResult.Talent.GarrTalentID = talent.GarrTalentID;
+        channelResult.Talent.Rank = talent.Rank;
+        channelResult.Talent.ResearchStartTime = time_t(talent.ResearchStartTime);
+        channelResult.Talent.Flags = talent.Flags;
+        _owner->SendDirectMessage(channelResult.Write());
+
+        return GARRISON_SUCCESS;
+    }
+
+    // A rank that costs nothing and takes no time has no research step at all - picking it IS having it. That is how
+    // the covenant ability trees (393/396/397/395) and the soulbind trait nodes are authored (cost 0 / gold 0 /
+    // duration 0), and it is the reason SPELL_EFFECT_LEARN_GARR_TALENT -> LearnTalent must land on rank 1: the quest
+    // reward spells 337187/337059/337190/337191 (class) and 328604/320846/336692/337388 (signature) would otherwise
+    // leave the talent parked at rank 0 forever and never grant their PerkSpellID.
+    // Outside the covenant sanctum this affects only 11 rows in unused scratch trees (151, 468).
+    if (std::vector<GarrTalentRankEntry const*> const* ranks = sGarrisonMgr.GetTalentRanksForTalent(garrTalentID))
+    {
+        if (!ranks->empty())
+        {
+            GarrTalentRankEntry const* firstRank = (*ranks)[0];
+            if (firstRank->ResearchCost <= 0 && firstRank->ResearchGoldCost <= 0 && firstRank->ResearchDurationSecs <= 0)
+            {
+                talent.Rank = 1;
+                ApplyTalentRankPerk(garrTalentID, 0);
+                _owner->UpdateCriteria(CriteriaType::CompleteResearchGarrisonTalent, garrTalentID, talent.Rank);
+                _owner->UpdateCriteria(CriteriaType::CompleteResearchAnyGarrisonTalent, garrTalentID, talent.Rank);
+            }
+        }
+    }
 
     // Send result
     WorldPackets::Garrison::GarrisonResearchTalentResult result;
@@ -4510,6 +5936,14 @@ uint32 Garrison::ResearchTalent(uint32 garrTalentID)
     // Verify the talent tree belongs to this garrison type
     GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
     if (!treeEntry || treeEntry->GarrTypeID != static_cast<int8>(GetType()))
+        return GARRISON_ERROR_INVALID_TALENT;
+
+    // Published PlayerConditionID gate (Channel Anima tiers, tier-0 covenant gates, Reservoir renown gates - see
+    // IsTalentAvailableForPlayer), then the covenant-ownership check (see LearnTalent).
+    if (!IsTalentAvailableForPlayer(talentEntry))
+        return GARRISON_ERROR_FAILED_CONDITION;
+
+    if (!IsTalentTreeOwnedByPlayerCovenant(treeEntry))
         return GARRISON_ERROR_INVALID_TALENT;
 
     // Must already be learned (or learn it now if not)
@@ -4575,11 +6009,22 @@ uint32 Garrison::ResearchTalent(uint32 garrTalentID)
     // Start research
     talent.ResearchStartTime = GameTime::GetGameTime();
 
+    // CriteriaType::StartResearchGarrisonTalent (202, Asset = GarrTalentID) and
+    // CriteriaType::StartResearchAnyGarrisonTalent (201, no asset).
+    _owner->UpdateCriteria(CriteriaType::StartResearchGarrisonTalent, garrTalentID, talent.Rank + 1);
+    _owner->UpdateCriteria(CriteriaType::StartResearchAnyGarrisonTalent, garrTalentID, talent.Rank + 1);
+
     // If research is instant (duration 0), complete immediately
     if (rankEntry->ResearchDurationSecs <= 0)
     {
         talent.Rank++;
         talent.ResearchStartTime = 0;
+
+        // An instant research never passes through CompleteAllTalentResearch, so grant the perk and credit the
+        // completion here.
+        ApplyTalentRankPerk(garrTalentID, talent.Rank - 1);
+        _owner->UpdateCriteria(CriteriaType::CompleteResearchGarrisonTalent, garrTalentID, talent.Rank);
+        _owner->UpdateCriteria(CriteriaType::CompleteResearchAnyGarrisonTalent, garrTalentID, talent.Rank);
     }
 
     // Legion Order Advancement intro quests ("Using Lost Knowledge" 46940 and its per-class equivalents) close their
@@ -4637,6 +6082,13 @@ uint32 Garrison::SocketTalent(uint32 garrTalentID, int32 soulbindConduitID, int3
     talent.SoulbindConduitID = soulbindConduitID;
     talent.SoulbindConduitRank = soulbindConduitRank;
 
+    // CriteriaType::SocketGarrisonTalent (227, Asset = GarrTalentID) - miscValue2 = the conduit socketed.
+    _owner->UpdateCriteria(CriteriaType::SocketGarrisonTalent, garrTalentID, soulbindConduitID);
+    // CriteriaType::SocketAnySoulbindConduit (228) - only a real conduit counts; clearing a socket
+    // (conduit id 0) is not a "socket a conduit" event.
+    if (soulbindConduitID > 0)
+        _owner->UpdateCriteria(CriteriaType::SocketAnySoulbindConduit, soulbindConduitID, soulbindConduitRank);
+
     // Send result
     WorldPackets::Garrison::GarrisonResearchTalentResult result;
     result.Result = GARRISON_SUCCESS;
@@ -4651,6 +6103,109 @@ uint32 Garrison::SocketTalent(uint32 garrTalentID, int32 soulbindConduitID, int3
     result.Talent.Socket = socket;
     _owner->SendDirectMessage(result.Write());
 
+    // Dedicated socket-data push. GarrisonResearchTalentResult above carries the whole talent; these
+    // two opcodes are the incremental form the client uses to update just the conduit slot, and are
+    // type-correct for whichever garrison owns this talent (WoD 2 / Order Hall 3 / War Campaign 9 /
+    // Covenant 111).
+    if (talent.SoulbindConduitID)
+    {
+        WorldPackets::Garrison::GarrisonTalentUpdateSocketData socketUpdate;
+        socketUpdate.GarrTypeID = static_cast<uint8>(GetType());
+        socketUpdate.GarrTalentID = talent.GarrTalentID;
+        WorldPackets::Garrison::GarrisonTalentSocketData socketData;
+        socketData.SoulbindConduitID = talent.SoulbindConduitID;
+        socketData.SoulbindConduitRank = talent.SoulbindConduitRank;
+        socketUpdate.Socket = socketData;
+        _owner->SendDirectMessage(socketUpdate.Write());
+    }
+    else
+    {
+        // Conduit cleared out of the socket - the slot is now empty rather than holding rank 0.
+        WorldPackets::Garrison::GarrisonTalentRemoveSocketData socketRemove;
+        socketRemove.GarrTypeID = static_cast<uint8>(GetType());
+        socketRemove.GarrTalentID = talent.GarrTalentID;
+        _owner->SendDirectMessage(socketRemove.Write());
+    }
+
+    return GARRISON_SUCCESS;
+}
+
+// Server-driven full respec of one talent tree: erases every talent belonging to the tree from
+// memory and from character_garrison_talents, then tells the client. There is no
+// CMSG_GARRISON_RESET_TALENT_TREE in the 12.0.7 opcode set, so this is reachable through
+// `.garrison resettalents <treeId>` rather than a client request.
+uint32 Garrison::ResetTalentTree(uint32 garrTalentTreeID)
+{
+    GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(garrTalentTreeID);
+    if (!treeEntry)
+        return GARRISON_ERROR_INVALID_TALENT;
+
+    // Refuse to reset a tree that does not belong to this garrison type.
+    if (treeEntry->GarrTypeID != GetType())
+        return GARRISON_ERROR_INVALID_TALENT;
+
+    // Collect first: the client tracks individual talents, so each one is announced separately.
+    std::vector<uint32> removedTalents;
+    // Talents in this tree that actually held a conduit. These are the ones whose socket disappears, and
+    // they are announced as one batch below instead of N singular remove-socket packets.
+    std::vector<uint32> clearedSocketTalents;
+    for (auto const& [talentId, talent] : _talents)
+    {
+        GarrTalentEntry const* talentEntry = sGarrTalentStore.LookupEntry(talentId);
+        if (!talentEntry || talentEntry->GarrTalentTreeID != garrTalentTreeID)
+            continue;
+
+        removedTalents.push_back(talentId);
+        if (talent.SoulbindConduitID)
+            clearedSocketTalents.push_back(talentId);
+
+        // Take back everything the talent's completed ranks granted (GarrTalentRank.PerkSpellID).
+        RemoveTalentRankPerks(talentId, talent.Rank);
+    }
+
+    if (removedTalents.empty())
+        return GARRISON_ERROR_INVALID_TALENT;
+
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+    for (uint32 talentId : removedTalents)
+    {
+        _talents.erase(talentId);
+
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_GARRISON_TALENT);
+        stmt->setUInt64(0, _owner->GetGUID().GetCounter());
+        stmt->setUInt32(1, talentId);
+        trans->Append(stmt);
+
+        WorldPackets::Garrison::GarrisonTalentRemoved talentRemoved;
+        talentRemoved.GarrTypeID = static_cast<uint8>(GetType());
+        talentRemoved.GarrTalentID = talentId;
+        _owner->SendDirectMessage(talentRemoved.Write());
+    }
+    CharacterDatabase.CommitTransaction(trans);
+
+    // Tree-level notifications. The socket-data reset is only meaningful when the tree actually
+    // held conduit data, so it is not sent unconditionally.
+    if (!clearedSocketTalents.empty())
+    {
+        // Batch form first: one message listing every talent that lost its conduit, so the conduit UI
+        // clears in a single frame instead of reacting to N singular removals. Changes is deliberately
+        // empty - a tree reset only removes sockets, it never seats one.
+        WorldPackets::Garrison::GarrisonApplyTalentSocketDataChanges socketChanges;
+        socketChanges.GarrTypeID = static_cast<uint8>(GetType());
+        socketChanges.RemovedTalentIDs = clearedSocketTalents;
+        _owner->SendDirectMessage(socketChanges.Write());
+
+        WorldPackets::Garrison::GarrisonResetTalentTreeSocketData socketReset;
+        socketReset.GarrTypeID = static_cast<uint8>(GetType());
+        socketReset.GarrTalentTreeID = garrTalentTreeID;
+        _owner->SendDirectMessage(socketReset.Write());
+    }
+
+    WorldPackets::Garrison::GarrisonResetTalentTree treeReset;
+    treeReset.GarrTypeID = static_cast<uint8>(GetType());
+    treeReset.GarrTalentTreeID = garrTalentTreeID;
+    _owner->SendDirectMessage(treeReset.Write());
+
     return GARRISON_SUCCESS;
 }
 
@@ -4658,12 +6213,20 @@ uint32 Garrison::SocketTalent(uint32 garrTalentID, int32 soulbindConduitID, int3
 // Trophy system
 // ============================================================
 
-void Garrison::AddTrophy(uint32 trophyID)
+// A monument shows exactly one statue, so this is an assignment, not an accumulation. The previous code
+// inserted into a set and never replaced, so every trophy a player so much as scrolled past stayed forever.
+void Garrison::SetSelectedTrophy(uint32 trophyInstanceID, uint32 trophyID)
 {
-    _trophies.insert(trophyID);
+    _trophies[trophyInstanceID] = trophyID;
 }
 
-void Garrison::RemoveTrophy(uint32 trophyID)
+void Garrison::ClearSelectedTrophy(uint32 trophyInstanceID)
 {
-    _trophies.erase(trophyID);
+    _trophies.erase(trophyInstanceID);
+}
+
+uint32 Garrison::GetSelectedTrophy(uint32 trophyInstanceID) const
+{
+    auto itr = _trophies.find(trophyInstanceID);
+    return itr != _trophies.end() ? itr->second : 0;
 }

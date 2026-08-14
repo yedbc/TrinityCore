@@ -695,6 +695,16 @@ struct CampaignEntry
     bool HasFlag(CampaignFlags flag) const { return EnumFlag(static_cast<CampaignFlags>(Flags)).HasFlag(flag); }
 };
 
+struct CampaignXConditionEntry
+{
+    uint32 ID;
+    LocalizedString FailureReason;
+    int32 PlayerConditionID;
+    int32 OrderIndex;
+    int32 Flags;
+    uint32 CampaignID;
+};
+
 struct CampaignXQuestLineEntry
 {
     uint32 ID;
@@ -1212,30 +1222,6 @@ struct CorruptionEffectsEntry
     int32 Flags;
 };
 
-struct RenownRewardsEntry
-{
-    uint32 ID;
-    LocalizedString Name;
-    LocalizedString Description;
-    LocalizedString ToastDescription;
-    int32 CovenantID;
-    int32 Level;
-    int32 Icon;
-    int32 Flags;
-    int32 UiOrder;
-    int32 ItemID;
-    int32 SpellID;
-    int32 MountID;
-    int32 TransmogID;
-    int32 TransmogSetID;
-    int32 CharTitlesID;
-    int32 GarrFollowerID;
-    int32 TransmogIllusionID;
-    int32 Field_12_0_0_63534_016;
-    int32 QuestID;
-    int32 PlayerConditionID;
-};
-
 struct CovenantEntry
 {
     uint32 ID;
@@ -1623,6 +1609,15 @@ struct CriteriaTreeEntry
     int32 Flags;
 
     EnumFlag<CriteriaTreeFlags> GetFlags() const { return static_cast<CriteriaTreeFlags>(Flags); }
+};
+
+struct CurrencyCategoryEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    int32 Flags;
+    uint8 ExpansionID;
+    int32 ParentCategoryID;
 };
 
 struct CurrencyContainerEntry
@@ -2086,6 +2081,16 @@ struct FactionEntry
 
 #define MAX_FACTION_RELATIONS 8
 
+struct FactionGroupEntry
+{
+    uint32 ID;
+    char const* InternalName;
+    LocalizedString Name;
+    uint8 MaskID;
+    int32 HonorCurrencyTextureFileID;
+    int32 ConquestCurrencyTextureFileID;
+};
+
 struct FactionTemplateEntry
 {
     uint32 ID;
@@ -2273,20 +2278,30 @@ struct GarrAbilityEffectEntry
     int32 ActionRecordID;
 };
 
+// GarrAutoCombatant.db2, layout 0x6ADAF487 (12.0.7.68275, WoWDBDefs). The statline is a level
+// curve, not a flat block. There is no BoardIndex column here (board position lives on
+// GarrMissionXEncounter) and no back-reference to an encounter (GarrEncounter.AutoCombatantID
+// points this way instead). Role values per the DBD: 0 None, 1 Melee, 2 RangedPhysical,
+// 3 RangedMagic, 4 HealSupport, 5 Tank - see AutoCombatRole.
 struct GarrAutoCombatantEntry
 {
     uint32 ID;
-    int32 Attack;
-    int32 Health;
-    int32 MaxHealth;
-    int32 AutoAttackSpellID;
+    int32 HealthBase;
+    int32 HealthGainPerLevel;
+    int32 AttackBase;
+    int32 AttackGainPerLevel;
+    int32 AttackSpellID;
+    int32 AbilitySpellID;
+    int32 AbilitySpellID2;
+    int32 PassiveSpellID;
     int32 Role;
-    int32 BoardIndex;
-    int32 GarrEncounterID;
-    int32 GarrAutoSpellID;
-    int32 Flags;
 };
 
+// GarrAutoSpell.db2, layout 0x8067D16A (12.0.7.68275, WoWDBDefs). The three trailing columns used to
+// be declared SchoolMask/SpellVisualID/Flags, which is the order of no build: the file order is
+// Flags, SchoolMask, IconFileDataID, so SchoolMask was being read out of Flags. Confirmed against the
+// shipped rows - GarrAutoSpell 4 "Double Strike ... Physical damage" carries 1 in this column,
+// 6 "Blood Explosion ... Shadow damage" carries 32, 10 "Starbranch Crush ... Frost damage" carries 16.
 struct GarrAutoSpellEntry
 {
     uint32 ID;
@@ -2294,20 +2309,27 @@ struct GarrAutoSpellEntry
     LocalizedString Description;
     int32 Cooldown;
     int32 Duration;
-    int32 SchoolMask;
-    int32 SpellVisualID;
     int32 Flags;
+    int32 SchoolMask;
+    int32 IconFileDataID;
 };
 
+// GarrAutoSpellEffect.db2, layout 0xACEA7666 (12.0.7.68275, WoWDBDefs). The middle columns used to be
+// declared EffectType/Targets/Amount/MiscType/MiscValue, one position off the real file order: what
+// was read as "EffectType" is the row's EffectIndex, what was read as "Targets" is the Effect kind,
+// and what was read as "MiscType" is the TargetType mask. Effect values per the DBD: 1 DealAutoDamage,
+// 2 Heal, 3 DealDamage, 4 Heal, 7 Dot, 8 Hot, 10 taunt, 12 damage-dealt multiplier,
+// 14 damage-taken multiplier, 18 increase max health (0/5/6/9/11/13/15..17 undocumented or test-only,
+// and 19/20 occur in the data without a DBD entry at all).
 struct GarrAutoSpellEffectEntry
 {
     uint32 ID;
     int32 GarrAutoSpellID;
-    uint8 EffectType;
-    uint8 Targets;
-    float Amount;
-    uint8 MiscType;
-    int32 MiscValue;
+    uint8 EffectIndex;
+    uint8 Effect;
+    float Points;
+    uint8 TargetType;
+    int32 Flags;
     int32 Period;
 };
 
@@ -2396,17 +2418,18 @@ struct GarrClassSpecPlayerCondEntry
     uint8 Flags;
 };
 
+// GarrEncounter.db2, layout 0x90365AF7 (12.0.7.68275, WoWDBDefs).
 struct GarrEncounterEntry
 {
     uint32 ID;
     LocalizedString Name;
     int32 CreatureID;
-    int32 CreatureDisplayInfoID;
-    uint32 UiAnimHeight;
+    int32 PortraitFileDataID;
+    uint32 UiTextureKitID;
     float UiAnimScale;
-    float UiTextureScale;
-    int32 EnvGarrMechanicTypeID;
-    int32 GarrEncounterSetID;
+    float UiAnimHeight;
+    int32 Flags;
+    int32 AutoCombatantID;
 };
 
 struct GarrEncounterXMechanicEntry
@@ -2625,13 +2648,15 @@ struct GarrMissionTextureEntry
     uint16 UiTextureAtlasMemberID;
 };
 
+// GarrMissionXEncounter.db2, layout 0x08428AE4 (12.0.7.68275, WoWDBDefs). BoardIndex is the
+// enemy's slot on the Adventures board (-1 for the pre-Shadowlands rows that have no board).
 struct GarrMissionXEncounterEntry
 {
     uint32 ID;
     uint32 GarrEncounterID;
-    uint32 GarrMissionSetEncounterID;
-    uint8 CombatWeightBase;
-    int8 CombatWeightMax;
+    uint32 GarrEncounterSetID;
+    uint8 OrderIndex;
+    int8 BoardIndex;
     int32 GarrMissionID;
 };
 
@@ -3450,6 +3475,23 @@ struct ItemCreationContextEntry
     uint32 ItemCreationContextGroupID;
 };
 
+struct ItemConversionEntry
+{
+    uint32 ID;
+    int32 Unknown920;
+    int32 ItemBonusTreeID;
+    int32 ItemLogicalCostGroupID;
+    int32 AlternateItemLogicalCostGroupID;
+    int32 PlayerConditionID;
+};
+
+struct ItemConversionEntryEntry
+{
+    uint32 ID;
+    int32 ItemID;
+    uint32 ItemConversionID;
+};
+
 struct ItemCurrencyCostEntry
 {
     uint32 ID;
@@ -3573,6 +3615,15 @@ struct ItemLimitCategoryConditionEntry
     int8 AddQuantity;
     uint32 PlayerConditionID;
     uint32 ParentItemLimitCategoryID;
+};
+
+struct ItemLogicalCostEntry
+{
+    uint32 ID;
+    int32 InventoryTypeSlotMask;
+    int32 Flags;
+    int32 ItemExtendedCostID;
+    uint32 ItemLogicalCostGroupID;
 };
 
 struct ItemModifiedAppearanceEntry
@@ -3845,6 +3896,40 @@ struct KeychainEntry
 {
     uint32 ID;
     std::array<uint8, KEYCHAIN_SIZE> Key;
+};
+
+struct MythicPlusSeasonKeyFloorEntry
+{
+    uint32 ID;
+    int32 KeyFloor;
+    int32 PlayerConditionID;
+    uint32 DisplaySeasonID;
+};
+
+struct MythicPlusSeasonRewardLevelsEntry
+{
+    uint32 ID;
+    uint32 MythicPlusSeasonID;
+    int32 ActivityTierID;
+    int32 DifficultyLevel;
+    int32 WeeklyRewardLevel;
+    int32 EndOfRunRewardLevel;
+};
+
+struct MythicPlusSeasonTrackedAffixEntry
+{
+    uint32 ID;
+    int32 KeystoneAffixID;
+    int32 BonusRating;
+    int32 Field_9_1_0_38511_004;
+    uint32 DisplaySeasonID;
+};
+
+struct MythicPlusSeasonTrackedMapEntry
+{
+    uint32 ID;
+    int32 MapChallengeModeID;
+    uint32 DisplaySeasonID;
 };
 
 struct KeystoneAffixEntry
@@ -4740,6 +4825,18 @@ struct QuestInfoEntry
     uint16 Profession;
 };
 
+struct QuestLineEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    LocalizedString Description;
+    int32 CompletionPlayerConditionID;
+    int32 Flags;
+    uint32 QuestID;
+    int32 PlayerConditionID;
+    int32 Unknown1027_5;
+};
+
 struct QuestLineXQuestEntry
 {
     uint32 ID;
@@ -4801,6 +4898,43 @@ struct RandPropPointsEntry
     std::array<uint32, 5> Epic;
     std::array<uint32, 5> Superior;
     std::array<uint32, 5> Good;
+};
+
+struct RenownRewardsEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    LocalizedString Description;
+    LocalizedString ToastDescription;
+    int32 CovenantID;
+    int32 Level;
+    int32 Icon;
+    int32 Flags;
+    int32 UiOrder;
+    int32 ItemID;
+    int32 SpellID;
+    int32 MountID;
+    int32 TransmogID;
+    int32 TransmogSetID;
+    int32 CharTitlesID;
+    int32 GarrFollowerID;
+    int32 TransmogIllusionID;
+    int32 RewardCategory;        // Field_12_0_0_63534_016 - reward category enum
+    int32 QuestID;
+    int32 PlayerConditionID;
+};
+
+struct RenownRewardsPlunderstormEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    LocalizedString Description;
+    int32 CovenantID;
+    int32 Level;
+    int32 Icon;
+    int32 RewardCategory;        // Field_10_2_6_53840_005
+    int32 UiOrder;
+    int32 SpellID;
 };
 
 struct RewardPackEntry
@@ -6098,6 +6232,20 @@ struct TransportRotationEntry
     uint32 GameObjectsID;
 };
 
+// Trophy.db2 (FileDataId 975024, layout 0xA17123C5). The catalogue of garrison monument trophies: the statue
+// appearances a WoD garrison Monument Base (GAMEOBJECT_TYPE_GARRISON_MONUMENT) can be set to display.
+// TrophyTypeID is the same id the monument gameobject carries in its Data0, so it partitions the catalogue by
+// monument - in the 68275 client 3 = Horde/Frostwall, 4 = Alliance/Lunarfall, 0 = NoValue (not displayable).
+// PlayerConditionID is the unlock gate; see WorldSession::HandleGetTrophyList for what it resolves to today.
+struct TrophyEntry
+{
+    uint32 ID;
+    LocalizedString Name;
+    uint8 TrophyTypeID;
+    int32 GameObjectDisplayInfoID;
+    uint32 PlayerConditionID;
+};
+
 struct UiMapEntry
 {
     LocalizedString Name;
@@ -6192,6 +6340,12 @@ struct UIChromieTimeExpansionInfoEntry
     int32 CompletedPlayerConditionID;
     int32 SortPriority;
     int32 RecommendPlayerConditionID;
+};
+
+struct UiTextureKitEntry
+{
+    uint32 ID;
+    char const* KitPrefix;     // textureKit string (e.g. "MajorFaction-DragonscaleExpedition")
 };
 
 #define MAX_UNIT_CONDITION_VALUES 8
@@ -6392,6 +6546,71 @@ struct WarbandScenePlacementEntry
     int32 Field_12_0_0_63534_008;
     int32 SlotID;
     int32 Field_12_0_0_63534_010;
+};
+
+struct WarbandSceneAnimationEntry
+{
+    uint32 ID;
+    int32 SpellVisualKitID;
+    int32 Event;
+    int32 AnimKitID;
+    int32 Field_11_0_0_54210_003;
+    float TimeIsh;
+    uint8 StandState;
+    uint8 SheatheState;
+    int8 Field_11_1_0_58221_008;
+    std::array<int32, 2> Field_11_0_0_54210_005;
+};
+
+struct WarbandSceneAnimChrSpecEntry
+{
+    uint32 ID;
+    int32 WarbandSceneAnimationID;
+    int32 ChrSpecializationID;
+};
+
+struct WarbandScenePlacementFilterReqEntry
+{
+    uint32 ID;
+    uint16 Field_11_1_0_58221_002;
+    int8 Field_11_1_0_58221_005;
+    std::array<int32, 2> Field_11_1_0_58221_003;
+};
+
+struct WarbandScenePlacementOptionEntry
+{
+    DBCPosition3D Position;
+    uint32 ID;
+    uint32 WarbandScenePlacementID;
+    float Orientation;
+    float Scale;
+    int32 Field_11_1_0_58221_005;
+    int32 Field_11_1_0_58221_006;
+};
+
+struct WarbandScenePlcmntAnimOverrideEntry
+{
+    uint32 ID;
+    int32 Field_11_0_0_54210_000;
+    int32 WarbandSceneAnimationID;
+};
+
+struct WarbandPlacementDisplayInfoEntry
+{
+    uint32 ID;
+    uint32 WarbandScenePlacementID;
+    int32 Field_11_2_0_61476_001;
+    int32 Field_11_2_0_61476_002;
+    int32 Field_11_2_0_61476_003;
+    int32 Field_11_2_0_61476_004;
+};
+
+struct WarbandSceneSourceInfoEntry
+{
+    LocalizedString SourceDescription;
+    uint32 ID;
+    uint32 WarbandSceneID;
+    int8 SourceType;
 };
 
 struct WMOAreaTableEntry

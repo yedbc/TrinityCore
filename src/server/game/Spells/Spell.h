@@ -363,6 +363,8 @@ class TC_GAME_API Spell
         void EffectProspecting();
         void EffectMilling();
         void EffectRenamePet();
+        void EffectSetItemBonusListGroupEntry();
+        void EffectIncreaseItemBonusListGroupStep();
         void EffectSendTaxi();
         void EffectKnockBack();
         void EffectPullTowards();
@@ -446,6 +448,7 @@ class TC_GAME_API Spell
         void EffectCreatePrivateConversation();
         void EffectApplyMountEquipment();
         void EffectSkipCampaign();
+        void EffectSetChromieTime();
         void EffectSendChatMessage();
         void EffectGrantBattlePetExperience();
         void EffectLearnTransmogIllusion();
@@ -477,6 +480,8 @@ class TC_GAME_API Spell
         void EffectChangeActiveCombatTraitConfig();
         void EffectTeleportGraveyard();
         void EffectUpdateInteractions();
+        void EffectPreloadWorld();
+        void EffectCancelPreloadWorld();
         void EffectSkipQuestLine();
         void EffectLearnWarbandScene();
         void EffectSetPlayerDataElementAccount();

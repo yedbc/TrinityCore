@@ -961,6 +961,48 @@ namespace WorldPackets
             ObjectGuid FailedBy;            ///< Unit that caused the spell to fail, set for SPELL_FAILED_INTERRUPTED_COMBAT
         };
 
+        // Sent to a client that is being shown a unit which is already casting, so the spell visual
+        // is picked up mid-flight instead of the cast appearing out of nowhere when it completes.
+        class ResumeCast final : public ServerPacket
+        {
+        public:
+            explicit ResumeCast() : ServerPacket(SMSG_RESUME_CAST, 18 + 4 + 4 + 18 + 18 + 4) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid CasterUnit;
+            SpellCastVisual Visual;
+            ObjectGuid CastID;
+            ObjectGuid Target;
+            int32 SpellID = 0;
+        };
+
+        // The cast bar half of the pair above: carries how far the cast or channel has already
+        // progressed so the client draws a partially filled bar instead of restarting it.
+        class ResumeCastBar final : public ServerPacket
+        {
+        public:
+            explicit ResumeCastBar() : ServerPacket(SMSG_RESUME_CAST_BAR, 18 + 18 + 4 + 4 + 4 + 4 + 4 + 1) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid CasterUnit;
+            ObjectGuid Target;
+            int32 SpellID = 0;
+            SpellCastVisual Visual;
+            int32 TimeElapsed = 0;      ///< milliseconds already spent, -1 when the cast has no fixed duration
+            int32 TotalTime = 0;        ///< milliseconds the whole cast takes, -1 when it has no fixed duration
+            struct UnknownTrailer
+            {
+                int32 Unknown1 = 0;
+                int32 Unknown2 = 0;
+            };
+            /// One capture in 424 set the trailing bit and appended two int32 (0, 2), on an empowered
+            /// cast. A single sample cannot name those two fields, so nothing populates them here and
+            /// the bit is always written clear - see Unit::SendResumeCastTo, which skips empowers.
+            Optional<UnknownTrailer> Unknown;
+        };
+
         class SpellEmpowerStart final : public ServerPacket
         {
         public:
@@ -1291,6 +1333,23 @@ namespace WorldPackets
 
             int32 RecipeID = 0;
             bool IsFavorite = false;
+        };
+
+        // CMSG_OPEN_TRADESKILL_NPC (0x3A01E9): the client telling the server a trade-skill window opened.
+        // Wire: PackedGuid NpcGUID - a PackedGuid, so 2 bytes when empty, NOT a fixed 16.
+        //
+        // Across 124 captured instances the guid is EMPTY in 123 of them (the player's own profession
+        // window) and a real creature guid in 1 (crafting at an NPC, preceded by CMSG_SET_SELECTION on the
+        // same guid). Both shapes are handled: an empty guid clears any stale crafter binding, a real one
+        // establishes the interaction the later profession opcodes are validated against.
+        class OpenTradeSkillNpc final : public ClientPacket
+        {
+        public:
+            explicit OpenTradeSkillNpc(WorldPacket&& packet) : ClientPacket(CMSG_OPEN_TRADESKILL_NPC, std::move(packet)) { }
+
+            void Read() override;
+
+            ObjectGuid NpcGUID;
         };
 
         class KeyboundOverride final : public ClientPacket

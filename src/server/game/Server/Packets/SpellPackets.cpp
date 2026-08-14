@@ -972,6 +972,37 @@ WorldPacket const* SpellChannelUpdate::Write()
     return &_worldPacket;
 }
 
+WorldPacket const* ResumeCast::Write()
+{
+    _worldPacket << CasterUnit;
+    _worldPacket << Visual;
+    _worldPacket << CastID;
+    _worldPacket << Target;
+    _worldPacket << int32(SpellID);
+
+    return &_worldPacket;
+}
+
+WorldPacket const* ResumeCastBar::Write()
+{
+    _worldPacket << CasterUnit;
+    _worldPacket << Target;
+    _worldPacket << int32(SpellID);
+    _worldPacket << Visual;
+    _worldPacket << int32(TimeElapsed);
+    _worldPacket << int32(TotalTime);
+    _worldPacket << OptionalInit(Unknown);
+    _worldPacket.FlushBits();
+
+    if (Unknown)
+    {
+        _worldPacket << int32(Unknown->Unknown1);
+        _worldPacket << int32(Unknown->Unknown2);
+    }
+
+    return &_worldPacket;
+}
+
 WorldPacket const* SpellEmpowerStart::Write()
 {
     _worldPacket << CastID;
@@ -1232,6 +1263,11 @@ void TradeSkillSetFavorite::Read()
 {
     _worldPacket >> RecipeID;
     _worldPacket >> Bits<1>(IsFavorite);
+}
+
+void OpenTradeSkillNpc::Read()
+{
+    _worldPacket >> NpcGUID;
 }
 
 void KeyboundOverride::Read()

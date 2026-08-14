@@ -606,6 +606,92 @@ CREATE TABLE `character_covenant` (
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
+-- Table structure for table `character_covenant_soulbind`
+--
+
+DROP TABLE IF EXISTS `character_covenant_soulbind`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `character_covenant_soulbind` (
+  `guid` bigint unsigned NOT NULL DEFAULT '0',
+  `covenantId` int unsigned NOT NULL DEFAULT '0',
+  `soulbindId` int unsigned NOT NULL DEFAULT '0',
+  PRIMARY KEY (`guid`,`covenantId`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Soulbind last active per covenant (also the set of covenants ever joined)';
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `character_garrison_conservatory`
+--
+
+DROP TABLE IF EXISTS `character_garrison_conservatory`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `character_garrison_conservatory` (
+  `guid`          BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Character GUID',
+  `plotId`        TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0-based wildseed plot index',
+  `wildseedEntry` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'garrison_conservatory_wildseed.wildseedEntry',
+  `plantedTime`   BIGINT NOT NULL DEFAULT 0,
+  `maturesAt`     BIGINT NOT NULL DEFAULT 0 COMMENT 'unix time the wildseed becomes harvestable',
+  `catalyst1`     INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'gameobject_template.entry of the attached catalyst',
+  `catalyst2`     INT UNSIGNED NOT NULL DEFAULT 0,
+  `catalyst3`     INT UNSIGNED NOT NULL DEFAULT 0,
+  `catalyst4`     INT UNSIGNED NOT NULL DEFAULT 0,
+  `state`         TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 empty, 1 growing, 2 ready',
+  PRIMARY KEY (`guid`, `plotId`),
+  KEY `idx_guid` (`guid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Queen''s Conservatory wildseed plots';
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `character_garrison_abomination_factory`
+--
+
+DROP TABLE IF EXISTS `character_garrison_abomination_factory`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `character_garrison_abomination_factory` (
+  `guid`          BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Character GUID',
+  `recipeSpellId` INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'SkillLineAbility.Spell of the construct-body recipe',
+  `builtTime`     BIGINT NOT NULL DEFAULT 0 COMMENT 'unix time the construct was stitched',
+  PRIMARY KEY (`guid`, `recipeSpellId`),
+  KEY `idx_guid` (`guid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Abomination Factory construct stable';
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `character_garrison_path_of_ascension`
+--
+
+DROP TABLE IF EXISTS `character_garrison_path_of_ascension`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `character_garrison_path_of_ascension` (
+  `guid`              BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Character GUID',
+  `memoryId`          INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'garrison_ascension_memory.memoryId',
+  `capturedTime`      BIGINT NOT NULL DEFAULT 0 COMMENT 'unix time the memory was captured',
+  `highestTrialWon`   TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0 none, 1 Courage, 2 Loyalty, 3 Wisdom, 4 Humility',
+  `lastCompletedTime` BIGINT NOT NULL DEFAULT 0 COMMENT 'unix time of the most recent trial win',
+  PRIMARY KEY (`guid`, `memoryId`),
+  KEY `idx_guid` (`guid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Path of Ascension captured memories and trial progress';
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Table structure for table `character_garrison_ember_court`
+--
+
+DROP TABLE IF EXISTS `character_garrison_ember_court`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `character_garrison_ember_court` (
+  `guid`           BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Character GUID',
+  `guestIndex`     TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT '0-15, CriteriaTree 87983 child OrderIndex',
+  `timesHosted`    INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'courts this guest has attended',
+  `highestMood`    TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'high-water mark on the unpublished mood scale;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
 -- Table structure for table `character_soulbind_conduits`
 --
 
@@ -1242,6 +1328,97 @@ CREATE TABLE `character_inventory` (
 LOCK TABLES `character_inventory` WRITE;
 /*!40000 ALTER TABLE `character_inventory` DISABLE KEYS */;
 /*!40000 ALTER TABLE `character_inventory` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
+-- Table structure for table `character_mythic_plus`
+--
+
+DROP TABLE IF EXISTS `character_mythic_plus`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `character_mythic_plus` (
+  `guid` bigint unsigned NOT NULL DEFAULT '0' COMMENT 'Global Unique Identifier',
+  `challengeModeId` int unsigned NOT NULL DEFAULT '0' COMMENT 'MapChallengeMode.db2 ID',
+  `level` int unsigned NOT NULL DEFAULT '0' COMMENT 'Keystone level of the best run',
+  `durationMs` int unsigned NOT NULL DEFAULT '0' COMMENT 'Effective run time in milliseconds (incl. death penalty)',
+  `deaths` int unsigned NOT NULL DEFAULT '0',
+  `completionDate` bigint NOT NULL DEFAULT '0' COMMENT 'Unix time of the run',
+  `score` float NOT NULL DEFAULT '0',
+  `affix1` int unsigned NOT NULL DEFAULT '0',
+  `affix2` int unsigned NOT NULL DEFAULT '0',
+  `affix3` int unsigned NOT NULL DEFAULT '0',
+  `affix4` int unsigned NOT NULL DEFAULT '0',
+  PRIMARY KEY (`guid`,`challengeModeId`),
+  CONSTRAINT `fk_character_mythic_plus_character` FOREIGN KEY (`guid`) REFERENCES `characters` (`guid`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Mythic Keystone best runs';
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `character_mythic_plus`
+--
+
+LOCK TABLES `character_mythic_plus` WRITE;
+/*!40000 ALTER TABLE `character_mythic_plus` DISABLE KEYS */;
+/*!40000 ALTER TABLE `character_mythic_plus` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
+-- Table structure for table `character_mythic_plus_vault`
+--
+
+DROP TABLE IF EXISTS `character_mythic_plus_vault`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `character_mythic_plus_vault` (
+  `guid` bigint unsigned NOT NULL COMMENT 'Global Unique Identifier',
+  `claimedResetTime` bigint NOT NULL DEFAULT '0' COMMENT 'Weekly reset boundary the vault reward was claimed for',
+  `keystoneResetTime` bigint NOT NULL DEFAULT '0' COMMENT 'Weekly reset boundary the keystone was last adjusted for',
+  `prevWeekResetTime` bigint NOT NULL DEFAULT '0' COMMENT 'Weekly reset boundary the summarised previous week ended at',
+  `prevWeekBestLevel` int unsigned NOT NULL DEFAULT '0' COMMENT 'Highest keystone level completed in that week (timed or not)',
+  `prevWeekBestTimedLevel` int unsigned NOT NULL DEFAULT '0' COMMENT 'Highest keystone level completed IN TIME in that week',
+  PRIMARY KEY (`guid`),
+  CONSTRAINT `fk_character_mythic_plus_vault_guid` FOREIGN KEY (`guid`) REFERENCES `characters` (`guid`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Per-character Great Vault weekly claim state';
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `character_mythic_plus_vault`
+--
+
+LOCK TABLES `character_mythic_plus_vault` WRITE;
+/*!40000 ALTER TABLE `character_mythic_plus_vault` DISABLE KEYS */;
+/*!40000 ALTER TABLE `character_mythic_plus_vault` ENABLE KEYS */;
+UNLOCK TABLES;
+
+--
+-- Table structure for table `character_mythic_plus_weekly`
+--
+
+DROP TABLE IF EXISTS `character_mythic_plus_weekly`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `character_mythic_plus_weekly` (
+  `guid` bigint unsigned NOT NULL COMMENT 'Global Unique Identifier',
+  `id` int unsigned NOT NULL AUTO_INCREMENT,
+  `challengeModeId` int unsigned NOT NULL DEFAULT '0',
+  `level` int unsigned NOT NULL DEFAULT '0',
+  `timed` tinyint unsigned NOT NULL DEFAULT '0' COMMENT 'Run beat the par time',
+  `completionDate` bigint NOT NULL DEFAULT '0',
+  `resetTime` bigint NOT NULL DEFAULT '0' COMMENT 'Weekly reset boundary these runs belong to',
+  PRIMARY KEY (`id`),
+  KEY `idx_guid` (`guid`),
+  CONSTRAINT `fk_character_mythic_plus_weekly_guid` FOREIGN KEY (`guid`) REFERENCES `characters` (`guid`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Per-character Mythic+ runs completed this Great Vault week';
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `character_mythic_plus_weekly`
+--
+
+LOCK TABLES `character_mythic_plus_weekly` WRITE;
+/*!40000 ALTER TABLE `character_mythic_plus_weekly` DISABLE KEYS */;
+/*!40000 ALTER TABLE `character_mythic_plus_weekly` ENABLE KEYS */;
 UNLOCK TABLES;
 
 --

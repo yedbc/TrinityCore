@@ -78,6 +78,7 @@ TC_GAME_API extern DB2Storage<BountyEntry>                          sBountyStore
 TC_GAME_API extern DB2Storage<BountySetEntry>                       sBountySetStore;
 TC_GAME_API extern DB2Storage<BroadcastTextEntry>                   sBroadcastTextStore;
 TC_GAME_API extern DB2Storage<CampaignEntry>                        sCampaignStore;
+TC_GAME_API extern DB2Storage<CampaignXConditionEntry>              sCampaignXConditionStore;
 TC_GAME_API extern DB2Storage<CampaignXQuestLineEntry>              sCampaignXQuestLineStore;
 TC_GAME_API extern DB2Storage<Cfg_CategoriesEntry>                  sCfgCategoriesStore;
 TC_GAME_API extern DB2Storage<Cfg_RegionsEntry>                     sCfgRegionsStore;
@@ -101,7 +102,6 @@ TC_GAME_API extern DB2Storage<ContributionEntry>                    sContributio
 TC_GAME_API extern DB2Storage<ConversationLineEntry>                sConversationLineStore;
 TC_GAME_API extern DB2Storage<CorruptionEffectsEntry>               sCorruptionEffectsStore;
 TC_GAME_API extern DB2Storage<CovenantEntry>                        sCovenantStore;
-TC_GAME_API extern DB2Storage<RenownRewardsEntry>                   sRenownRewardsStore;
 TC_GAME_API extern DB2Storage<CraftingQualityEntry>                 sCraftingQualityStore;
 TC_GAME_API extern DB2Storage<CreatureDisplayInfoEntry>             sCreatureDisplayInfoStore;
 TC_GAME_API extern DB2Storage<CreatureDisplayInfoExtraEntry>        sCreatureDisplayInfoExtraStore;
@@ -111,6 +111,7 @@ TC_GAME_API extern DB2Storage<CreatureModelDataEntry>               sCreatureMod
 TC_GAME_API extern DB2Storage<CreatureTypeEntry>                    sCreatureTypeStore;
 TC_GAME_API extern DB2Storage<CriteriaEntry>                        sCriteriaStore;
 TC_GAME_API extern DB2Storage<CriteriaTreeEntry>                    sCriteriaTreeStore;
+TC_GAME_API extern DB2Storage<CurrencyCategoryEntry>                sCurrencyCategoryStore;
 TC_GAME_API extern DB2Storage<CurrencyTypesEntry>                   sCurrencyTypesStore;
 TC_GAME_API extern DB2Storage<CurveEntry>                           sCurveStore;
 TC_GAME_API extern DB2Storage<DataTagXHouseDecorRecordEntry>        sDataTagXHouseDecorRecordStore;
@@ -139,6 +140,7 @@ TC_GAME_API extern DB2Storage<ExteriorComponentHookEntry>            sExteriorCo
 TC_GAME_API extern DB2Storage<ExteriorComponentTypeEntry>            sExteriorComponentTypeStore;
 TC_GAME_API extern DB2Storage<ExteriorComponentXGroupEntry>          sExteriorComponentXGroupStore;
 TC_GAME_API extern DB2Storage<FactionEntry>                         sFactionStore;
+TC_GAME_API extern DB2Storage<FactionGroupEntry>                    sFactionGroupStore;
 TC_GAME_API extern DB2Storage<FactionTemplateEntry>                 sFactionTemplateStore;
 TC_GAME_API extern DB2Storage<FlightCapabilityEntry>                sFlightCapabilityStore;
 TC_GAME_API extern DB2Storage<FriendshipRepReactionEntry>           sFriendshipRepReactionStore;
@@ -242,6 +244,8 @@ TC_GAME_API extern DB2Storage<ItemBonusListLevelDeltaEntry>         sItemBonusLi
 TC_GAME_API extern DB2Storage<ItemBonusTreeEntry>                   sItemBonusTreeStore;
 TC_GAME_API extern DB2Storage<ItemBonusTreeNodeEntry>               sItemBonusTreeNodeStore;
 TC_GAME_API extern DB2Storage<ItemContextPickerEntryEntry>          sItemContextPickerEntryStore;
+TC_GAME_API extern DB2Storage<ItemConversionEntry>                  sItemConversionStore;
+TC_GAME_API extern DB2Storage<ItemConversionEntryEntry>             sItemConversionEntryStore;
 TC_GAME_API extern DB2Storage<ItemCreationContextEntry>             sItemCreationContextStore;
 TC_GAME_API extern DB2Storage<ItemDamageAmmoEntry>                  sItemDamageAmmoStore;
 TC_GAME_API extern DB2Storage<ItemDamageOneHandEntry>               sItemDamageOneHandStore;
@@ -256,6 +260,7 @@ TC_GAME_API extern DB2Storage<ItemLevelSelectorEntry>               sItemLevelSe
 TC_GAME_API extern DB2Storage<ItemLevelSelectorQualityEntry>        sItemLevelSelectorQualityStore;
 TC_GAME_API extern DB2Storage<ItemLevelSelectorQualitySetEntry>     sItemLevelSelectorQualitySetStore;
 TC_GAME_API extern DB2Storage<ItemLimitCategoryEntry>               sItemLimitCategoryStore;
+TC_GAME_API extern DB2Storage<ItemLogicalCostEntry>                 sItemLogicalCostStore;
 TC_GAME_API extern DB2Storage<ItemModifiedAppearanceEntry>          sItemModifiedAppearanceStore;
 TC_GAME_API extern DB2Storage<ItemModifiedAppearanceExtraEntry>     sItemModifiedAppearanceExtraStore;
 TC_GAME_API extern DB2Storage<ItemNameDescriptionEntry>             sItemNameDescriptionStore;
@@ -301,6 +306,10 @@ TC_GAME_API extern DB2Storage<NeighborhoodInitiativeEntry>          sNeighborhoo
 TC_GAME_API extern DB2Storage<NeighborhoodMapEntry>                 sNeighborhoodMapStore;
 TC_GAME_API extern DB2Storage<NeighborhoodNameGenEntry>             sNeighborhoodNameGenStore;
 TC_GAME_API extern DB2Storage<NeighborhoodPlotEntry>                sNeighborhoodPlotStore;
+TC_GAME_API extern DB2Storage<MythicPlusSeasonKeyFloorEntry>        sMythicPlusSeasonKeyFloorStore;
+TC_GAME_API extern DB2Storage<MythicPlusSeasonRewardLevelsEntry>    sMythicPlusSeasonRewardLevelsStore;
+TC_GAME_API extern DB2Storage<MythicPlusSeasonTrackedAffixEntry>    sMythicPlusSeasonTrackedAffixStore;
+TC_GAME_API extern DB2Storage<MythicPlusSeasonTrackedMapEntry>      sMythicPlusSeasonTrackedMapStore;
 TC_GAME_API extern DB2Storage<OverrideSpellDataEntry>               sOverrideSpellDataStore;
 TC_GAME_API extern DB2Storage<ParagonReputationEntry>               sParagonReputationStore;
 TC_GAME_API extern DB2Storage<PerksActivityEntry>                   sPerksActivityStore;
@@ -326,11 +335,14 @@ TC_GAME_API extern DB2Storage<PvpTalentSlotUnlockEntry>             sPvpTalentSl
 TC_GAME_API extern DB2Storage<PvpTierEntry>                         sPvpTierStore;
 TC_GAME_API extern DB2Storage<QuestFactionRewardEntry>              sQuestFactionRewardStore;
 TC_GAME_API extern DB2Storage<QuestInfoEntry>                       sQuestInfoStore;
+TC_GAME_API extern DB2Storage<QuestLineEntry>                       sQuestLineStore;
 TC_GAME_API extern DB2Storage<QuestLineXQuestEntry>                 sQuestLineXQuestStore;
 TC_GAME_API extern DB2Storage<QuestMoneyRewardEntry>                sQuestMoneyRewardStore;
 TC_GAME_API extern DB2Storage<QuestSortEntry>                       sQuestSortStore;
 TC_GAME_API extern DB2Storage<QuestXPEntry>                         sQuestXPStore;
 TC_GAME_API extern DB2Storage<RandPropPointsEntry>                  sRandPropPointsStore;
+TC_GAME_API extern DB2Storage<RenownRewardsEntry>                   sRenownRewardsStore;
+TC_GAME_API extern DB2Storage<RenownRewardsPlunderstormEntry>       sRenownRewardsPlunderstormStore;
 TC_GAME_API extern DB2Storage<RewardPackEntry>                      sRewardPackStore;
 TC_GAME_API extern DB2Storage<RoomComponentEntry>                   sRoomComponentStore;
 TC_GAME_API extern DB2Storage<RoomComponentOptionEntry>             sRoomComponentOptionStore;
@@ -434,9 +446,11 @@ TC_GAME_API extern DB2Storage<TransmogSetGroupEntry>                sTransmogSet
 TC_GAME_API extern DB2Storage<TransmogSetItemEntry>                 sTransmogSetItemStore;
 TC_GAME_API extern DB2Storage<TransportAnimationEntry>              sTransportAnimationStore;
 TC_GAME_API extern DB2Storage<TransportRotationEntry>               sTransportRotationStore;
+TC_GAME_API extern DB2Storage<TrophyEntry>                          sTrophyStore;
 TC_GAME_API extern DB2Storage<UiMapEntry>                           sUiMapStore;
 TC_GAME_API extern DB2Storage<UIChromieTimeExpansionInfoEntry>      sUIChromieTimeExpansionInfoStore;
 TC_GAME_API extern DB2Storage<UISplashScreenEntry>                  sUISplashScreenStore;
+TC_GAME_API extern DB2Storage<UiTextureKitEntry>                    sUiTextureKitStore;
 TC_GAME_API extern DB2Storage<UnitConditionEntry>                   sUnitConditionStore;
 TC_GAME_API extern DB2Storage<UnitPowerBarEntry>                    sUnitPowerBarStore;
 TC_GAME_API extern DB2Storage<VehicleEntry>                         sVehicleStore;
@@ -445,6 +459,13 @@ TC_GAME_API extern DB2Storage<VignetteEntry>                        sVignetteSto
 TC_GAME_API extern DB2Storage<WarbandSceneEntry>                    sWarbandSceneStore;
 TC_GAME_API extern DB2Storage<WeeklyRewardChestThresholdEntry>      sWeeklyRewardChestThresholdStore;
 TC_GAME_API extern DB2Storage<WarbandScenePlacementEntry>           sWarbandScenePlacementStore;
+TC_GAME_API extern DB2Storage<WarbandSceneAnimationEntry>           sWarbandSceneAnimationStore;
+TC_GAME_API extern DB2Storage<WarbandSceneAnimChrSpecEntry>         sWarbandSceneAnimChrSpecStore;
+TC_GAME_API extern DB2Storage<WarbandScenePlacementFilterReqEntry>  sWarbandScenePlacementFilterReqStore;
+TC_GAME_API extern DB2Storage<WarbandScenePlacementOptionEntry>     sWarbandScenePlacementOptionStore;
+TC_GAME_API extern DB2Storage<WarbandScenePlcmntAnimOverrideEntry>  sWarbandScenePlcmntAnimOverrideStore;
+TC_GAME_API extern DB2Storage<WarbandPlacementDisplayInfoEntry>     sWarbandPlacementDisplayInfoStore;
+TC_GAME_API extern DB2Storage<WarbandSceneSourceInfoEntry>          sWarbandSceneSourceInfoStore;
 TC_GAME_API extern DB2Storage<WorldEffectEntry>                     sWorldEffectStore;
 TC_GAME_API extern DB2Storage<WorldMapOverlayEntry>                 sWorldMapOverlayStore;
 TC_GAME_API extern DB2Storage<WorldStateExpressionEntry>            sWorldStateExpressionStore;

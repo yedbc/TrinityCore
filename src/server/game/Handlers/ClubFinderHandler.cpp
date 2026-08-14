@@ -26,6 +26,28 @@
 #include "Player.h"
 #include "WorldSession.h"
 
+// CF-6: managing a guild's recruitment (posting, reading its applicant list, responding to and
+// whispering applicants) is not leader-only. Retail lets any officer whose guild rank carries the
+// recruiter permission act on the posting, so the leader-only gate here was stricter than retail.
+//
+// The client and the wire/enum expose no dedicated club-finder/recruiter right, so the guild invite
+// right (GR_RIGHT_INVITE) - the same rank right that governs bringing new members into the guild - is
+// used as the recruiter-equivalent: managing recruitment is exactly the act of inviting members. The
+// guild leader holds the GuildMaster rank (GR_RIGHT_ALL) and therefore always passes; a member whose
+// rank lacks the invite right, or a player not in the guild at all, is refused with the existing
+// CLUB_FINDER error.
+static bool CanManageClubRecruitment(Guild const* guild, Player const* player)
+{
+    if (!guild || !player)
+        return false;
+
+    if (guild->GetLeaderGUID() == player->GetGUID())
+        return true;
+
+    Guild::Member const* member = guild->GetMember(player->GetGUID());
+    return member && guild->HasAnyRankRight(member->GetRankId(), GR_RIGHT_INVITE);
+}
+
 // Club Finder P0: a guild advertises itself for recruitment.
 //
 // The client clamps Name to 96 and Description to 2048 before sending, and the wire encodes those
@@ -66,9 +88,9 @@ void WorldSession::HandleClubFinderPost(WorldPackets::ClubFinder::ClubFinderPost
         return;
     }
 
-    if (guild->GetLeaderGUID() != player->GetGUID())
+    if (!CanManageClubRecruitment(guild, player))
     {
-        TC_LOG_DEBUG("network", "CMSG_CLUB_FINDER_POST: {} is not the leader of guild {}.",
+        TC_LOG_DEBUG("network", "CMSG_CLUB_FINDER_POST: {} lacks recruitment permission in guild {}.",
             GetPlayerInfo(), guild->GetId());
         sendError(CLUB_FINDER_ERROR_NO_POSTING_PERMISSIONS);
         return;
@@ -164,6 +186,12 @@ void WorldSession::HandleClubFinderPost(WorldPackets::ClubFinder::ClubFinderPost
 // guild rather than cached on the posting, so a browsing player sees the guild's real current state.
 static bool BuildClubCacheData(ClubFinderPosting const& posting, WorldPackets::ClubFinder::ClubFinderLookupClubPostingsList::ClubCacheData& data)
 {
+    // A direct REQUEST_CLUBS_DATA lookup names posting ids straight out and must not become a way to
+    // read the postings moderation hid from search: apply the same visibility predicate Search uses, so
+    // a crafted request cannot enumerate banned, delisted, pending-delete, unlisted or expired postings.
+    if (!ClubFinderMgr::IsPostingVisible(posting))
+        return false;
+
     Guild* guild = sGuildMgr->GetGuildById(posting.ClubId);
     if (!guild)
         return false;
@@ -235,8 +263,9 @@ void WorldSession::HandleClubFinderRequestClubsData(WorldPackets::ClubFinder::Cl
     SendPacket(response.Write());
 }
 
-// Decodes the client's filter list into search criteria. Filter types 1, 2, 3 and 5 map directly onto
-// data the posting carries; 4 (class) and 6 (locale) are parsed but not yet matched - see below.
+// Decodes the client's filter list into search criteria. Filter types 1, 2, 3, 4, 5 and 6 all map onto
+// data the posting carries: 1/2/4 are bit groups of the posting's recruitmentFlags, 6 its packed
+// recruitment locale.
 static void ApplySearchFilters(std::vector<WorldPackets::ClubFinder::ClubFinderPostingFilter> const& filters,
     ClubFinderMgr::SearchCriteria& criteria)
 {
@@ -256,8 +285,9 @@ static void ApplySearchFilters(std::vector<WorldPackets::ClubFinder::ClubFinderP
             case 5:     // specialization bitmask
                 criteria.Specs = filter.Uint64Value;
                 break;
-            case 4:     // the searching player class id
-                criteria.ClassId = uint8(filter.UintValue);
+            case 4:     // recruited class-role flags (Tank / Healer / Damage), bits 9-11 of the same
+                        // recruitmentFlags bit space as the focus and size groups.
+                criteria.RoleFlags = filter.UintValue;
                 break;
             case 6:     // applicant locale flags, a bitmask of (1 << WowLocale). The client applies no
                         // validation to this value, so it is masked to the legal locale set here.
@@ -278,6 +308,13 @@ void WorldSession::HandleClubFinderRequestClubsList(WorldPackets::ClubFinder::Cl
     ClubFinderMgr::SearchCriteria criteria;
     criteria.SearchString = request.SearchString;
     criteria.Type = request.Type;
+
+    // CF-7: the searcher's faction drives cross-faction search visibility - an opposite-faction posting
+    // is hidden from search unless its guild advertises cross-faction. Apply/accept remain ungated;
+    // this is a search-visibility filter only.
+    if (Player* player = GetPlayer())
+        criteria.SearcherTeamId = int8(player->GetTeamId());
+
     ApplySearchFilters(request.Filters, criteria);
 
     WorldPackets::ClubFinder::ClubFinderReturnRecruitingClubs response;
@@ -353,11 +390,12 @@ void WorldSession::HandleClubFinderRequestMembershipToClub(WorldPackets::ClubFin
         return;
     }
 
-    // Applying to your own guild is meaningless, and a guild that stopped listing or let its posting
-    // lapse is not accepting.
-    if (player->GetGuildId() == posting->ClubId
-        || !(posting->RecruitmentFlags & CLUB_FINDER_SETTING_ENABLE_LISTING)
-        || ClubFinderMgr::IsPostingExpired(*posting))
+    // Applying to your own guild is meaningless, and a posting that is not visible to search is not
+    // accepting applications either: IsPostingVisible rejects a guild that stopped listing or let its
+    // posting lapse, and - the gap this closes - also rejects a banned, delisted or pending-delete
+    // posting, so a player holding a stale clubFinderGUID cannot lodge an application against a posting
+    // moderation has removed.
+    if (player->GetGuildId() == posting->ClubId || !ClubFinderMgr::IsPostingVisible(*posting))
     {
         sendError(CLUB_FINDER_ERROR_APPLY_CLUB);
         return;
@@ -368,10 +406,27 @@ void WorldSession::HandleClubFinderRequestMembershipToClub(WorldPackets::ClubFin
     application.PlayerGuid = player->GetGUID();
     application.Comment    = request.Comment.substr(0, 512);
     application.Specs      = request.RecruitingSpecs;
+    application.Status     = CLUB_FINDER_APPLICATION_PENDING;
 
-    // A guild that auto-accepts admits the applicant without the officer step.
-    application.Status = (posting->RecruitmentFlags & CLUB_FINDER_SETTING_AUTO_ACCEPT)
-        ? CLUB_FINDER_APPLICATION_AUTO_APPROVED : CLUB_FINDER_APPLICATION_PENDING;
+    // A guild that auto-accepts admits the applicant without the officer step - but the admission has
+    // to be a real guild join, exactly like the officer accept path. Reporting AUTO_APPROVED without
+    // adding the member (the old behaviour) left an auto-accept guild gaining zero members. Only mark
+    // the application JOINED when the transactional add actually succeeds; otherwise leave it PENDING
+    // so an officer can still act on it. A player already in another guild cannot be auto-joined, so
+    // the already-guilded guard simply leaves the application pending.
+    if (posting->RecruitmentFlags & CLUB_FINDER_SETTING_AUTO_ACCEPT)
+    {
+        Guild* guild = sGuildMgr->GetGuildById(posting->ClubId);
+        if (guild && !player->GetGuildId())
+        {
+            CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+            if (guild->AddMember(trans, player->GetGUID()))
+            {
+                CharacterDatabase.CommitTransaction(trans);
+                application.Status = CLUB_FINDER_APPLICATION_JOINED;
+            }
+        }
+    }
 
     sClubFinderMgr->SaveApplication(std::move(application));
 
@@ -397,8 +452,8 @@ void WorldSession::HandleClubFinderGetApplicantsList(WorldPackets::ClubFinder::C
     ClubFinderPosting const* posting = guild ? sClubFinderMgr->GetPostingForClub(guild->GetId()) : nullptr;
 
     // No posting, or no authority over it: an empty list is the truthful answer, and never another
-    // guild applicants.
-    if (!posting || guild->GetLeaderGUID() != player->GetGUID())
+    // guild applicants. Any officer with the recruiter (invite) right may read it, not just the leader.
+    if (!posting || !CanManageClubRecruitment(guild, player))
     {
         SendPacket(response.Write());
         return;
@@ -439,7 +494,7 @@ void WorldSession::HandleClubFinderRespondToApplicant(WorldPackets::ClubFinder::
         return;
     }
 
-    if (guild->GetLeaderGUID() != player->GetGUID())
+    if (!CanManageClubRecruitment(guild, player))
     {
         sendError(CLUB_FINDER_ERROR_NO_INVITE_PERMISSIONS);
         return;
@@ -447,6 +502,19 @@ void WorldSession::HandleClubFinderRespondToApplicant(WorldPackets::ClubFinder::
 
     ClubFinderApplication const* existing = sClubFinderMgr->GetApplication(posting->PostingId, request.PlayerGUID);
     if (!existing)
+    {
+        sendError(CLUB_FINDER_ERROR_RESPOND_APPLICANT);
+        return;
+    }
+
+    // Consent guard: an applicant controls their own membership, so only a still-live request may be
+    // acted on. The old code checked only that an application row existed, which let a leader accept a
+    // withdrawn (CANCELED), declined, already-joined, or expired application and force a player into the
+    // guild against their current consent - the applicant may have cancelled, or the offer may have
+    // lapsed. Refuse anything that is not a pending (or auto-approved) and unexpired request; the
+    // client surfaces CLUB_FINDER_ERROR_RESPOND_APPLICANT and re-requests the applicant list.
+    if ((existing->Status != CLUB_FINDER_APPLICATION_PENDING && existing->Status != CLUB_FINDER_APPLICATION_AUTO_APPROVED)
+        || ClubFinderMgr::IsApplicationExpired(*existing))
     {
         sendError(CLUB_FINDER_ERROR_RESPOND_APPLICANT);
         return;
@@ -539,7 +607,7 @@ void WorldSession::HandleClubFinderWhisperApplicantRequest(WorldPackets::ClubFin
 
     ClubFinderPosting const* posting = GetPostingFromGUID(request.ClubFinderGUID);
     Guild* guild = posting ? sGuildMgr->GetGuildById(posting->ClubId) : nullptr;
-    if (!posting || !guild || guild->GetLeaderGUID() != player->GetGUID())
+    if (!posting || !guild || !CanManageClubRecruitment(guild, player))
         return;
 
     if (!sClubFinderMgr->GetApplication(posting->PostingId, request.PlayerGUID))

@@ -21,6 +21,7 @@
 #include "Common.h"
 #include "AsyncCallbackProcessor.h"
 #include "AuthDefines.h"
+#include "BattlePayMgr.h"          // ShopProduct / ShopEntitlement
 #include "ClientBuildInfo.h"
 #include "DatabaseEnvFwd.h"
 #include "Duration.h"
@@ -90,6 +91,7 @@ namespace lfg
     struct LfgRoleCheck;
     struct LfgUpdateData;
     enum LfgTeleportResult : uint8;
+    enum LfgSlotInvalidReason : uint32;
 }
 
 namespace rbac
@@ -119,6 +121,7 @@ namespace WorldPackets
     {
         class AdventureJournalOpenQuest;
         class AdventureJournalUpdateSuggestions;
+        class EncounterJournalStartArathiRpe;
     }
 
     namespace AdventureMap
@@ -129,10 +132,14 @@ namespace WorldPackets
 
     namespace BattlePay
     {
+        class UpdateVasPurchaseStates;
+        class VasGetServiceStatus;
         class GetProductList;
         class GetPurchaseList;
         class StartPurchase;
         class OpenCheckout;
+        class ConfirmPurchaseResponse;
+        class DistributionAssignToTarget;
     }
 
     namespace AreaTrigger
@@ -172,6 +179,7 @@ namespace WorldPackets
     {
         enum class ConnectToSerial : uint32;
         class QueuedMessagesEnd;
+        class SuspendCommsAck;
     }
 
     namespace Azerite
@@ -207,6 +215,10 @@ namespace WorldPackets
         class SurrenderArena;
         class BattlemasterJoin;
         class BattlemasterJoinArena;
+        class BattlemasterJoinRatedBGBlitz;
+        class BattlemasterJoinSkirmish;
+        class BattlemasterJoinBrawl;
+        class JoinRatedBattleground;
         class StartWarGame;
         class AcceptWargameInvite;
         class BattlefieldLeave;
@@ -260,6 +272,7 @@ namespace WorldPackets
         class DelveTeleportOut;
         class RequestPartyEligibilityForDelveTiers;
         class SelectDelveEntranceTier;
+        class TieredEntranceOpen;
     }
 
     namespace BlackMarket
@@ -398,6 +411,12 @@ namespace WorldPackets
         class CraftingOrderUpdateIgnoreList;
     }
 
+    namespace Contribution
+    {
+        class ContributionContribute;
+        class ContributionLastUpdateRequest;
+    }
+
     namespace Combat
     {
         class AttackSwing;
@@ -420,6 +439,7 @@ namespace WorldPackets
     namespace Contribution
     {
         class ContributionContribute;
+        class ContributionLastUpdateRequest;
     }
 
     namespace Covenant
@@ -551,6 +571,9 @@ namespace WorldPackets
         class GuildChallengeUpdateRequest;
         class SaveGuildEmblem;
         class GuildSetAchievementTracking;
+        class GuildQueryRecipes;
+        class GuildQueryMemberRecipes;
+        class GuildQueryMembersForRecipe;
         class GuildChangeNameRequest;
     }
 
@@ -688,6 +711,7 @@ namespace WorldPackets
         class InstanceAbandonVoteResponse;
         class InstanceInfo;
         class InstanceLockResponse;
+        class RequestInstanceEncounterEventSync;
         class ResetInstances;
         class SetDifficultyID;
         class StartInstanceAbandonVote;
@@ -704,6 +728,7 @@ namespace WorldPackets
         class DestroyItem;
         class GetItemPurchaseData;
         class ItemPurchaseRefund;
+        class PerformItemInteraction;
         class RepairItem;
         class ReadItem;
         class SellItem;
@@ -741,6 +766,8 @@ namespace WorldPackets
         class DFTeleport;
         class DFGetSystemInfo;
         class DFGetJoinStatus;
+        class DFConfirmExpandSearch;
+        struct RideTicket;
     }
 
     namespace LFGList
@@ -785,11 +812,17 @@ namespace WorldPackets
         class SendMail;
     }
 
+    namespace MajorFactions
+    {
+        class RequestCatchupState;
+    }
+
     namespace Misc
     {
         class SetSelection;
         class ViolenceLevel;
         class TimeSyncResponse;
+        class DiscardedTimeSyncAcks;
         class TutorialSetFlag;
         class SetDungeonDifficulty;
         class SetRaidDifficulty;
@@ -957,6 +990,8 @@ namespace WorldPackets
         class PerksProgramRequestRefund;
         class PerksProgramSetFrozenVendorItem;
         class PerksProgramRequestCartCheckout;
+        class PerksProgramItemsRefreshed;
+        class PerksProgramRequestPendingRewards;
     }
 
     namespace Query
@@ -1049,6 +1084,7 @@ namespace WorldPackets
         class AddIgnore;
         class DelFriend;
         class DelIgnore;
+        class MakeConditionalAppearancePermanent;
         class RecentAllyRequestData;
         class RecentAllySetNote;
         class SendContactList;
@@ -1082,6 +1118,7 @@ namespace WorldPackets
         class UpdateMissileTrajectory;
         class UpdateAuraVisual;
         class TradeSkillSetFavorite;
+        class OpenTradeSkillNpc;
         class KeyboundOverride;
         class RequestCrowdControlSpell;
         class SetEmpowerMinHoldStagePercent;
@@ -1594,6 +1631,7 @@ class TC_GAME_API WorldSession
 
         static constexpr uint32 SPECIAL_INIT_ACTIVE_MOVER_TIME_SYNC_COUNTER = 0xFFFFFFFF;
         static constexpr uint32 SPECIAL_RESUME_COMMS_TIME_SYNC_COUNTER      = 0xFFFFFFFE;
+        static constexpr uint32 SPECIAL_SUSPEND_COMMS_TIME_SYNC_COUNTER     = 0xFFFFFFFD;
 
         // Packets cooldown
         time_t GetCalendarEventCreationCooldown() const { return _calendarEventCreationCooldown; }
@@ -1603,6 +1641,18 @@ class TC_GAME_API WorldSession
         BattlePets::BattlePetMgr* GetBattlePetMgr() const { return _battlePetMgr.get(); }
 
         CollectionMgr* GetCollectionMgr() const { return _collectionMgr.get(); }
+
+        // Account-wide Trader's Tender (currency 2032). The authoritative balance lives in the login DB
+        // (battlenet_account_perks_tender), shared by every character of the bnet account; -1 means no row
+        // has been loaded yet (first login since the account-wide wallet was introduced -> seed from the
+        // loading character's existing per-character balance).
+        int64 GetAccountPerksTender() const { return _accountPerksTender; }
+        void StoreAccountPerksTender(uint32 amount);   // updates the session cache + persists to the login DB
+
+        // The Trading Post interval (UTC month-start) for which the account last received its base monthly Tender
+        // (Collector's Cache), used to grant it exactly once per period. Persisted alongside the balance.
+        uint64 GetAccountPerksCacheGrantPeriod() const { return _accountPerksCacheGrantPeriod; }
+        void SetAccountPerksCacheGrantPeriod(uint64 period) { _accountPerksCacheGrantPeriod = period; }
 
     public:                                                 // opcodes handlers
 
@@ -1839,6 +1889,9 @@ class TC_GAME_API WorldSession
         void HandleTurnInPetition(WorldPackets::Petition::TurnInPetition& packet);
 
         void HandleGuildQueryOpcode(WorldPackets::Guild::QueryGuildInfo& query);
+        void HandleGuildQueryRecipes(WorldPackets::Guild::GuildQueryRecipes& packet);
+        void HandleGuildQueryMemberRecipes(WorldPackets::Guild::GuildQueryMemberRecipes& packet);
+        void HandleGuildQueryMembersForRecipe(WorldPackets::Guild::GuildQueryMembersForRecipe& packet);
         void HandleGuildInviteByName(WorldPackets::Guild::GuildInviteByName& packet);
         void HandleGuildOfficerRemoveMember(WorldPackets::Guild::GuildOfficerRemoveMember& packet);
         void HandleGuildAcceptInvite(WorldPackets::Guild::AcceptGuildInvite& invite);
@@ -1862,7 +1915,10 @@ class TC_GAME_API WorldSession
         void HandlePerksProgramRequestRefund(WorldPackets::PerksProgram::PerksProgramRequestRefund& packet);
         void HandlePerksProgramSetFrozenVendorItem(WorldPackets::PerksProgram::PerksProgramSetFrozenVendorItem& packet);
         void HandlePerksProgramRequestCartCheckout(WorldPackets::PerksProgram::PerksProgramRequestCartCheckout& packet);
+        void HandlePerksProgramItemsRefreshed(WorldPackets::PerksProgram::PerksProgramItemsRefreshed& packet);
+        void HandlePerksProgramRequestPendingRewards(WorldPackets::PerksProgram::PerksProgramRequestPendingRewards& packet);
         void SendPerksProgramActivityUpdate();
+        void SendPerksAnimToggleKillSwitch();
         void HandleGuildSetGuildMaster(WorldPackets::Guild::GuildSetGuildMaster& packet);
         void HandleGuildUpdateMotdText(WorldPackets::Guild::GuildUpdateMotdText& packet);
         void HandleGuildNewsUpdateSticky(WorldPackets::Guild::GuildNewsUpdateSticky& packet);
@@ -1885,6 +1941,9 @@ class TC_GAME_API WorldSession
         void HandleHouseInteriorLeaveHouse(WorldPackets::Housing::HouseInteriorLeaveHouse const& houseInteriorLeaveHouse);
 
         // Housing - Decor System
+        // m3/A6: returns false (and consumes no budget) when the per-session
+        // decoration throttle is exceeded; handlers then reply TOO_MANY_REQUESTS.
+        bool CheckHousingDecorThrottle();
         void HandleHousingDecorSetEditMode(WorldPackets::Housing::HousingDecorSetEditMode const& housingDecorSetEditMode);
         void HandleHousingDecorPlace(WorldPackets::Housing::HousingDecorPlace const& housingDecorPlace);
         void HandleHousingDecorMove(WorldPackets::Housing::HousingDecorMove const& housingDecorMove);
@@ -2126,6 +2185,7 @@ class TC_GAME_API WorldSession
         void HandleAutoEquipItemOpcode(WorldPackets::Item::AutoEquipItem& autoEquipItem);
         void HandleSellItemOpcode(WorldPackets::Item::SellItem const& sellItem);
         void HandleSellAllJunkItems(WorldPackets::Item::SellAllJunkItems const& sellAllJunkItems);
+        void HandlePerformItemInteraction(WorldPackets::Item::PerformItemInteraction& performItemInteraction);
         void HandleBuyItemOpcode(WorldPackets::Item::BuyItem& packet);
         void HandleListInventoryOpcode(WorldPackets::NPC::Hello& packet);
         void HandleAutoStoreBagItemOpcode(WorldPackets::Item::AutoStoreBagItem& packet);
@@ -2171,6 +2231,7 @@ class TC_GAME_API WorldSession
         void HandleConfirmRespecWipeOpcode(WorldPackets::Talent::ConfirmRespecWipe& confirmRespecWipe);
         void HandleUnlearnSkillOpcode(WorldPackets::Spells::UnlearnSkill& packet);
         void HandleTradeSkillSetFavorite(WorldPackets::Spells::TradeSkillSetFavorite const& tradeSkillSetFavorite);
+        void HandleOpenTradeSkillNpc(WorldPackets::Spells::OpenTradeSkillNpc const& packet);
 
         void HandleTraitsCommitConfig(WorldPackets::Traits::TraitsCommitConfig const& traitsCommitConfig);
         void HandleClassTalentsRequestNewConfig(WorldPackets::Traits::ClassTalentsRequestNewConfig& classTalentsRequestNewConfig);
@@ -2212,6 +2273,7 @@ class TC_GAME_API WorldSession
         void HandleChatMessageWhisperOpcode(WorldPackets::Chat::ChatMessageWhisper& chatMessageWhisper);
         void HandleChatMessageChannelOpcode(WorldPackets::Chat::ChatMessageChannel& chatMessageChannel);
         ChatMessageResult HandleChatMessage(ChatMsg type, Language lang, std::string msg, std::string target = "", Optional<ObjectGuid> targetGuid = {});
+        void SendChatNotInParty(ChatMsg type);
         void HandleChatAddonMessageOpcode(WorldPackets::Chat::ChatAddonMessage& chatAddonMessage);
         void HandleChatAddonMessageTargetedOpcode(WorldPackets::Chat::ChatAddonMessageTargeted& chatAddonMessageTargeted);
         void HandleChatAddonMessage(ChatMsg type, std::string prefix, std::string text, bool isLogged, std::string target = "", Optional<ObjectGuid> targetGuid = {});
@@ -2277,6 +2339,10 @@ class TC_GAME_API WorldSession
         void HandleBattlefieldListOpcode(WorldPackets::Battleground::BattlefieldListRequest& battlefieldList);
         void HandleBattlefieldLeaveOpcode(WorldPackets::Battleground::BattlefieldLeave& battlefieldLeave);
         void HandleBattlemasterJoinArena(WorldPackets::Battleground::BattlemasterJoinArena& packet);
+        void HandleBattlemasterJoinRatedBGBlitz(WorldPackets::Battleground::BattlemasterJoinRatedBGBlitz& packet);
+        void HandleBattlemasterJoinSkirmish(WorldPackets::Battleground::BattlemasterJoinSkirmish& packet);
+        void HandleBattlemasterJoinBrawl(WorldPackets::Battleground::BattlemasterJoinBrawl& packet);
+        void HandleJoinRatedBattleground(WorldPackets::Battleground::JoinRatedBattleground& packet);
         void HandleStartWarGame(WorldPackets::Battleground::StartWarGame& packet);
         void HandleAcceptWargameInvite(WorldPackets::Battleground::AcceptWargameInvite& packet);
         void HandleReportPvPAFK(WorldPackets::Battleground::ReportPvPPlayerAFK& reportPvPPlayerAFK);
@@ -2305,7 +2371,9 @@ class TC_GAME_API WorldSession
         void HandleSetTitleOpcode(WorldPackets::Character::SetTitle& packet);
         void HandleTimeSync(uint32 counter, int64 clientTime, TimePoint responseReceiveTime);
         void HandleTimeSyncResponse(WorldPackets::Misc::TimeSyncResponse const& timeSyncResponse);
+        void HandleDiscardedTimeSyncAcks(WorldPackets::Misc::DiscardedTimeSyncAcks const& discardedTimeSyncAcks);
         void HandleQueuedMessagesEnd(WorldPackets::Auth::QueuedMessagesEnd const& queuedMessagesEnd);
+        void HandleSuspendCommsAck(WorldPackets::Auth::SuspendCommsAck const& suspendCommsAck);
         void HandleWhoIsOpcode(WorldPackets::Who::WhoIsRequest& packet);
         void HandleResetInstancesOpcode(WorldPackets::Instance::ResetInstances& packet);
         void HandleInstanceLockResponse(WorldPackets::Instance::InstanceLockResponse& packet);
@@ -2313,6 +2381,7 @@ class TC_GAME_API WorldSession
         void HandleInstanceAbandonVoteResponse(WorldPackets::Instance::InstanceAbandonVoteResponse& packet);
         void HandleSetDifficultyID(WorldPackets::Instance::SetDifficultyID& packet);
         void HandleToggleDifficulty(WorldPackets::Instance::ToggleDifficulty& packet);
+        void HandleRequestInstanceEncounterEventSync(WorldPackets::Instance::RequestInstanceEncounterEventSync& packet);
 
         // Looking for Dungeon/Raid
         void SendLfgPlayerLockInfo();
@@ -2325,6 +2394,7 @@ class TC_GAME_API WorldSession
         void HandleLfgTeleportOpcode(WorldPackets::LFG::DFTeleport& dfTeleport);
         void HandleDFGetSystemInfo(WorldPackets::LFG::DFGetSystemInfo& dfGetSystemInfo);
         void HandleDFGetJoinStatus(WorldPackets::LFG::DFGetJoinStatus& dfGetJoinStatus);
+        void HandleDFConfirmExpandSearch(WorldPackets::LFG::DFConfirmExpandSearch& dfConfirmExpandSearch);
 
         // Premade Group Finder (LFG List)
         void HandleLFGListJoin(WorldPackets::LFGList::LFGListJoin& packet);
@@ -2338,7 +2408,7 @@ class TC_GAME_API WorldSession
         void HandleLFGListInviteApplicant(WorldPackets::LFGList::LFGListInviteApplicant& packet);
         void HandleLFGListInviteResponse(WorldPackets::LFGList::LFGListInviteResponse& packet);
         void HandleRequestLFGListBlacklist(WorldPackets::LFGList::RequestLFGListBlacklist& packet);
-        void SendLFGListUpdateStatus(uint32 listingId);
+        void SendLFGListUpdateStatus(uint32 listingId, uint8 status = 0x38);
 
         void SendLfgUpdateStatus(lfg::LfgUpdateData const& updateData, bool party);
         void SendLfgRoleChosen(ObjectGuid guid, uint8 roles);
@@ -2351,6 +2421,8 @@ class TC_GAME_API WorldSession
         void SendLfgDisabled();
         void SendLfgOfferContinue(uint32 dungeonEntry);
         void SendLfgTeleportError(lfg::LfgTeleportResult err);
+        void SendLfgExpandSearchPrompt(WorldPackets::LFG::RideTicket const& ticket);
+        void SendLfgSlotInvalid(lfg::LfgSlotInvalidReason reason, int32 subReason1, int32 subReason2);
 
         void HandleSelfResOpcode(WorldPackets::Spells::SelfRes& selfRes);
         void HandleRequestPetInfo(WorldPackets::Pet::RequestPetInfo& requestPetInfo);
@@ -2361,7 +2433,6 @@ class TC_GAME_API WorldSession
         void HandleSortBags(WorldPackets::Item::SortBags& sortBags);
         void HandleSortBankBags(WorldPackets::Item::SortBankBags& sortBankBags);
         void HandleRemoveNewItem(WorldPackets::Item::RemoveNewItem& removeNewItem);
-        void HandlePerformItemInteraction(WorldPackets::Item::PerformItemInteraction& performItemInteraction);
         void HandleConvertItemToBindToAccount(WorldPackets::Item::ConvertItemToBindToAccount& convertItemToBindToAccount);
 
         void HandleCancelTempEnchantmentOpcode(WorldPackets::Item::CancelTempEnchantment& cancelTempEnchantment);
@@ -2470,6 +2541,7 @@ class TC_GAME_API WorldSession
         bool IsCommentator() const { return _isCommentator; }
         void SetCommentator(bool on) { _isCommentator = on; }
         void HandleContributionContribute(WorldPackets::Contribution::ContributionContribute& contribute);
+        void HandleContributionLastUpdateRequest(WorldPackets::Contribution::ContributionLastUpdateRequest& request);
         void HandleCloseTraitSystemInteraction(WorldPackets::Misc::CloseTraitSystemInteraction& closeTraitSystemInteraction);
         void HandleCloseRuneforgeInteraction(WorldPackets::Misc::CloseRuneforgeInteraction& closeRuneforgeInteraction);
         void HandleConversationLineStarted(WorldPackets::Misc::ConversationLineStarted& conversationLineStarted);
@@ -2487,6 +2559,7 @@ class TC_GAME_API WorldSession
         // Adventure Journal
         void HandleAdventureJournalOpenQuest(WorldPackets::AdventureJournal::AdventureJournalOpenQuest& openQuest);
         void HandleAdventureJournalUpdateSuggestions(WorldPackets::AdventureJournal::AdventureJournalUpdateSuggestions& updateSuggestions);
+        void HandleEncounterJournalStartArathiRpe(WorldPackets::AdventureJournal::EncounterJournalStartArathiRpe& startArathiRpe);
 
         // Covenant
         void HandleActivateSoulbind(WorldPackets::Covenant::ActivateSoulbind& packet);
@@ -2530,7 +2603,7 @@ class TC_GAME_API WorldSession
         void HandleConsumableTokenCanVeteranBuy(WorldPackets::Token::ConsumableTokenCanVeteranBuy& consumableTokenCanVeteranBuy);
         void HandleCanRedeemTokenForBalance(WorldPackets::Token::CanRedeemTokenForBalance& canRedeemTokenForBalance);
         void SendCommerceTokenUpdate();
-        void SendGenerateSsoToken();
+        void SendGenerateSsoToken(uint32 clientToken);
 
         // Compact Unit Frames (4.x)
         void HandleSaveCUFProfiles(WorldPackets::Misc::SaveCUFProfiles& packet);
@@ -2542,6 +2615,8 @@ class TC_GAME_API WorldSession
         void HandleStartChallengeMode(WorldPackets::ChallengeMode::StartChallengeMode& startChallengeMode);
         void HandleResetChallengeMode(WorldPackets::ChallengeMode::ResetChallengeMode& resetChallengeMode);
         void HandleMythicPlusRequestMapStats(WorldPackets::ChallengeMode::MythicPlusRequestMapStats& request);
+        // CMSG_REQUEST_WEEKLY_REWARDS / CMSG_CLAIM_WEEKLY_REWARD are bound to the WorldPackets::WeeklyRewards
+        // overloads (WeeklyRewardHandler.cpp), which serve all three vault rows - see ChallengeModeHandler.cpp.
 
         // Garrison
         void HandleGetGarrisonInfo(WorldPackets::Garrison::GetGarrisonInfo& getGarrisonInfo);
@@ -2618,6 +2693,7 @@ class TC_GAME_API WorldSession
         void HandleDelveTeleportOut(WorldPackets::Delves::DelveTeleportOut& delveTeleportOut);
         void HandleRequestPartyEligibilityForDelveTiers(WorldPackets::Delves::RequestPartyEligibilityForDelveTiers& requestPartyEligibilityForDelveTiers);
         void HandleSelectDelveEntranceTier(WorldPackets::Delves::SelectDelveEntranceTier& selectDelveEntranceTier);
+        void HandleTieredEntranceOpen(WorldPackets::Delves::TieredEntranceOpen& tieredEntranceOpen);
 
         // Battlenet
         void HandleBattlenetChangeRealmTicket(WorldPackets::Battlenet::ChangeRealmTicket& changeRealmTicket);
@@ -2626,9 +2702,25 @@ class TC_GAME_API WorldSession
         // In-game Shop (BattlePay)
         void HandleBattlePayGetProductList(WorldPackets::BattlePay::GetProductList& getProductList);
         void HandleBattlePayGetPurchaseList(WorldPackets::BattlePay::GetPurchaseList& getPurchaseList);
+        void HandleUpdateVasPurchaseStates(WorldPackets::BattlePay::UpdateVasPurchaseStates& packet);
+        void HandleVasGetServiceStatus(WorldPackets::BattlePay::VasGetServiceStatus& packet);
         void HandleBattlePayStartPurchase(WorldPackets::BattlePay::StartPurchase& startPurchase);
         void HandleBattlePayOpenCheckout(WorldPackets::BattlePay::OpenCheckout& openCheckout);
+        void HandleBattlePayConfirmPurchaseResponse(WorldPackets::BattlePay::ConfirmPurchaseResponse& confirmPurchaseResponse);
         void BattlePayProcessPurchase(uint32 productID);
+        void SendBattlePayDistributionList();
+        // Purchase delivery notifications: SMSG_BATTLE_PAY_MOUNT_DELIVERED /
+        // SMSG_BATTLE_PAY_COLLECTION_ITEM_DELIVERED per deliverable, then SMSG_BATTLE_PAY_DELIVERY_ENDED.
+        void SendBattlePayDeliveryNotifications(ShopProduct const& product, uint64 purchaseID);
+
+        // In-game Shop entitlements ("distributions"): buy now, apply to a character later.
+        void HandleBattlePayDistributionAssignToTarget(WorldPackets::BattlePay::DistributionAssignToTarget& assign);
+        void LoadBattlePayEntitlements(bool sendList);
+        void SendBattlePayDistributionListNow();
+        void SendBattlePayDistributionUpdate(ShopEntitlement const& entitlement);
+        void SendBattlePayEntitlementSync();
+        int32 BattlePayCreateEntitlement(ShopProduct const& product, uint64 purchaseID);
+        void RedeemBattlePayEntitlements();
 
         void SendBattlenetResponse(uint32 serviceHash, uint32 methodId, uint32 token, pb::Message const* response);
         void SendBattlenetResponse(uint32 serviceHash, uint32 methodId, uint32 token, uint32 status);
@@ -2698,6 +2790,11 @@ class TC_GAME_API WorldSession
         QueryCallbackProcessor _queryProcessor;
         AsyncCallbackProcessor<TransactionCallback> _transactionCallbacks;
         AsyncCallbackProcessor<SQLQueryHolderCallback> _queryHolderProcessor;
+
+        // In-game Shop (BattlePay) purchase anti-abuse: throttle + in-flight guard so a replayed or
+        // double-clicked CMSG_BATTLE_PAY_START_PURCHASE is charged exactly once (C-13).
+        bool _battlePayPurchaseInFlight = false;
+        uint32 _lastBattlePayPurchaseMSTime = 0;
 
     friend class World;
     protected:
@@ -2800,6 +2897,9 @@ class TC_GAME_API WorldSession
         PlayerDataAccount _playerDataAccount;
         std::vector<std::string> _registeredAddonPrefixes;
         bool _filterAddonMessages;
+        // Garrison login prologue (FOLLOWER_FATIGUE_CLEARED + FOLLOWER_ACTIVATIONS_SET) is sniff-confirmed
+        // to be sent only before the FIRST GetGarrisonInfo result of a session.
+        bool _sentGarrisonLoginPrologue = false;
         uint32 recruiterId;
         bool isRecruiter;
         bool _isCommentator = false;                        // account is currently in commentator (spectator) mode
@@ -2819,9 +2919,26 @@ class TC_GAME_API WorldSession
         // Packets cooldown
         time_t _calendarEventCreationCooldown;
 
+        // In-game Shop: last catalog generation this session was served the product-list blob for
+        // (0 = never). Throttles the 58 KB blob to once per generation; see BattlePayMgr.
+        uint32 _battlePayCatalogGeneration = 0;
+
+        // In-game Shop: pending purchase awaiting the client's confirmation response (two-step flow,
+        // Shop.PurchaseConfirmation). _battlePayConfirmToken 0 = nothing pending.
+        uint32 _battlePayPendingProductID = 0;
+        uint32 _battlePayConfirmToken = 0;
+
+        // In-game Shop: this account's unapplied entitlements ("distributions"), refreshed from the auth
+        // DB at character select and after every change. Cached because the assign handler must decide
+        // synchronously whether the id the client named is one this account actually owns.
+        std::vector<ShopEntitlement> _battlePayEntitlements;
+
         std::unique_ptr<BattlePets::BattlePetMgr> _battlePetMgr;
 
         std::unique_ptr<CollectionMgr> _collectionMgr;
+
+        int64 _accountPerksTender = -1;   // cached account-wide Trader's Tender balance; -1 = not loaded / no row yet
+        uint64 _accountPerksCacheGrantPeriod = 0;   // interval the base monthly Tender was last granted for this account
 
         ConnectToKey _instanceConnectKey;
 
@@ -2830,6 +2947,13 @@ class TC_GAME_API WorldSession
         // The client's PlotIndex may differ from our DB2 PlotIndex values.
         uint32 _lastClientPlotIndex = 0;
         ObjectGuid _lastCornerstoneGuid;
+
+        // m3/A6 per-session decoration throttle. Each decor place/move/remove is
+        // an AddToMap + synchronous DB write; without a limit a scripted client
+        // can amplify GO-spawn / DB load. Sliding fixed window: up to
+        // HOUSING_DECOR_THROTTLE_BURST edits per HOUSING_DECOR_THROTTLE_WINDOW_MS.
+        uint32 _housingDecorThrottleWindowStart = 0;
+        uint32 _housingDecorThrottleCount = 0;
 
         WorldSession(WorldSession const& right) = delete;
         WorldSession& operator=(WorldSession const& right) = delete;

@@ -24,6 +24,9 @@
 #include "Log.h"
 #include "ObjectMgr.h"
 #include "Random.h"
+#include "SharedDefines.h"
+#include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "Timer.h"
 #include "World.h"
 
@@ -147,6 +150,13 @@ void GarrisonMgr::Initialize()
     for (auto& [talentId, ranks] : _talentRanksByTalent)
         std::sort(ranks.begin(), ranks.end(), [](GarrTalentRankEntry const* a, GarrTalentRankEntry const* b) { return a->Rank < b->Rank; });
 
+    // Index GarrAbilityEffect by its owning GarrAbility (same shape as _talentsByTree above). This is what lets
+    // a GarrTalent.GarrAbilityID-carrying talent (e.g. the Command Table tiers: GarrAbility 1274 'Forward
+    // Planning' effect 1844 AbilityAction 14 / GarrAbility 1273 'Strategic Genius' effect 1843 AbilityAction 17)
+    // be dispatched data-driven instead of the store being loaded but never read.
+    for (GarrAbilityEffectEntry const* effect : sGarrAbilityEffectStore)
+        _abilityEffectsByAbility[effect->GarrAbilityID].push_back(effect);
+
     // Build talent research index (talent tree -> research entry via crossref)
     for (GarrTalTreeXGarrTalResearchEntry const* xref : sGarrTalTreeXGarrTalResearchStore)
     {
@@ -161,9 +171,13 @@ void GarrisonMgr::Initialize()
     for (GarrEncounterSetXEncounterEntry const* xref : sGarrEncounterSetXEncounterStore)
         _encounterSetEncounters[xref->GarrEncounterSetID].push_back(xref->GarrEncounterID);
 
-    for (GarrAutoCombatantEntry const* combatant : sGarrAutoCombatantStore)
-        if (combatant->GarrEncounterID != 0)
-            _autoCombatantByEncounter[combatant->GarrEncounterID] = combatant;
+    // The encounter -> statline link lives on GarrEncounter.AutoCombatantID; GarrAutoCombatant has
+    // no back-reference to an encounter. 251 of 2626 encounters carry one and every one of them
+    // belongs to a GarrTypeID 111 (Shadowlands Adventures) mission.
+    for (GarrEncounterEntry const* encounter : sGarrEncounterStore)
+        if (encounter->AutoCombatantID != 0)
+            if (GarrAutoCombatantEntry const* combatant = sGarrAutoCombatantStore.LookupEntry(encounter->AutoCombatantID))
+                _autoCombatantByEncounter[encounter->ID] = combatant;
 
     InitializeDbIdSequences();
     LoadPlotFinalizeGOInfo();
@@ -171,6 +185,72 @@ void GarrisonMgr::Initialize()
     LoadMissionRewards();
     LoadOrderHallShipments();
     LoadOrderHallStandards();
+    LoadConservatoryWildseeds();
+    LoadConservatoryCatalysts();
+    LoadConservatoryYields();
+    LoadAbominationRecipes();
+    LoadAscensionMemories();
+    LoadEmberCourtGuests();
+    LoadTransportNetworkSpells();
+}
+
+// Transport Network (trees 308/309/307/310). The 12 talents are category (c) in the covenant sanctum audit:
+// every rank row publishes PerkSpellID 0 / GarrAbilityID 0 / Points 0, so the client data names NO effect at
+// all - the talents' own descriptions name destinations, and matching standalone teleport/taxi spells exist in
+// the build but nothing links them. That link is therefore authored content (garrison_transport_network), and
+// every authored row is validated here exactly like a rank perk would be: the talent must exist and belong to
+// a Transport Network tree, and the spell must exist.
+void GarrisonMgr::LoadTransportNetworkSpells()
+{
+    _transportNetworkSpells.clear();
+
+    QueryResult result = WorldDatabase.Query("SELECT garrTalentId, spellId FROM garrison_transport_network");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 transport network spells. DB table `garrison_transport_network` is empty - "
+            "researching a Transport Network tier will grant nothing until it is authored.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 talentId = fields[0].GetUInt32();
+        uint32 spellId = fields[1].GetUInt32();
+
+        GarrTalentEntry const* talentEntry = sGarrTalentStore.LookupEntry(talentId);
+        if (!talentEntry)
+        {
+            TC_LOG_ERROR("sql.sql", "Non-existing GarrTalent.db2 entry {} referenced in `garrison_transport_network` (spellId {}); skipped.", talentId, spellId);
+            continue;
+        }
+
+        GarrTalentTreeEntry const* treeEntry = sGarrTalentTreeStore.LookupEntry(talentEntry->GarrTalentTreeID);
+        if (!treeEntry || treeEntry->FeatureTypeIndex != GARR_TALENT_FEATURE_TRANSPORT_NETWORK)
+        {
+            TC_LOG_ERROR("sql.sql", "GarrTalent {} referenced in `garrison_transport_network` is not a Transport Network talent "
+                "(tree {}, FeatureTypeIndex {}); skipped.", talentId, talentEntry->GarrTalentTreeID, treeEntry ? treeEntry->FeatureTypeIndex : -1);
+            continue;
+        }
+
+        if (!sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE))
+        {
+            TC_LOG_ERROR("sql.sql", "Non-existing spell {} referenced in `garrison_transport_network` (garrTalentId {}); skipped.", spellId, talentId);
+            continue;
+        }
+
+        _transportNetworkSpells[talentId].push_back(spellId);
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} transport network spell grants.", count);
+}
+
+std::vector<uint32> const* GarrisonMgr::GetTransportNetworkSpells(uint32 garrTalentId) const
+{
+    auto itr = _transportNetworkSpells.find(garrTalentId);
+    return itr != _transportNetworkSpells.end() ? &itr->second : nullptr;
 }
 
 // Class-hall / order-hall (and any non-plot garrison) troop recruiters aren't garrison plot buildings, so the
@@ -237,6 +317,583 @@ uint32 GarrisonMgr::GetStandardGoForContainer(uint32 containerId) const
 {
     auto itr = _orderHallStandardGoByContainer.find(containerId);
     return itr != _orderHallStandardGoByContainer.end() ? itr->second : 0;
+}
+
+// Queen's Conservatory wildseed kinds. The 12.0.7 client publishes the Conservatory's unlock ladder
+// (GarrTalentTree 319 + GarrTalent 1086-1090 + their GarrTalentRank/GarrTalentCost rows) and the harvest
+// reward (GameObject 350978 "Queen's Conservatory Cache" -> gameobject_loot_template 350978), but nothing
+// anywhere describes what an individual wildseed costs, how long it takes to mature, or which catalyst
+// combination changes the yield. Those are therefore authored here instead of guessed in code. An empty
+// table is a valid state: QueensConservatory::PlantWildseed then answers CONSERVATORY_ERROR_NO_WILDSEED_DATA
+// and nothing else about the sanctum changes.
+void GarrisonMgr::LoadConservatoryWildseeds()
+{
+    _conservatoryWildseeds.clear();
+
+    QueryResult result = WorldDatabase.Query("SELECT wildseedEntry, costCurrencyId, costCurrencyCount, costItemId, "
+        "costItemCount, maturationSeconds, rewardGameObjectId, requiredTier FROM garrison_conservatory_wildseed");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 Queen's Conservatory wildseed kinds. DB table "
+            "`garrison_conservatory_wildseed` is empty - planting stays disabled until it is authored.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        ConservatoryWildseedTemplate wildseed;
+        wildseed.WildseedEntry      = fields[0].GetUInt32();
+        wildseed.CostCurrencyId     = fields[1].GetUInt32();
+        wildseed.CostCurrencyCount  = fields[2].GetUInt32();
+        wildseed.CostItemId         = fields[3].GetUInt32();
+        wildseed.CostItemCount      = fields[4].GetUInt32();
+        wildseed.MaturationSeconds  = fields[5].GetUInt32();
+        wildseed.RewardGameObjectId = fields[6].GetUInt32();
+        wildseed.RequiredTier       = fields[7].GetUInt8();
+
+        if (!wildseed.WildseedEntry)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_wildseed` has a row with wildseedEntry 0; skipped.");
+            continue;
+        }
+
+        if (wildseed.CostCurrencyId && !sCurrencyTypesStore.LookupEntry(wildseed.CostCurrencyId))
+        {
+            TC_LOG_ERROR("sql.sql", "Non-existing CurrencyTypes.db2 entry {} referenced in "
+                "`garrison_conservatory_wildseed` (wildseedEntry {}); cost cleared.", wildseed.CostCurrencyId, wildseed.WildseedEntry);
+            wildseed.CostCurrencyId = 0;
+            wildseed.CostCurrencyCount = 0;
+        }
+
+        if (wildseed.CostItemId && !sObjectMgr->GetItemTemplate(wildseed.CostItemId))
+        {
+            TC_LOG_ERROR("sql.sql", "Non-existing item {} referenced in `garrison_conservatory_wildseed` "
+                "(wildseedEntry {}); cost cleared.", wildseed.CostItemId, wildseed.WildseedEntry);
+            wildseed.CostItemId = 0;
+            wildseed.CostItemCount = 0;
+        }
+
+        if (!wildseed.RewardGameObjectId)
+            wildseed.RewardGameObjectId = CONSERVATORY_DEFAULT_REWARD_GO;
+
+        if (!sObjectMgr->GetGameObjectTemplate(wildseed.RewardGameObjectId))
+        {
+            TC_LOG_ERROR("sql.sql", "Non-existing gameobject_template {} referenced as rewardGameObjectId in "
+                "`garrison_conservatory_wildseed` (wildseedEntry {}); row skipped.", wildseed.RewardGameObjectId, wildseed.WildseedEntry);
+            continue;
+        }
+
+        if (!wildseed.MaturationSeconds)
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_wildseed` row {} has maturationSeconds 0; "
+                "it will be refused at plant time.", wildseed.WildseedEntry);
+
+        if (!wildseed.RequiredTier || wildseed.RequiredTier > CONSERVATORY_MAX_TIERS)
+            wildseed.RequiredTier = 1;
+
+        _conservatoryWildseeds[wildseed.WildseedEntry] = wildseed;
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} Queen's Conservatory wildseed kinds.", count);
+}
+
+ConservatoryWildseedTemplate const* GarrisonMgr::GetConservatoryWildseed(uint32 wildseedEntry) const
+{
+    auto itr = _conservatoryWildseeds.find(wildseedEntry);
+    return itr != _conservatoryWildseeds.end() ? &itr->second : nullptr;
+}
+
+// Queen's Conservatory catalysts. Unlike the wildseed kinds, WHAT a catalyst does is published by the client:
+// the three items 176921 Temporal Leaves / 176922 Wild Nightbloom / 176832 Wildseed Root Grain share the Use
+// spell 323169 "Infuse Catalyst" and each one's own description states its effect verbatim (quoted in
+// QueensConservatory.h and in world migration 2026_08_07_63). What is NOT published is the effect's magnitude
+// in server terms and the loot table each combination pays out, so the whole set is a world table and no item
+// id is compiled in. An empty table is valid - AttachCatalyst then refuses with CONSERVATORY_ERROR_NO_CATALYST_DATA
+// instead of recording a link that changes nothing, which is precisely the silent no-op this table replaces.
+void GarrisonMgr::LoadConservatoryCatalysts()
+{
+    _conservatoryCatalysts.clear();
+
+    QueryResult result = WorldDatabase.Query("SELECT catalystItemId, effectType, effectValue, maxPerPlot, spellId "
+        "FROM garrison_conservatory_catalyst");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 Queen's Conservatory catalysts. DB table "
+            "`garrison_conservatory_catalyst` is empty - linking catalysts stays disabled until it is authored.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        ConservatoryCatalystTemplate catalyst;
+        catalyst.CatalystItemId = fields[0].GetUInt32();
+        catalyst.EffectType     = ConservatoryCatalystEffect(fields[1].GetUInt8());
+        catalyst.EffectValue    = fields[2].GetInt32();
+        catalyst.MaxPerPlot     = fields[3].GetUInt8();
+        catalyst.SpellId        = fields[4].GetUInt32();
+
+        if (!catalyst.CatalystItemId)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_catalyst` has a row with catalystItemId 0; skipped.");
+            continue;
+        }
+
+        // The item has to be a real one or the link could never be paid for.
+        if (!sObjectMgr->GetItemTemplate(catalyst.CatalystItemId))
+        {
+            TC_LOG_ERROR("sql.sql", "Non-existing item {} referenced as catalystItemId in "
+                "`garrison_conservatory_catalyst`; row skipped.", catalyst.CatalystItemId);
+            continue;
+        }
+
+        if (catalyst.EffectType == CONSERVATORY_CATALYST_EFFECT_NONE || catalyst.EffectType >= CONSERVATORY_CATALYST_EFFECT_MAX)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_catalyst` row {} has effectType {}, which is not "
+                "one of 1 TIME_DELTA / 2 YIELD_QUALITY / 3 YIELD_QUANTITY; row skipped rather than linked as a "
+                "catalyst that would do nothing.", catalyst.CatalystItemId, uint32(catalyst.EffectType));
+            continue;
+        }
+
+        // A TIME_DELTA of zero would move no clock, i.e. exactly the no-op this table exists to prevent.
+        if (catalyst.EffectType == CONSERVATORY_CATALYST_EFFECT_TIME_DELTA && !catalyst.EffectValue)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_catalyst` row {} is TIME_DELTA with effectValue 0 "
+                "and would change nothing; row skipped.", catalyst.CatalystItemId);
+            continue;
+        }
+
+        if (catalyst.SpellId && !sSpellMgr->GetSpellInfo(catalyst.SpellId, DIFFICULTY_NONE))
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_catalyst` row {} references spell {}, which is not "
+                "in the spell store. The column is provenance only, so the row is kept.",
+                catalyst.CatalystItemId, catalyst.SpellId);
+
+        if (!catalyst.MaxPerPlot || catalyst.MaxPerPlot > CONSERVATORY_MAX_CATALYSTS)
+            catalyst.MaxPerPlot = CONSERVATORY_MAX_CATALYSTS;
+
+        _conservatoryCatalysts[catalyst.CatalystItemId] = catalyst;
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} Queen's Conservatory catalysts.", count);
+}
+
+ConservatoryCatalystTemplate const* GarrisonMgr::GetConservatoryCatalyst(uint32 catalystItemId) const
+{
+    auto itr = _conservatoryCatalysts.find(catalystItemId);
+    return itr != _conservatoryCatalysts.end() ? &itr->second : nullptr;
+}
+
+// Which gameobject_loot_template a harvest rolls for a given catalyst combination. `gameobject_loot_template`
+// 350978 - the "Queen's Conservatory Cache" chest - flattens every outcome into one table, so rolling it means
+// every harvest can produce every satchel tier and size no matter what was linked to the pod. This table is
+// what makes the catalysts matter. A combination with no row is a REFUSAL, never a fallback to another table;
+// see QueensConservatory::ResolveHarvestLootId.
+void GarrisonMgr::LoadConservatoryYields()
+{
+    _conservatoryYields.clear();
+
+    QueryResult result = WorldDatabase.Query("SELECT spiritItemId, rootGrainCount, nightbloomCount, lootId "
+        "FROM garrison_conservatory_yield");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 Queen's Conservatory yield rows. DB table "
+            "`garrison_conservatory_yield` is empty - harvests fall back to the wildseed's reward chest.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        ConservatoryYieldKey key;
+        key.SpiritItemId    = fields[0].GetUInt32();
+        key.RootGrainCount  = fields[1].GetUInt8();
+        key.NightbloomCount = fields[2].GetUInt8();
+        uint32 const lootId = fields[3].GetUInt32();
+
+        if (!lootId)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_yield` row ({}, {}, {}) has lootId 0; skipped.",
+                key.SpiritItemId, uint32(key.RootGrainCount), uint32(key.NightbloomCount));
+            continue;
+        }
+
+        if (key.RootGrainCount > CONSERVATORY_MAX_CATALYSTS || key.NightbloomCount > CONSERVATORY_MAX_CATALYSTS
+            || key.RootGrainCount + key.NightbloomCount > CONSERVATORY_MAX_CATALYSTS)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_yield` row ({}, {}, {}) needs more catalyst links "
+                "than any wildseed pod has ({}); skipped.", key.SpiritItemId, uint32(key.RootGrainCount),
+                uint32(key.NightbloomCount), uint32(CONSERVATORY_MAX_CATALYSTS));
+            continue;
+        }
+
+        if (key.SpiritItemId && !_conservatoryWildseeds.count(key.SpiritItemId))
+            TC_LOG_ERROR("sql.sql", "Table `garrison_conservatory_yield` row ({}, {}, {}) names a spiritItemId with "
+                "no `garrison_conservatory_wildseed` row; it can never be selected.", key.SpiritItemId,
+                uint32(key.RootGrainCount), uint32(key.NightbloomCount));
+
+        _conservatoryYields[key] = lootId;
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} Queen's Conservatory yield rows.", count);
+}
+
+uint32 GarrisonMgr::GetConservatoryYieldLootId(uint32 spiritItemId, uint8 rootGrainCount, uint8 nightbloomCount) const
+{
+    // A spirit-specific row wins over the wildcard, so a single spirit can be re-pointed without restating the
+    // whole grid.
+    if (spiritItemId)
+    {
+        auto itr = _conservatoryYields.find({ spiritItemId, rootGrainCount, nightbloomCount });
+        if (itr != _conservatoryYields.end())
+            return itr->second;
+    }
+
+    auto itr = _conservatoryYields.find({ 0, rootGrainCount, nightbloomCount });
+    return itr != _conservatoryYields.end() ? itr->second : 0;
+}
+
+// Abomination Factory (Necrolord unique sanctum feature, GarrTalentTree 321). Two of the three things this needs
+// come straight out of the client:
+//   * the recipe set  - the 66 SkillLineAbility rows of SkillLine 2787 "Abominable Stitching";
+//   * which of them build a construct - exactly the ones whose spell carries SPELL_EFFECT_KILL_CREDIT (the
+//     "Construct Body: X" spells credit creature 167076 / 167581). That is 15 of the 66 and nothing else in the
+//     skill, so the stable roster never needs a hardcoded id list.
+// The third - which researched tier of tree 321 unlocks each recipe - is published nowhere: every one of the 66
+// rows has MinSkillLineRank 1, TradeSkillCategory groups them by kind rather than rank, and no PlayerCondition in
+// the build mentions talents 1096-1100. That mapping is therefore authored in `garrison_abomination_recipe`. An
+// empty table is a valid state: the skill line is still granted and ranked, but no recipe is taught.
+void GarrisonMgr::LoadAbominationRecipes()
+{
+    _abominationStitchingSpells.clear();
+    _abominationConstructSpells.clear();
+    _abominationRecipes.clear();
+
+    if (std::vector<SkillLineAbilityEntry const*> const* abilities = sDB2Manager.GetSkillLineAbilitiesBySkill(SKILL_ABOMINABLE_STITCHING))
+    {
+        for (SkillLineAbilityEntry const* ability : *abilities)
+        {
+            _abominationStitchingSpells.insert(ability->Spell);
+
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(ability->Spell, DIFFICULTY_NONE);
+            if (!spellInfo)
+                continue;
+
+            for (SpellEffectInfo const& effect : spellInfo->GetEffects())
+            {
+                if (effect.IsEffect(SPELL_EFFECT_KILL_CREDIT))
+                {
+                    _abominationConstructSpells.insert(ability->Spell);
+                    break;
+                }
+            }
+        }
+    }
+
+    TC_LOG_INFO("server.loading", ">> Abominable Stitching (SkillLine {}): {} client recipe(s), {} of them construct bodies.",
+        uint32(SKILL_ABOMINABLE_STITCHING), uint32(_abominationStitchingSpells.size()), uint32(_abominationConstructSpells.size()));
+
+    QueryResult result = WorldDatabase.Query("SELECT spellId, requiredRank FROM garrison_abomination_recipe");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 Abomination Factory recipe unlocks. DB table "
+            "`garrison_abomination_recipe` is empty - no stitching recipe is taught until it is authored.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        AbominationRecipeTemplate recipe;
+        recipe.RecipeSpellId = fields[0].GetUInt32();
+        recipe.RequiredRank  = fields[1].GetUInt8();
+
+        // The recipe list is not authorable - a row may only gate a spell the client already publishes as an
+        // Abominable Stitching recipe. This keeps content from inventing a stitching recipe that does not exist.
+        if (!_abominationStitchingSpells.count(recipe.RecipeSpellId))
+        {
+            TC_LOG_ERROR("sql.sql", "Spell {} referenced in `garrison_abomination_recipe` is not a SkillLineAbility "
+                "of SkillLine {} (Abominable Stitching); row skipped.", recipe.RecipeSpellId, uint32(SKILL_ABOMINABLE_STITCHING));
+            continue;
+        }
+
+        if (!recipe.RequiredRank || recipe.RequiredRank > ABOMINATION_FACTORY_MAX_RANK)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_abomination_recipe` row for spell {} has requiredRank {} "
+                "outside 1-{}; row skipped.", recipe.RecipeSpellId, uint32(recipe.RequiredRank), uint32(ABOMINATION_FACTORY_MAX_RANK));
+            continue;
+        }
+
+        _abominationRecipes[recipe.RecipeSpellId] = recipe;
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} Abomination Factory recipe unlocks.", count);
+}
+
+bool GarrisonMgr::IsAbominationStitchingRecipe(uint32 spellId) const
+{
+    return _abominationStitchingSpells.count(spellId) != 0;
+}
+
+bool GarrisonMgr::IsAbominationConstructRecipe(uint32 spellId) const
+{
+    return _abominationConstructSpells.count(spellId) != 0;
+}
+
+uint8 GarrisonMgr::GetAbominationRecipeRank(uint32 spellId) const
+{
+    auto itr = _abominationRecipes.find(spellId);
+    return itr != _abominationRecipes.end() ? itr->second.RequiredRank : uint8(0);
+}
+
+// Path of Ascension (Kyrian unique sanctum feature, GarrTalentTree 320).
+//
+// Almost the whole feature is published by the 12.0.7.68275 client and is read straight out of it - the five
+// talents 1091-1095 and their costs, the four trial difficulties 168-171 ("Path of Ascension: Courage /
+// Loyalty / Wisdom / Humility"), scenario 1803 on map 2375, and the ten memory quests already sitting in
+// `integ_world` under QuestSortID -595 with their kill-credit objectives and reward items. What NO row in the
+// build states is which memory is one of the SIX the first tier captures versus the FOUR the second adds, and
+// which memories are the "some" that gain a second trial at tier 2 versus "the rest" at tier 3. That mapping
+// is content, so it is authored here instead of being invented in C++; an empty table is a valid state and
+// simply leaves PathOfAscension::CaptureMemory answering ASCENSION_ERROR_NO_MEMORY_DATA.
+void GarrisonMgr::LoadAscensionMemories()
+{
+    _ascensionMemories.clear();
+    _ascensionArenaAuthored = false;
+
+    // Does this world DB actually instantiate the Ascension Coliseum? Scenario 1803 and map 2375 are real
+    // client data, but a scenario only runs if `scenarios` names it for the map AND the map has something in
+    // it. Both halves are checked so a half-authored arena cannot report itself as playable.
+    if (QueryResult arena = WorldDatabase.PQuery("SELECT "
+        "(SELECT COUNT(*) FROM scenarios WHERE map = {}), "
+        "(SELECT COUNT(*) FROM creature WHERE map = {})", uint32(ASCENSION_MAP_ID), uint32(ASCENSION_MAP_ID)))
+    {
+        Field* fields = arena->Fetch();
+        _ascensionArenaAuthored = fields[0].GetUInt64() > 0 && fields[1].GetUInt64() > 0;
+    }
+
+    if (!_ascensionArenaAuthored)
+        TC_LOG_INFO("server.loading", ">> Path of Ascension: the Ascension Coliseum (scenario {} on map {}) is not "
+            "authored in this world DB - no `scenarios` row and/or no spawns. Trials will be refused rather than "
+            "started.", uint32(ASCENSION_SCENARIO_ID), uint32(ASCENSION_MAP_ID));
+
+    QueryResult result = WorldDatabase.Query("SELECT memoryId, creatureId, captureQuestId, requiredTier, "
+        "courageTier, loyaltyTier, wisdomTier, humilityTier FROM garrison_ascension_memory");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 Path of Ascension memories. DB table `garrison_ascension_memory` "
+            "is empty - no memory can be captured until the roster is authored.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        AscensionMemoryTemplate memory;
+        memory.MemoryId       = fields[0].GetUInt32();
+        memory.CreatureId     = fields[1].GetUInt32();
+        memory.CaptureQuestId = fields[2].GetUInt32();
+        memory.RequiredTier   = fields[3].GetUInt8();
+        memory.CourageTier    = fields[4].GetUInt8();
+        memory.LoyaltyTier    = fields[5].GetUInt8();
+        memory.WisdomTier     = fields[6].GetUInt8();
+        memory.HumilityTier   = fields[7].GetUInt8();
+
+        // A memory must name a creature that exists: CompleteTrial credits it, and that credit is what makes
+        // the memory's own quest pay out. Without it a completion would silently reward nothing.
+        if (!sObjectMgr->GetCreatureTemplate(memory.CreatureId))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_ascension_memory` row {} names creatureId {} which has no "
+                "creature_template; row skipped.", memory.MemoryId, memory.CreatureId);
+            continue;
+        }
+
+        if (memory.CaptureQuestId && !sObjectMgr->GetQuestTemplate(memory.CaptureQuestId))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_ascension_memory` row {} names captureQuestId {} which does "
+                "not exist; row skipped.", memory.MemoryId, memory.CaptureQuestId);
+            continue;
+        }
+
+        if (!memory.RequiredTier || memory.RequiredTier > ASCENSION_MAX_TIERS)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_ascension_memory` row {} has requiredTier {} outside 1-{}; "
+                "row skipped.", memory.MemoryId, uint32(memory.RequiredTier), uint32(ASCENSION_MAX_TIERS));
+            continue;
+        }
+
+        bool badTrialTier = false;
+        for (uint8 trial = ASCENSION_TRIAL_COURAGE; trial <= ASCENSION_TRIAL_MAX; ++trial)
+        {
+            uint8 const trialTier = memory.GetTrialTier(AscensionTrial(trial));
+            if (trialTier > ASCENSION_MAX_TIERS)
+            {
+                TC_LOG_ERROR("sql.sql", "Table `garrison_ascension_memory` row {} opens {} at researched tier {}, "
+                    "outside 0-{}; row skipped.", memory.MemoryId, PathOfAscension::GetTrialName(AscensionTrial(trial)),
+                    uint32(trialTier), uint32(ASCENSION_MAX_TIERS));
+                badTrialTier = true;
+                break;
+            }
+
+            // A trial cannot open before the memory can be captured - that combination could never be entered.
+            if (trialTier && trialTier < memory.RequiredTier)
+            {
+                TC_LOG_ERROR("sql.sql", "Table `garrison_ascension_memory` row {} opens {} at tier {} but the memory "
+                    "is only capturable at tier {}; row skipped.", memory.MemoryId,
+                    PathOfAscension::GetTrialName(AscensionTrial(trial)), uint32(trialTier), uint32(memory.RequiredTier));
+                badTrialTier = true;
+                break;
+            }
+        }
+
+        if (badTrialTier)
+            continue;
+
+        _ascensionMemories[memory.MemoryId] = memory;
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} Path of Ascension memories.", count);
+}
+
+AscensionMemoryTemplate const* GarrisonMgr::GetAscensionMemory(uint32 memoryId) const
+{
+    auto itr = _ascensionMemories.find(memoryId);
+    return itr != _ascensionMemories.end() ? &itr->second : nullptr;
+}
+
+// The Ember Court (Venthyr unique sanctum feature, GarrTalentTree 324).
+//
+// Almost the whole feature is published by the 12.0.7.68275 client and is read straight out of it - the five
+// talents 1111-1115 with their guest-slot wording, scenario 1791 and its four steps, AreaTable 13329
+// "SinfallScenario", the sixteen guests (CriteriaTree 87983 cross-checked against the sixteen "RSVP: <Guest>"
+// quests in `integ_world`), and the five attribute axes (CriteriaTree 88024-88033 + UiWidgetVisualization
+// 1435-1440), the five-rung mood ladder (SpellName 327199/327200/327201/327781/327202 + the "Mood: <Rung>"
+// strings in UiWidgetStringSource), and every guest's LIKES (that guest's ItemSparse mood-icon item, whose
+// Description_lang is a literal "Likes: <poles>" list). The single thing NO row in the build states is what
+// each guest DISLIKES - only "Likes:" strings exist - so that, and only that, is authored here. An empty
+// table is a perfectly normal state: a guest simply has no dislike, and nothing is inferred from its likes.
+void GarrisonMgr::LoadEmberCourtGuests()
+{
+    _emberCourtGuests.clear();
+    _emberCourtVenueAuthored = false;
+
+    // Does this world DB actually instantiate the Ember Court? A scenario only runs if `scenarios` names it
+    // for the map AND the venue has something in it. Both halves are checked so a half-authored Court cannot
+    // report itself as playable.
+    if (QueryResult venue = WorldDatabase.PQuery("SELECT "
+        "(SELECT COUNT(*) FROM scenarios WHERE map = {}), "
+        "(SELECT COUNT(*) FROM creature WHERE areaId = {})", uint32(EMBER_COURT_MAP_ID), uint32(EMBER_COURT_AREA_ID)))
+    {
+        Field* fields = venue->Fetch();
+        _emberCourtVenueAuthored = fields[0].GetUInt64() > 0 && fields[1].GetUInt64() > 0;
+    }
+
+    if (!_emberCourtVenueAuthored)
+        TC_LOG_INFO("server.loading", ">> The Ember Court: the venue (scenario {} in area {} on map {}) is not "
+            "authored in this world DB - no `scenarios` row and/or no spawns. Courts will be refused rather "
+            "than started.", uint32(EMBER_COURT_SCENARIO_ID), uint32(EMBER_COURT_AREA_ID), uint32(EMBER_COURT_MAP_ID));
+
+    QueryResult result = WorldDatabase.Query("SELECT guestIndex, dislikedAttribute, dislikedPole "
+        "FROM garrison_ember_court_guest");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 Ember Court guest dislikes. DB table "
+            "`garrison_ember_court_guest` is empty - the 12.0.7 build publishes no dislikes, so this is the "
+            "expected state; every guest's LIKES are client data and are already loaded.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        EmberCourtGuestTemplate guest;
+        guest.GuestIndex        = fields[0].GetUInt8();
+        guest.DislikedAttribute = fields[1].GetUInt8();
+        guest.DislikedPole      = fields[2].GetUInt8();
+
+        // The roster is fixed at sixteen by the client (CriteriaTree 87983 has exactly sixteen children); an
+        // index outside it names nobody.
+        if (!EmberCourt::GetGuestInfo(guest.GuestIndex))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_ember_court_guest` has guestIndex {} but the client roster "
+                "(CriteriaTree 87983) only has {} guests, 0-{}; row skipped.", uint32(guest.GuestIndex),
+                uint32(EMBER_COURT_GUEST_COUNT), uint32(EMBER_COURT_GUEST_COUNT - 1));
+            continue;
+        }
+
+        struct { uint8 attribute; uint8 pole; char const* what; } const axes[1] =
+        {
+            { guest.DislikedAttribute, guest.DislikedPole, "disliked" }
+        };
+
+        bool badAttribute = false;
+        for (auto const& [attribute, pole, what] : axes)
+        {
+            if (attribute > EMBER_COURT_ATTRIBUTE_MAX)
+            {
+                TC_LOG_ERROR("sql.sql", "Table `garrison_ember_court_guest` row {} has {}Attribute {} outside "
+                    "0-{}; row skipped.", uint32(guest.GuestIndex), what, uint32(attribute),
+                    uint32(EMBER_COURT_ATTRIBUTE_MAX));
+                badAttribute = true;
+                break;
+            }
+
+            if (pole > EMBER_COURT_POLE_HIGH)
+            {
+                TC_LOG_ERROR("sql.sql", "Table `garrison_ember_court_guest` row {} has {}Pole {} outside 0-2 "
+                    "(0 none, 1 low, 2 high); row skipped.", uint32(guest.GuestIndex), what, uint32(pole));
+                badAttribute = true;
+                break;
+            }
+
+            // An axis without an end, or an end without an axis, cannot be evaluated either way.
+            if ((attribute == EMBER_COURT_ATTRIBUTE_NONE) != (pole == EMBER_COURT_POLE_NONE))
+            {
+                TC_LOG_ERROR("sql.sql", "Table `garrison_ember_court_guest` row {} sets {}Attribute {} with "
+                    "{}Pole {} - an attribute and a pole must both be set or both be 0; row skipped.",
+                    uint32(guest.GuestIndex), what, uint32(attribute), what, uint32(pole));
+                badAttribute = true;
+                break;
+            }
+        }
+
+        if (badAttribute)
+            continue;
+
+        // A guest cannot dislike the very pole its own client-published "Likes:" list names.
+        if (guest.DislikedAttribute != EMBER_COURT_ATTRIBUTE_NONE
+            && EmberCourt::IsAttributeLiked(guest.GuestIndex, EmberCourtAttribute(guest.DislikedAttribute),
+                EmberCourtAttributePole(guest.DislikedPole)))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `garrison_ember_court_guest` row {} makes the guest dislike {} {}, "
+                "but the client's own 'Likes:' list for them says they like it; row skipped.",
+                uint32(guest.GuestIndex),
+                EmberCourt::GetAttributePoleName(EmberCourtAttribute(guest.DislikedAttribute), EmberCourtAttributePole(guest.DislikedPole)),
+                EmberCourt::GetAttributeName(EmberCourtAttribute(guest.DislikedAttribute)));
+            continue;
+        }
+
+        _emberCourtGuests[guest.GuestIndex] = guest;
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} Ember Court guest dislikes.", count);
+}
+
+EmberCourtGuestTemplate const* GarrisonMgr::GetEmberCourtGuest(uint8 guestIndex) const
+{
+    auto itr = _emberCourtGuests.find(guestIndex);
+    return itr != _emberCourtGuests.end() ? &itr->second : nullptr;
 }
 
 void GarrisonMgr::LoadOrderHallStandards()
@@ -719,6 +1376,15 @@ GarrTalentResearchEntry const* GarrisonMgr::GetTalentResearchForTree(uint32 garr
     auto itr = _talentResearchByTree.find(garrTalentTreeID);
     if (itr != _talentResearchByTree.end())
         return itr->second;
+
+    return nullptr;
+}
+
+std::vector<GarrAbilityEffectEntry const*> const* GarrisonMgr::GetGarrAbilityEffects(uint32 garrAbilityID) const
+{
+    auto itr = _abilityEffectsByAbility.find(garrAbilityID);
+    if (itr != _abilityEffectsByAbility.end())
+        return &itr->second;
 
     return nullptr;
 }

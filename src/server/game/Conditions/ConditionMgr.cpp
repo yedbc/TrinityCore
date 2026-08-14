@@ -162,6 +162,8 @@ ConditionMgr::ConditionTypeInfo const ConditionMgr::StaticConditionTypeData[COND
     { .Name = "String ID",                 .HasConditionValue1 = false, .HasConditionValue2 = false, .HasConditionValue3 = false, .HasConditionStringValue1 =  true },
     { .Name = "Label",                     .HasConditionValue1 =  true, .HasConditionValue2 = false, .HasConditionValue3 = false, .HasConditionStringValue1 = false },
     { .Name = "Chromie Time",              .HasConditionValue1 =  true, .HasConditionValue2 = false, .HasConditionValue3 = false, .HasConditionStringValue1 = false },
+    { .Name = "Group status",              .HasConditionValue1 =  true, .HasConditionValue2 = false, .HasConditionValue3 = false, .HasConditionStringValue1 = false },
+    { .Name = "Covenant",                  .HasConditionValue1 =  true, .HasConditionValue2 =  true, .HasConditionValue3 = false, .HasConditionStringValue1 = false }
 };
 
 ConditionSourceInfo::ConditionSourceInfo(WorldObject const* target0, WorldObject const* target1, WorldObject const* target2) :
@@ -693,6 +695,29 @@ bool Condition::Meets(ConditionSourceInfo& sourceInfo) const
             }
             break;
         }
+        case CONDITION_COVENANT:
+        {
+            // ConditionValue1 0 means "any covenant", so this doubles as the has-not-chosen-yet test when negated.
+            Player const* player = object->ToPlayer();
+            if (!player)
+                break;
+
+            if (!ConditionValue2)
+            {
+                condMeets = ConditionValue1 ? player->GetActiveCovenant() == ConditionValue1 : player->GetActiveCovenant() != 0;
+                break;
+            }
+
+            // ConditionValue2 = minimum renown level. Renown is per covenant and survives leaving one, so with the
+            // "any covenant" wildcard this asks what the 9.1.5 free-switch rule asks - "has this character ever
+            // taken a covenant to Renown N" - without requiring it to be in one right now.
+            if (ConditionValue1)
+                condMeets = player->GetActiveCovenant() == ConditionValue1
+                    && player->GetCovenantRenownLevel(ConditionValue1) >= ConditionValue2;
+            else
+                condMeets = player->GetHighestCovenantRenownLevel() >= ConditionValue2;
+            break;
+        }
         default:
             break;
     }
@@ -915,6 +940,9 @@ uint32 Condition::GetSearcherTypeMaskForCondition() const
             mask |= GRID_MAP_TYPE_MASK_CREATURE | GRID_MAP_TYPE_MASK_GAMEOBJECT;
             break;
         case CONDITION_CHROMIE_TIME:
+            mask |= GRID_MAP_TYPE_MASK_PLAYER;
+            break;
+        case CONDITION_COVENANT:
             mask |= GRID_MAP_TYPE_MASK_PLAYER;
             break;
         default:
@@ -2671,6 +2699,21 @@ bool ConditionMgr::isConditionTypeValid(Condition* cond) const
                 return false;
             }
             break;
+        case CONDITION_GROUP_STATUS:
+            if (cond->ConditionValue1 > uint32(GroupStatusCondition::NotInGroupOrNotInRaid))
+            {
+                TC_LOG_ERROR("sql.sql", "{} has non invalid group status condition value1 ({}), skipped.", *cond, cond->ConditionValue1);
+                return false;
+            }
+            break;
+        case CONDITION_COVENANT:
+            // 0 is the wildcard "in any covenant", every other value must name a real Covenant.db2 row
+            if (cond->ConditionValue1 && !sCovenantStore.LookupEntry(cond->ConditionValue1))
+            {
+                TC_LOG_ERROR("sql.sql", "{} has non existing covenant ({}), skipped.", *cond, cond->ConditionValue1);
+                return false;
+            }
+            break;
         case CONDITION_AREAID:
         case CONDITION_ALIVE:
         case CONDITION_IN_WATER:
@@ -2684,9 +2727,10 @@ bool ConditionMgr::isConditionTypeValid(Condition* cond) const
             break;
         case CONDITION_CHROMIE_TIME:
         {
-            if (cond->ConditionValue1 > CURRENT_EXPANSION)
+            // ConditionValue1 is a UiChromieTimeExpansionInfo record id (5-16 at 12.0.7), not an Expansions enum value; 0 = "any Chromie Time"
+            if (cond->ConditionValue1 && !sUIChromieTimeExpansionInfoStore.LookupEntry(cond->ConditionValue1))
             {
-                TC_LOG_ERROR("sql.sql", "{} has invalid expansion in value1 ({}), skipped.", *cond, cond->ConditionValue1);
+                TC_LOG_ERROR("sql.sql", "{} has non existing UiChromieTimeExpansionInfo id in value1 ({}), skipped.", *cond, cond->ConditionValue1);
                 return false;
             }
             break;

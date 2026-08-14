@@ -82,6 +82,54 @@ namespace
         return fmt::format("lo={:016X} hi={:016X}", guid.GetRawValue(0), guid.GetRawValue(1));
     }
 
+    // C1 anti-abuse gate (SERVER-CORE GAP-1 / anti-abuse A1). Authoritative
+    // server-side authorization for every decor/fixture EDIT operation.
+    // Player::GetHousing() falls back to _housings[0] (a house in a *different*
+    // neighborhood) when the player owns none on the current map, and decor
+    // spawns ALWAYS_VISIBLE as a real GameObject on the shared neighborhood map
+    // — so a visitor could otherwise spawn/despawn GameObjects on a host's plot
+    // AND corrupt their own house with host-map coordinates. Returns true ONLY
+    // when the player edits a house they own from a legitimate location:
+    //   * inside their OWN HouseInteriorMap instance (owner == player), or
+    //   * standing on their OWN occupied plot on the neighborhood HousingMap,
+    //     where that plot's HouseGuid matches the house object being edited
+    //     (defeats the _housings[0] cross-neighborhood fallback).
+    // Any other case (visitor on a host plot, off-plot, untracked) is rejected.
+    bool PlayerCanEditHousing(Player* player, Housing const* housing)
+    {
+        if (!player || !housing)
+            return false;
+
+        Map* map = player->GetMap();
+
+        // Own interior: interior instances are per-owner, so being inside an
+        // interior whose owner is this player proves ownership of that house.
+        if (HouseInteriorMap* interiorMap = dynamic_cast<HouseInteriorMap*>(map))
+            return interiorMap->GetOwnerGuid() == player->GetGUID();
+
+        // Neighborhood exterior: require the player to be standing on their own
+        // occupied plot, and that plot's house to be the one being edited.
+        if (HousingMap* housingMap = dynamic_cast<HousingMap*>(map))
+        {
+            Neighborhood* neighborhood = housingMap->GetNeighborhood();
+            if (!neighborhood)
+                return false;
+
+            int8 plotIndex = housingMap->GetPlayerCurrentPlot(player->GetGUID());
+            if (plotIndex < 0)
+                return false;
+
+            Neighborhood::PlotInfo const* plotInfo = neighborhood->GetPlotInfo(static_cast<uint8>(plotIndex));
+            if (!plotInfo)
+                return false;
+
+            return plotInfo->OwnerGuid == player->GetGUID()
+                && plotInfo->HouseGuid == housing->GetHouseGuid();
+        }
+
+        return false;
+    }
+
     // Sends manual SMSG_AURA_UPDATE + SMSG_SPELL_START + SMSG_SPELL_GO for a housing
     // spell that doesn't exist in our DB2/spell data. The sniff shows these spells use:
     //   AURA_UPDATE: CastID matches SPELL_START/SPELL_GO CastID
@@ -196,10 +244,14 @@ namespace
 
 void WorldSession::HandleDeclineNeighborhoodInvites(WorldPackets::Housing::DeclineNeighborhoodInvites const& declineNeighborhoodInvites)
 {
+    Player* player = GetPlayer();
+    if (!player)
+        return;
+
     if (declineNeighborhoodInvites.Allow)
-        GetPlayer()->SetPlayerFlagEx(PLAYER_FLAGS_EX_AUTO_DECLINE_NEIGHBORHOOD);
+        player->SetPlayerFlagEx(PLAYER_FLAGS_EX_AUTO_DECLINE_NEIGHBORHOOD);
     else
-        GetPlayer()->RemovePlayerFlagEx(PLAYER_FLAGS_EX_AUTO_DECLINE_NEIGHBORHOOD);
+        player->RemovePlayerFlagEx(PLAYER_FLAGS_EX_AUTO_DECLINE_NEIGHBORHOOD);
 }
 
 // ============================================================
@@ -527,6 +579,26 @@ void WorldSession::HandleHouseInteriorLeaveHouse(WorldPackets::Housing::HouseInt
 // Decor System
 // ============================================================
 
+bool WorldSession::CheckHousingDecorThrottle()
+{
+    uint32 now = GameTime::GetGameTimeMS();
+    // getMSTimeDiff-safe: GetGameTimeMS wraps ~49.7 days; treat a wrap or an
+    // elapsed window as a fresh window.
+    uint32 elapsed = now - _housingDecorThrottleWindowStart;
+    if (_housingDecorThrottleWindowStart == 0 || elapsed >= HOUSING_DECOR_THROTTLE_WINDOW_MS)
+    {
+        _housingDecorThrottleWindowStart = now;
+        _housingDecorThrottleCount = 1;
+        return true;
+    }
+
+    if (_housingDecorThrottleCount >= HOUSING_DECOR_THROTTLE_BURST)
+        return false;
+
+    ++_housingDecorThrottleCount;
+    return true;
+}
+
 void WorldSession::HandleHousingDecorSetEditMode(WorldPackets::Housing::HousingDecorSetEditMode const& housingDecorSetEditMode)
 {
     TC_LOG_ERROR("housing", ">>> CMSG_HOUSING_DECOR_SET_EDIT_MODE Active={}", housingDecorSetEditMode.Active);
@@ -542,6 +614,17 @@ void WorldSession::HandleHousingDecorSetEditMode(WorldPackets::Housing::HousingD
             player->GetGUID().ToString());
         WorldPackets::Housing::HousingDecorSetEditModeResponse response;
         response.Result = HOUSING_RESULT_HOUSE_NOT_FOUND;
+        SendPacket(response.Write());
+        return;
+    }
+
+    // C1 gate: only the owner, on their own plot / in their own interior, may
+    // ENTER edit mode. Leaving edit mode (Active=false) is always allowed so a
+    // visitor/off-plot player can never be stuck in an editing state.
+    if (housingDecorSetEditMode.Active && !PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingDecorSetEditModeResponse response;
+        response.Result = HOUSING_RESULT_NOT_ON_OWNED_PLOT;
         SendPacket(response.Write());
         return;
     }
@@ -695,6 +778,15 @@ void WorldSession::HandleHousingDecorSetEditMode(WorldPackets::Housing::HousingD
                         if (!meshObj || !meshObj->IsInWorld())
                             continue;
 
+                        // A duplicate CREATE for a GUID the client already holds kills it
+                        // (ACCESS_VIOLATION, null read) - refresh via a values update instead,
+                        // same as the fixture path below.
+                        if (player->HaveAtClient(meshObj))
+                        {
+                            meshObj->BuildValuesUpdateBlockForPlayer(&updateData, player);
+                            continue;
+                        }
+
                         meshObj->BuildCreateUpdateBlockForPlayer(&updateData, player);
                         player->m_clientGUIDs.insert(meshObjGuid);
                         ++meshCreateCount;
@@ -708,6 +800,15 @@ void WorldSession::HandleHousingDecorSetEditMode(WorldPackets::Housing::HousingD
                         MeshObject* meshObj = interiorMap->GetMeshObject(meshObjGuid);
                         if (!meshObj || !meshObj->IsInWorld())
                             continue;
+
+                        // A duplicate CREATE for a GUID the client already holds kills it
+                        // (ACCESS_VIOLATION, null read) - refresh via a values update instead,
+                        // same as the fixture path below.
+                        if (player->HaveAtClient(meshObj))
+                        {
+                            meshObj->BuildValuesUpdateBlockForPlayer(&updateData, player);
+                            continue;
+                        }
 
                         meshObj->BuildCreateUpdateBlockForPlayer(&updateData, player);
                         player->m_clientGUIDs.insert(meshObjGuid);
@@ -878,6 +979,29 @@ void WorldSession::HandleHousingDecorPlace(WorldPackets::Housing::HousingDecorPl
         return;
     }
 
+    // C1 gate: reject decor placement unless the player owns the target house
+    // and is on their own plot / in their own interior.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingDecorPlaceResponse response;
+        response.PlayerGuid = player->GetGUID();
+        response.DecorGuid = housingDecorPlace.DecorGuid;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
+        SendPacket(response.Write());
+        return;
+    }
+
+    // m3/A6: per-session decoration throttle.
+    if (!CheckHousingDecorThrottle())
+    {
+        WorldPackets::Housing::HousingDecorPlaceResponse response;
+        response.PlayerGuid = player->GetGUID();
+        response.DecorGuid = housingDecorPlace.DecorGuid;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_TOO_MANY_REQUESTS);
+        SendPacket(response.Write());
+        return;
+    }
+
     // Look up the entry ID from pending placements (set during RedeemDeferredDecor/StartPlacingNewDecor).
     // If the client already has the item in storage (e.g. pre-populated on login), it sends PLACE
     // directly without REDEEM_DEFERRED first. In that case, extract decorEntryId from the Housing GUID.
@@ -982,6 +1106,28 @@ void WorldSession::HandleHousingDecorMove(WorldPackets::Housing::HousingDecorMov
         return;
     }
 
+    // C1 gate: reject decor move unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingDecorMoveResponse response;
+        response.PlayerGuid = player->GetGUID();
+        response.DecorGuid = housingDecorMove.DecorGuid;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
+        SendPacket(response.Write());
+        return;
+    }
+
+    // m3/A6: per-session decoration throttle.
+    if (!CheckHousingDecorThrottle())
+    {
+        WorldPackets::Housing::HousingDecorMoveResponse response;
+        response.PlayerGuid = player->GetGUID();
+        response.DecorGuid = housingDecorMove.DecorGuid;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_TOO_MANY_REQUESTS);
+        SendPacket(response.Write());
+        return;
+    }
+
     // Client sends Euler angles (via TaggedPosition<XYZ> Rotation) — convert to quaternion
     float yaw = housingDecorMove.Rotation.Pos.GetPositionX();
     float pitch = housingDecorMove.Rotation.Pos.GetPositionY();
@@ -1045,6 +1191,26 @@ void WorldSession::HandleHousingDecorRemove(WorldPackets::Housing::HousingDecorR
         return;
     }
 
+    // C1 gate: reject decor removal unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingDecorRemoveResponse response;
+        response.DecorGuid = housingDecorRemove.DecorGuid;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
+        SendPacket(response.Write());
+        return;
+    }
+
+    // m3/A6: per-session decoration throttle.
+    if (!CheckHousingDecorThrottle())
+    {
+        WorldPackets::Housing::HousingDecorRemoveResponse response;
+        response.DecorGuid = housingDecorRemove.DecorGuid;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_TOO_MANY_REQUESTS);
+        SendPacket(response.Write());
+        return;
+    }
+
     // Capture plotIndex and source info before RemoveDecor (which erases the placed entry)
     uint8 plotIndex = housing->GetPlotIndex();
     ObjectGuid decorGuid = housingDecorRemove.DecorGuid;
@@ -1104,6 +1270,17 @@ void WorldSession::HandleHousingDecorLock(WorldPackets::Housing::HousingDecorLoc
         return;
     }
 
+    // C1 gate: reject decor lock/unlock unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingDecorLockResponse response;
+        response.DecorGuid = housingDecorLock.DecorGuid;
+        response.PlayerGuid = player->GetGUID();
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
+        SendPacket(response.Write());
+        return;
+    }
+
     // Use client's requested lock state (not toggle)
     Housing::PlacedDecor const* decor = housing->GetPlacedDecor(housingDecorLock.DecorGuid);
     if (!decor)
@@ -1149,6 +1326,16 @@ void WorldSession::HandleHousingDecorSetDyeSlots(WorldPackets::Housing::HousingD
         WorldPackets::Housing::HousingDecorSystemSetDyeSlotsResponse response;
         response.DecorGuid = housingDecorSetDyeSlots.DecorGuid;
         response.Result = static_cast<uint8>(HOUSING_RESULT_HOUSE_NOT_FOUND);
+        SendPacket(response.Write());
+        return;
+    }
+
+    // C1 gate: reject dye edits unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingDecorSystemSetDyeSlotsResponse response;
+        response.DecorGuid = housingDecorSetDyeSlots.DecorGuid;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
         SendPacket(response.Write());
         return;
     }
@@ -1276,6 +1463,15 @@ void WorldSession::HandleHousingDecorRequestStorage(WorldPackets::Housing::Housi
                 MeshObject* meshObj = playerMap->GetMeshObject(meshObjGuid);
                 if (!meshObj || !meshObj->IsInWorld())
                     continue;
+
+                // A duplicate CREATE for a GUID the client already holds kills it
+                // (ACCESS_VIOLATION, null read) - refresh via a values update instead,
+                // same as the fixture path below.
+                if (player->HaveAtClient(meshObj))
+                {
+                    meshObj->BuildValuesUpdateBlockForPlayer(&updateData, player);
+                    continue;
+                }
 
                 meshObj->BuildCreateUpdateBlockForPlayer(&updateData, player);
                 player->m_clientGUIDs.insert(meshObjGuid);
@@ -1502,6 +1698,16 @@ void WorldSession::HandleHousingFixtureSetEditMode(WorldPackets::Housing::Housin
         return;
     }
 
+    // C1 gate: only the owner, on their own plot / in their own interior, may
+    // ENTER fixture edit mode. Leaving (Active=false) is always allowed.
+    if (housingFixtureSetEditMode.Active && !PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingFixtureSetEditModeResponse response;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
+        SendPacket(response.Write());
+        return;
+    }
+
     bool entering = housingFixtureSetEditMode.Active;
 
     // Client enum HouseEditorMode: 4=Customize (interior), 6=ExteriorCustomization (fixture).
@@ -1596,6 +1802,14 @@ void WorldSession::HandleHousingFixtureSetEditMode(WorldPackets::Housing::Housin
     }
 
     // 2) SMSG_HOUSE_EXTERIOR_LOCK_RESPONSE — tells client the fixture entity is locked for editing
+    // Only when we actually have a fixture entity to name. Inside the interior the lookup
+    // above runs against a HousingMap and finds nothing, so this used to go out with
+    // FixtureEntityGuid = 0: the client resolves that GUID to lock it, gets null, and dies
+    // (ACCESS_VIOLATION on a null read) the moment interior edit mode starts. The retail
+    // interior-customize capture (wall_floor_ceiling_customize, 66838) contains no
+    // exterior-lock response at all - that flow is DECOR_SET_EDIT_MODE /
+    // ROOM_SET_LAYOUT_EDIT_MODE - so suppressing it indoors matches retail too.
+    if (!fixtureEntityGuid.IsEmpty())
     {
         WorldPackets::Housing::HouseExteriorLockResponse lockResponse;
         lockResponse.FixtureEntityGuid = fixtureEntityGuid;
@@ -1604,6 +1818,10 @@ void WorldSession::HandleHousingFixtureSetEditMode(WorldPackets::Housing::Housin
         lockResponse.Active = entering;
         SendPacket(lockResponse.Write());
     }
+    else
+        TC_LOG_INFO("housing", "HandleHousingFixtureSetEditMode: no fixture entity for player {} on map {} - "
+            "suppressing SMSG_HOUSE_EXTERIOR_LOCK_RESPONSE (an empty FixtureEntityGuid crashes the client)",
+            player->GetGUID().ToString(), player->GetMapId());
 
     // 3) SMSG_MOVE_SET_COMPOUND_STATE — root + disable gravity on enter, unroot + enable gravity on exit
     //    Also update server-side movement flags so movement validation stays consistent.
@@ -1735,6 +1953,15 @@ void WorldSession::HandleHousingFixtureSetCoreFixture(WorldPackets::Housing::Hou
         return;
     }
 
+    // C1 gate: reject fixture edits unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingFixtureSetCoreFixtureResponse response;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
+        SendPacket(response.Write());
+        return;
+    }
+
     // Validate ExteriorComponentID against DB2 store
     uint32 componentID = housingFixtureSetCoreFixture.ExteriorComponentID;
 
@@ -1807,6 +2034,15 @@ void WorldSession::HandleHousingFixtureCreateFixture(WorldPackets::Housing::Hous
     {
         WorldPackets::Housing::HousingFixtureCreateFixtureResponse response;
         response.Result = static_cast<uint8>(HOUSING_RESULT_HOUSE_NOT_FOUND);
+        SendPacket(response.Write());
+        return;
+    }
+
+    // C1 gate: reject fixture creation unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingFixtureCreateFixtureResponse response;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
         SendPacket(response.Write());
         return;
     }
@@ -1941,6 +2177,15 @@ void WorldSession::HandleHousingFixtureDeleteFixture(WorldPackets::Housing::Hous
         return;
     }
 
+    // C1 gate: reject fixture deletion unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingFixtureDeleteFixtureResponse response;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
+        SendPacket(response.Write());
+        return;
+    }
+
     uint32 componentID = housingFixtureDeleteFixture.ExteriorComponentID;
     uint32 originalID = componentID; // preserve original for RemoveFixture key lookup
 
@@ -2049,6 +2294,15 @@ void WorldSession::HandleHousingFixtureSetHouseSize(WorldPackets::Housing::Housi
         return;
     }
 
+    // C1 gate: reject house-size changes unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingFixtureSetHouseSizeResponse response;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
+        SendPacket(response.Write());
+        return;
+    }
+
     // Validate house size against HousingFixtureSize enum (1=Any, 2=Small, 3=Medium, 4=Large)
     uint8 requestedSize = housingFixtureSetHouseSize.Size;
     if (requestedSize < HOUSING_FIXTURE_SIZE_ANY || requestedSize > HOUSING_FIXTURE_SIZE_LARGE)
@@ -2116,6 +2370,15 @@ void WorldSession::HandleHousingFixtureSetHouseType(WorldPackets::Housing::Housi
     {
         WorldPackets::Housing::HousingFixtureSetHouseTypeResponse response;
         response.Result = static_cast<uint8>(HOUSING_RESULT_HOUSE_NOT_FOUND);
+        SendPacket(response.Write());
+        return;
+    }
+
+    // C1 gate: reject house-type changes unless the player owns the target house.
+    if (!PlayerCanEditHousing(player, housing))
+    {
+        WorldPackets::Housing::HousingFixtureSetHouseTypeResponse response;
+        response.Result = static_cast<uint8>(HOUSING_RESULT_NOT_ON_OWNED_PLOT);
         SendPacket(response.Write());
         return;
     }
@@ -3030,7 +3293,8 @@ void WorldSession::HandleHousingSvcsGuildCreateNeighborhood(WorldPackets::Housin
     Neighborhood* neighborhood = sNeighborhoodMgr.CreateGuildNeighborhood(
         player->GetGUID(), housingSvcsGuildCreateNeighborhood.NeighborhoodName,
         housingSvcsGuildCreateNeighborhood.NeighborhoodTypeID,
-        player->GetTeam());
+        player->GetTeam(),
+        player->GetGuildId()); // M8: persist guild link
 
     WorldPackets::Housing::HousingSvcsCreateCharterNeighborhoodResponse response;
     response.TrailingResult = static_cast<uint8>(neighborhood ? HOUSING_RESULT_SUCCESS : HOUSING_RESULT_GENERIC_FAILURE);
@@ -3825,7 +4089,11 @@ void WorldSession::HandleHousingSvcsGetHouseFinderInfo(WorldPackets::Housing::Ho
         entry.NeighborhoodGUID = neighborhood->GetGuid();
         entry.OwnerGUID = neighborhood->GetOwnerGuid();
         entry.Name = neighborhood->GetName();
-        // Field1 | Field2 is a BITMASK of "unavailable" plots (IDA: client ORs them at offset 520,
+        // Field1 is the occupied-plot bitmask (1 << plotIndex). Proven against the retail capture: in all three
+        // house-bearing records, set-bits(Field1) == sorted(the per-house uint8), so that uint8 is PlotIndex and
+        // Field1 indexes the same plot space. Field2 is NOT a continuation of it - retail sends Field2=0 in 6 of 7
+        // list entries and 0 in both detail responses (one entry carries 0x10000, i.e. "plot 80", which cannot
+        // exist in a 55-plot neighborhood), so the old "client ORs Field1|Field2 at offset 520,
         // then checks (1LL << plotIndex) & bitmask to determine if plot is occupied on the finder map).
         // Include both permanently-occupied plots AND plots currently held by ANOTHER player's
         // 5-minute reservation, so the user can't keep clicking Reserve on the same plot
@@ -3918,7 +4186,12 @@ void WorldSession::HandleHousingSvcsGetHouseFinderNeighborhood(WorldPackets::Hou
     }
     response.Neighborhood.Field1 = occupiedBitmask;
     response.Neighborhood.Field2 = 0;
-    response.Neighborhood.ExtraFlags = 0x20; // Retail sniff: finder detail always has ExtraFlags=0x20
+    // ExtraFlags is Enum.HouseFinderSuggestionReason (None=0 .. Random=32, HomeOwner=64), i.e. list-context
+    // metadata rather than a neighborhood property: the retail capture
+    // dump_12.0.5.67186_2026-04-24_13-23-54 sends 0x40/0x20 in the LIST but 0x00 in BOTH detail responses -
+    // including for the same neighborhood 0x6CCE, which is 0x40 in the list and 0x00 in the detail. The old
+    // comment claiming "finder detail always has ExtraFlags=0x20" was the wrong way round.
+    response.Neighborhood.ExtraFlags = 0x00;
 
     TC_LOG_INFO("housing", "  DETAIL: occupiedBitmask=0x{:016X} occupiedCount={}",
         occupiedBitmask, neighborhood->GetOccupiedPlotCount());
@@ -4390,17 +4663,33 @@ void WorldSession::HandleInvitePlayerToNeighborhood(WorldPackets::Housing::Invit
         return;
     }
 
-    // NOTE: resolves currently-connected players by name only; offline-name lookup
-    // (name cache / DB) is a follow-up.
+    // The client API is C_HousingNeighborhood.InvitePlayerToNeighborhood(playerName), so this
+    // opcode is a name -> GUID resolution as much as an invite. Resolve connected players first,
+    // then fall back to the character cache so offline characters resolve too.
     ObjectGuid inviteeGuid;
     if (Player* invitee = ObjectAccessor::FindConnectedPlayerByName(invitePlayerToNeighborhood.PlayerName))
         inviteeGuid = invitee->GetGUID();
+    else
+        inviteeGuid = sCharacterCache->GetCharacterGuidByName(invitePlayerToNeighborhood.PlayerName);
+
+    // SMSG_NEIGHBORHOOD_INVITE_NAME_LOOKUP_RESULT (0x5C0011) reports the outcome of that
+    // resolution. Client handler (68275, case 6029329) reads uint8 Result then a PackedGUID and
+    // only raises its Lua event when the GUID's HighGuid type field is non-zero — so "not found"
+    // is encoded as an empty GUID, which is what the failure path below sends.
+    WorldPackets::Neighborhood::NeighborhoodInviteNameLookupResult lookupResult;
+    lookupResult.Result = static_cast<uint8>(inviteeGuid.IsEmpty()
+        ? HOUSING_RESULT_PLAYER_NOT_FOUND : HOUSING_RESULT_SUCCESS);
+    lookupResult.PlayerGuid = inviteeGuid;
+    SendPacket(lookupResult.Write());
 
     if (inviteeGuid.IsEmpty())
     {
         WorldPackets::Neighborhood::NeighborhoodInviteResidentResponse response;
-        response.Result = static_cast<uint8>(HOUSING_RESULT_GENERIC_FAILURE);
+        response.Result = static_cast<uint8>(HOUSING_RESULT_PLAYER_NOT_FOUND);
         SendPacket(response.Write());
+
+        TC_LOG_DEBUG("housing", "CMSG_INVITE_PLAYER_TO_NEIGHBORHOOD: name '{}' did not resolve to a character",
+            invitePlayerToNeighborhood.PlayerName);
         return;
     }
 
@@ -4474,9 +4763,12 @@ void WorldSession::HandleHousingPhotoSharingCompleteAuthorization(WorldPackets::
     Housing* housing = player->GetHousing();
     WorldPackets::Housing::HousingPhotoSharingAuthorizationResult response;
 
+    // The result byte is NOT a HousingResult - it is the authorized flag: the 68974 tester capture
+    // (TESTER_SNIFF_68974_MINE.md) shows retail answering a successful completion with 01, and the
+    // sibling SMSG_HOUSING_PHOTO_SHARING_AUTHORIZATION_CLEARED_RESULT is a single bool-u8 as well.
     if (!housing || housing->GetHouseGuid().IsEmpty())
     {
-        response.Result = static_cast<uint8>(HOUSING_RESULT_HOUSE_NOT_FOUND);
+        response.Result = 0;
         SendPacket(response.Write());
         return;
     }
@@ -4484,7 +4776,7 @@ void WorldSession::HandleHousingPhotoSharingCompleteAuthorization(WorldPackets::
     // Track authorization state on the Housing object (per-session, volatile).
     // Actual screenshot hosting requires an external CDN — server only tracks the auth grant.
     housing->SetPhotoSharingAuthorized(true);
-    response.Result = static_cast<uint8>(HOUSING_RESULT_SUCCESS);
+    response.Result = 1;
     SendPacket(response.Write());
 
     TC_LOG_DEBUG("housing", "CMSG_HOUSING_PHOTO_SHARING_COMPLETE_AUTHORIZATION Player: {} authorized photo sharing for house {}",

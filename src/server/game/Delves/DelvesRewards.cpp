@@ -16,16 +16,62 @@
  */
 
 #include "DelvesRewards.h"
+#include "Config.h"
 #include "DatabaseEnv.h"
+#include "DB2Stores.h"
 #include "DelveMgr.h"
 #include "DelvesCompanion.h"
 #include "DelvesSeason.h"
+#include "ItemBonusMgr.h"
 #include "Log.h"
+#include "Loot.h"
+#include "LootMgr.h"
+#include "Mail.h"
 #include "Player.h"
+#include "ReputationMgr.h"
+#include "WeeklyRewardsMgr.h"
 #include "WorldSession.h"
 
 namespace Delves
 {
+
+namespace
+{
+    // Rolls a reference_loot_template pool as personal loot at the delve item context and grants every item,
+    // scaled through ItemBonusMgr (the same authentic ilvl path the M+ rewards use). Mails on full bags.
+    void GrantDelveLoot(Player* player, uint32 lootId, uint8 itemContext)
+    {
+        if (!lootId || !LootTemplates_Reference.HaveLootFor(lootId))
+            return;
+
+        Loot loot(player->GetMap(), ObjectGuid::Empty, LOOT_NONE, nullptr);
+        loot.FillLoot(lootId, LootTemplates_Reference, player, true /*personal*/, true /*noEmptyError*/,
+            LOOT_MODE_DEFAULT, ItemContext(itemContext));
+
+        for (LootItem const& lootItem : loot.items)
+        {
+            if (!lootItem.itemid || !lootItem.count)
+                continue;
+
+            std::vector<int32> bonuses = ItemBonusMgr::GetBonusListsForItem(lootItem.itemid,
+                ItemBonusMgr::ItemBonusGenerationParams(ItemContext(itemContext)));
+
+            ItemPosCountVec dest;
+            if (player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, lootItem.itemid, lootItem.count) == EQUIP_ERR_OK)
+                player->StoreNewItem(dest, lootItem.itemid, true, 0, GuidSet(), ItemContext(itemContext), &bonuses);
+            else if (Item* item = Item::CreateItem(lootItem.itemid, lootItem.count, ItemContext(itemContext), player, false))
+            {
+                item->SetBonuses(bonuses);
+                CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+                item->SaveToDB(trans);
+                MailDraft("Delve Reward", "Your delve reward.")
+                    .AddItem(item)
+                    .SendMailTo(trans, player, MailSender(player, MAIL_STATIONERY_GM), MAIL_CHECK_MASK_COPIED);
+                CharacterDatabase.CommitTransaction(trans);
+            }
+        }
+    }
+}
 
 void DelvesRewards::AwardDelveCompletion(Player* player, uint8 tier, bool bountiful, bool hasRevivesRemaining)
 {
@@ -46,6 +92,11 @@ void DelvesRewards::AwardDelveCompletion(Player* player, uint8 tier, bool bounti
     // Award companion XP
     AwardCompanionXP(player, tier);
 
+    // End-of-run gear (non-bountiful context; retail caps this at the tier-3 track). The item POOL is
+    // server content (reference_loot_template, Delves.Reward.LootId); the LEVEL comes from the item context.
+    GrantDelveLoot(player, uint32(sConfigMgr->GetIntDefault("Delves.Reward.LootId", 0)),
+        GetItemContextForTier(std::min<uint8>(tier, 3), false));
+
     // Handle bountiful rewards
     if (bountiful)
     {
@@ -54,14 +105,23 @@ void DelvesRewards::AwardDelveCompletion(Player* player, uint8 tier, bool bounti
         if (hasRevivesRemaining && HasCofferKey(player))
         {
             ConsumeCofferKey(player);
-            // TODO: Spawn Bountiful Coffer with enhanced loot
+            // Bountiful Coffer: the enhanced chest loot at the tier's bounty item context.
+            GrantDelveLoot(player, uint32(sConfigMgr->GetIntDefault("Delves.Coffer.LootId", 0)),
+                GetItemContextForTier(tier, true));
             TC_LOG_DEBUG("scripts.delves", "Player {} opened Bountiful Coffer (tier {}, ItemContext {})",
                 player->GetName(), tier, GetItemContextForTier(tier, true));
         }
     }
 
-    // Update Great Vault progress
-    UpdateGreatVaultProgress(player, tier);
+    // Great Vault: an endgame delve completion credits the vault's World activity row - the row the client
+    // fills from WeeklyRewardChestThreshold.db2 Type 6 (live ids 196/197/198, slots at 2/4/8 completions).
+    // The level recorded per run is the delve TIER, so each slot is awarded the Nth-best tier of the week,
+    // exactly as a Mythic+ run credits the Dungeon row at its keystone level. The reward ITEM LEVEL that
+    // retail derives from that tier is content the server does not have a full table for yet (only the two
+    // endpoints are documented: T1 = 233, T8+ = 259, capped at Hero 1/6), so no ilvl is fabricated here -
+    // the vault advertises the slot and its tier, and the item comes from the vault reward pool.
+    if (tier >= DELVE_TIER_ENDGAME_START)
+        sWeeklyRewardsMgr.RecordActivity(player, WeeklyRewards::ActivityType::World, tier);
 
     // Check for tier unlock (must have revives remaining)
     if (hasRevivesRemaining && CanUnlockNextTier(progress.HighestTierUnlocked, tier, hasRevivesRemaining))
@@ -86,10 +146,23 @@ void DelvesRewards::AwardCrests(Player* player, uint8 tier)
     if (!reward || reward->CrestType == CREST_NONE || reward->CrestCount == 0)
         return;
 
-    // TODO: Award actual crest currency items based on reward->CrestType and reward->CrestCount
-    // CrestType maps to specific currency IDs in the game
-    TC_LOG_DEBUG("scripts.delves", "Awarding {} crests of type {} to {} for tier {}",
-        reward->CrestCount, reward->CrestType, player->GetName(), tier);
+    // CrestType -> crest currency (Midnight S1 Dawncrest ladder; config-tunable, guarded on CurrencyTypes.db2
+    // so a wrong/absent id is a safe no-op). Delves top out at Hero crests (T11), matching retail.
+    uint32 currencyId = 0;
+    switch (reward->CrestType)
+    {
+        case CREST_WEATHERED: currencyId = uint32(sConfigMgr->GetIntDefault("Delves.Crest.Tier1.CurrencyId", 3383)); break; // Adventurer Dawncrest
+        case CREST_CARVED:    currencyId = uint32(sConfigMgr->GetIntDefault("Delves.Crest.Tier2.CurrencyId", 3341)); break; // Veteran Dawncrest
+        case CREST_RUNED:     currencyId = uint32(sConfigMgr->GetIntDefault("Delves.Crest.Tier3.CurrencyId", 3343)); break; // Champion Dawncrest
+        case CREST_GILDED:    currencyId = uint32(sConfigMgr->GetIntDefault("Delves.Crest.Tier4.CurrencyId", 3345)); break; // Hero Dawncrest
+        default: break;
+    }
+
+    if (currencyId && sCurrencyTypesStore.LookupEntry(currencyId))
+        player->AddCurrency(currencyId, reward->CrestCount, CurrencyGainSource::Loot);
+
+    TC_LOG_DEBUG("scripts.delves", "Awarded {} crests (currency {}) to {} for tier {}",
+        reward->CrestCount, currencyId, player->GetName(), tier);
 }
 
 void DelvesRewards::AwardCompanionXP(Player* player, uint8 tier)
@@ -100,6 +173,19 @@ void DelvesRewards::AwardCompanionXP(Player* player, uint8 tier)
     CompanionState state;
     DelvesCompanion::LoadFromDB(player->GetSession()->GetBattlenetAccountId(), state);
     DelvesCompanion::AwardCompanionXP(player->GetSession()->GetBattlenetAccountId(), state, xpAmount);
+
+    // Mirror the same amount into the retail-visible companion reputation track so the client's
+    // rep/renown UI tracks companion progression. This is a mirror only - the internal CompanionState
+    // math above stays authoritative. Config-tunable and guarded on Faction.db2, so a wrong or absent
+    // id is a safe no-op.
+    //
+    // Faction 2744 "Valeera Sanguinar" / "Trusty Delve Companion", NOT 2742 "Delves: Season 1":
+    // PlayerCompanionInfo.db2 row 11 is the Midnight row (DelvesSeasonID 4, TraitTreeID 1168,
+    // CreatureDisplayInfoID 67214) and its FactionID is 2744 - the companion's OWN track, exactly
+    // mirroring Brann's 2640 on rows 1/9/10. 2742 is the season faction, which is a different thing.
+    if (uint32 factionId = uint32(sConfigMgr->GetIntDefault("Delves.Companion.FactionId", 2744)))
+        if (FactionEntry const* factionEntry = sFactionStore.LookupEntry(factionId))
+            player->GetReputationMgr().ModifyReputation(factionEntry, int32(xpAmount));
 
     TC_LOG_DEBUG("scripts.delves", "Awarded {} companion XP to {} (level {} -> {})",
         xpAmount, player->GetName(), state.Level, state.Level);
@@ -141,29 +227,6 @@ void DelvesRewards::AwardCofferKeyShards(Player* player, uint32 amount)
     // This happens when entering a delve, but we track the shards here
     TC_LOG_DEBUG("scripts.delves", "Awarded {} coffer key shards to {} (total: {}/{})",
         actualAmount, player->GetName(), progress.WeeklyCofferShards, MAX_COFFER_KEY_SHARDS_PER_WEEK);
-}
-
-void DelvesRewards::UpdateGreatVaultProgress(Player* player, uint8 tier)
-{
-    if (tier < DELVE_TIER_ENDGAME_START) // Only tier 4+ counts for vault
-        return;
-
-    // Great Vault tracking uses the existing WeeklyRewardChest system
-    // Completions at 2/4/8 unlock vault slots
-    // The highest tier completed determines the vault reward ilvl
-    // TODO: Integrate with existing WeeklyRewardChestActivity system
-    TC_LOG_DEBUG("scripts.delves", "Updated Great Vault progress for {} (tier {})", player->GetName(), tier);
-}
-
-uint8 DelvesRewards::GetGreatVaultSlotCount(uint32 weeklyCompletions)
-{
-    if (weeklyCompletions >= VAULT_SLOT_3_COMPLETIONS) // 8
-        return 3;
-    if (weeklyCompletions >= VAULT_SLOT_2_COMPLETIONS) // 4
-        return 2;
-    if (weeklyCompletions >= VAULT_SLOT_1_COMPLETIONS) // 2
-        return 1;
-    return 0;
 }
 
 bool DelvesRewards::CanUnlockNextTier(uint8 currentHighest, uint8 completedTier, bool hasRevivesRemaining)
@@ -214,6 +277,14 @@ void DelvesRewards::ResetWeeklyProgress(uint32 battlenetAccountId, DelveProgress
     progress.WeeklyBountifulCount = 0;
     progress.WeeklyCofferShards = 0;
     SaveProgress(battlenetAccountId, progress);
+}
+
+void DelvesRewards::ResetAllWeeklyProgress()
+{
+    // Weekly rollover for every account at once; online players' cached progress reloads on next use.
+    CharacterDatabase.Execute("UPDATE delve_progress SET weeklyCompletions = 0, highestTierThisWeek = 0, "
+        "weeklyBountifulCount = 0, weeklyCofferShards = 0");
+    TC_LOG_INFO("delves", "DelvesRewards: weekly delve progress reset.");
 }
 
 void DelvesRewards::PublishProgress(Player* player)

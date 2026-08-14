@@ -2910,6 +2910,118 @@ void ObjectMgr::LoadInstanceSpawnGroups()
     TC_LOG_INFO("server.loading", ">> Loaded {} instance spawn groups in {} ms", n, GetMSTimeDiffToNow(oldMSTime));
 }
 
+// Loads the boss-ability timelines that drive SMSG_INSTANCE_ENCOUNTER_EVENT_SEQUENCE / _APPEND /
+// _CAST_UPDATE. Without this table the whole opcode family is machinery with no content: it is what
+// InstanceScript::StartEncounterTimeline reads on every pull.
+//
+// About EncounterEventID, because getting this wrong is the easy mistake here:
+//
+// It is NOT a value this project may allocate. It is a row id of EncounterEvent.db2, which the *client*
+// ships and reads - C_EncounterEvents.GetEventInfo(encounterEventID) resolves it to that row's SpellID,
+// Severity, BroadcastTextID, Flags and IconFileDataID for display. The 12.0.7 client's copy holds 622 rows
+// (ids 1-809) whose parent-lookup column is the DungeonEncounterID, so the client already knows which
+// events belong to which encounter. An id we made up would simply miss, HasEventInfo would return false,
+// and the entry would carry no client-side identity.
+//
+// So every row's EncounterEventID must be copied out of EncounterEvent.db2 for the matching
+// DungeonEncounterID, and SpellID must be the SpellID that row carries. The server does not have that DB2
+// loaded (adding the store would need hotfix-database plumbing), which is exactly why these values live in
+// a world table: they are data, and a build that does load the DB2 later can validate this table against
+// it without any code change.
+void ObjectMgr::LoadInstanceEncounterTimeline()
+{
+    uint32 oldMSTime = getMSTime();
+
+    _instanceEncounterTimelineStore.clear();
+
+    //                                               0                   1             2                 3        4                5           6      7         8            9             10
+    QueryResult result = WorldDatabase.Query("SELECT DungeonEncounterID, DifficultyID, EncounterEventID, SpellID, BroadcastTextID, IconFileID, Flags, Severity, FirstCastMs, RepeatCastMs, MaxQueueDurationMs FROM instance_encounter_timeline ORDER BY DungeonEncounterID, FirstCastMs");
+
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 instance encounter timeline events. DB table `instance_encounter_timeline` is empty.");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+
+        InstanceEncounterTimelineInfo info;
+        info.DungeonEncounterID = fields[0].GetUInt32();
+        info.DifficultyID       = fields[1].GetUInt32();
+        info.EncounterEventID   = fields[2].GetUInt32();
+        info.SpellID            = fields[3].GetUInt32();
+        info.BroadcastTextID    = fields[4].GetUInt32();
+        info.IconFileID         = fields[5].GetInt32();
+        info.Flags              = fields[6].GetUInt32();
+        info.Severity           = fields[7].GetUInt8();
+        info.FirstCast          = Milliseconds(fields[8].GetUInt32());
+        info.RepeatCast         = Milliseconds(fields[9].GetUInt32());
+        info.MaxQueueDuration   = Milliseconds(fields[10].GetUInt32());
+
+        if (!sDungeonEncounterStore.LookupEntry(info.DungeonEncounterID))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `instance_encounter_timeline` has an entry for non-existing DungeonEncounterID {}, skipped.", info.DungeonEncounterID);
+            continue;
+        }
+
+        if (info.DifficultyID && !sDifficultyStore.LookupEntry(info.DifficultyID))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `instance_encounter_timeline` (DungeonEncounterID {}, EncounterEventID {}) has a non-existing DifficultyID {}, skipped.",
+                info.DungeonEncounterID, info.EncounterEventID, info.DifficultyID);
+            continue;
+        }
+
+        // A zero id would be indistinguishable from "no event" to the client, and the timeline entry could
+        // never resolve to anything it can draw.
+        if (!info.EncounterEventID)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `instance_encounter_timeline` (DungeonEncounterID {}) has EncounterEventID 0, which cannot resolve in the client's EncounterEvent.db2, skipped.",
+                info.DungeonEncounterID);
+            continue;
+        }
+
+        if (!sSpellMgr->GetSpellInfo(info.SpellID, DIFFICULTY_NONE))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `instance_encounter_timeline` (DungeonEncounterID {}, EncounterEventID {}) has a non-existing SpellID {}, skipped.",
+                info.DungeonEncounterID, info.EncounterEventID, info.SpellID);
+            continue;
+        }
+
+        // EncounterEventSeverity is Low=0 / Medium=1 / High=2 in the client's enum registrar.
+        if (info.Severity > 2)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `instance_encounter_timeline` (DungeonEncounterID {}, EncounterEventID {}) has Severity {} outside EncounterEventSeverity (0-2), skipped.",
+                info.DungeonEncounterID, info.EncounterEventID, info.Severity);
+            continue;
+        }
+
+        // The countdown is the whole point of the entry; a zero-length one would fire on the tick it was
+        // created and the client would never draw it.
+        if (info.FirstCast <= 0ms)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `instance_encounter_timeline` (DungeonEncounterID {}, EncounterEventID {}) has FirstCastMs 0, skipped.",
+                info.DungeonEncounterID, info.EncounterEventID);
+            continue;
+        }
+
+        if (info.MaxQueueDuration <= 0ms)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `instance_encounter_timeline` (DungeonEncounterID {}, EncounterEventID {}) has MaxQueueDurationMs 0, skipped.",
+                info.DungeonEncounterID, info.EncounterEventID);
+            continue;
+        }
+
+        _instanceEncounterTimelineStore[info.DungeonEncounterID].push_back(info);
+        ++count;
+    } while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} instance encounter timeline events for {} encounters in {} ms",
+        count, _instanceEncounterTimelineStore.size(), GetMSTimeDiffToNow(oldMSTime));
+}
+
 SpawnData const* ObjectMgr::GetSpawnData(SpawnObjectType type, ObjectGuid::LowType spawnId) const
 {
     if (!SpawnData::TypeHasData(type))
@@ -6566,6 +6678,57 @@ void ObjectMgr::LoadQuestGreetings()
     TC_LOG_INFO("server.loading", ">> Loaded {} quest_greeting in {} ms", count, GetMSTimeDiffToNow(oldMSTime));
 }
 
+std::vector<QuestGarrisonFollower> const* ObjectMgr::GetQuestGarrisonFollowers(uint32 questId) const
+{
+    return Trinity::Containers::MapGetValuePtr(_questGarrisonFollowerStore, questId);
+}
+
+void ObjectMgr::LoadQuestGarrisonFollowers()
+{
+    uint32 oldMSTime = getMSTime();
+
+    _questGarrisonFollowerStore.clear();
+
+    //                                               0            1               2
+    QueryResult result = WorldDatabase.Query("SELECT QuestID, GarrFollowerID, GarrType FROM quest_reward_garrison_follower");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 quest garrison follower rewards, table is empty!");
+        return;
+    }
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+
+        uint32 questId          = fields[0].GetUInt32();
+        uint32 garrFollowerId   = fields[1].GetUInt32();
+        uint8 garrType          = fields[2].GetUInt8();
+
+        if (!GetQuestTemplate(questId))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `quest_reward_garrison_follower` has reward for non-existent quest {}, skipped.", questId);
+            continue;
+        }
+
+        if (!sGarrFollowerStore.LookupEntry(garrFollowerId))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `quest_reward_garrison_follower` (QuestID {}) references non-existent GarrFollower.db2 id {}, skipped.", questId, garrFollowerId);
+            continue;
+        }
+
+        QuestGarrisonFollower reward;
+        reward.GarrFollowerID = garrFollowerId;
+        reward.GarrType = garrType;
+        _questGarrisonFollowerStore[questId].push_back(reward);
+        ++count;
+    }
+    while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} quest garrison follower rewards in {} ms", count, GetMSTimeDiffToNow(oldMSTime));
+}
+
 void ObjectMgr::LoadTavernAreaTriggers()
 {
     uint32 oldMSTime = getMSTime();
@@ -6634,6 +6797,80 @@ void ObjectMgr::LoadAreaTriggerScripts()
     while (result->NextRow());
 
     TC_LOG_INFO("server.loading", ">> Loaded {} areatrigger scripts in {} ms", _areaTriggerScriptStore.size(), GetMSTimeDiffToNow(oldMSTime));
+}
+
+// Flight masters are normally resolved to a TaxiNodes row by proximity (GetNearestTaxiNode). That cannot work
+// for the covenant sanctum transport networks: every node in them carries TaxiNodeFlags::IgnoreForFindNearest,
+// which is precisely the flag Blizzard can afford to set because their flight master is bound to its node
+// explicitly instead of being found by distance. `creature_taxi_node` restores that explicit binding.
+void ObjectMgr::LoadCreatureTaxiNodes()
+{
+    uint32 oldMSTime = getMSTime();
+
+    _creatureTaxiNodeStore.clear();                             // need for reload case
+
+    QueryResult result = WorldDatabase.Query("SELECT CreatureID, TaxiNodeID FROM creature_taxi_node");
+    if (!result)
+    {
+        TC_LOG_INFO("server.loading", ">> Loaded 0 creature taxi node bindings. DB table `creature_taxi_node` is empty.");
+        return;
+    }
+
+    do
+    {
+        Field* fields = result->Fetch();
+
+        uint32 creatureId = fields[0].GetUInt32();
+        uint32 taxiNodeId = fields[1].GetUInt32();
+
+        CreatureTemplate const* creatureTemplate = GetCreatureTemplate(creatureId);
+        if (!creatureTemplate)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `creature_taxi_node` references non-existing creature {} (TaxiNodeID {}), skipped.", creatureId, taxiNodeId);
+            continue;
+        }
+
+        if (!(creatureTemplate->npcflag & UNIT_NPC_FLAG_FLIGHTMASTER))
+        {
+            TC_LOG_ERROR("sql.sql", "Table `creature_taxi_node` binds creature {} to TaxiNodeID {}, but that creature is not a flight master "
+                "(missing UNIT_NPC_FLAG_FLIGHTMASTER); the binding would never be used, skipped.", creatureId, taxiNodeId);
+            continue;
+        }
+
+        TaxiNodesEntry const* node = sTaxiNodesStore.LookupEntry(taxiNodeId);
+        if (!node)
+        {
+            TC_LOG_ERROR("sql.sql", "Table `creature_taxi_node` references non-existing TaxiNodes.db2 entry {} (CreatureID {}), skipped.", taxiNodeId, creatureId);
+            continue;
+        }
+
+        // A node outside the taxi network has no edges in TaxiPathGraph, so binding to it would open an empty
+        // flight map. Refuse it rather than silently offering a dead flight master.
+        if (!node->IsPartOfTaxiNetwork())
+        {
+            TC_LOG_ERROR("sql.sql", "Table `creature_taxi_node` binds creature {} to TaxiNodeID {}, which is not part of the taxi network, skipped.", creatureId, taxiNodeId);
+            continue;
+        }
+
+        _creatureTaxiNodeStore[creatureId] = taxiNodeId;
+    }
+    while (result->NextRow());
+
+    TC_LOG_INFO("server.loading", ">> Loaded {} creature taxi node bindings in {} ms", _creatureTaxiNodeStore.size(), GetMSTimeDiffToNow(oldMSTime));
+}
+
+uint32 ObjectMgr::GetCreatureTaxiNode(uint32 creatureId) const
+{
+    auto itr = _creatureTaxiNodeStore.find(creatureId);
+    return itr != _creatureTaxiNodeStore.end() ? itr->second : 0;
+}
+
+uint32 ObjectMgr::GetTaxiNodeForFlightMaster(uint32 creatureId, float x, float y, float z, uint32 mapid, uint32 team)
+{
+    if (uint32 boundNode = GetCreatureTaxiNode(creatureId))
+        return boundNode;
+
+    return GetNearestTaxiNode(x, y, z, mapid, team);
 }
 
 uint32 ObjectMgr::GetNearestTaxiNode(float x, float y, float z, uint32 mapid, uint32 team)
@@ -9752,7 +9989,17 @@ void ObjectMgr::LoadGossipMenuAddon()
             }
         }
 
-        if (addon.LfgDungeonsID && sLFGDungeonsStore.LookupEntry(addon.LfgDungeonsID))
+        // The `!` was lost in e59eef5432 ("Core/PacketIO: Updated to 11.0.0") when the preceding
+        // `else` branch was rewritten into a standalone `if`, which inverted the test: the error
+        // fired - and the field was zeroed - for every LfgDungeonsID that DOES exist. The only rows
+        // in this table with a non-zero LfgDungeonsID are the delve tier pickers (39751 -> 3025
+        // Atal'Aman, 40277 -> 3069 The Shadow Enclave), so the net effect was that the client never
+        // received a LfgDungeonsID on SMSG_GOSSIP_MESSAGE and Blizzard_DelvesDifficultyPicker could
+        // never render. Confirmed live: M:/IntegratedServer/logs/DBErrors.log carries exactly the
+        // two lines "Table gossip_menu_addon: ID 39751/40277 is using non-existing LfgDungeonsID
+        // 3025/3069", while LFGDungeons.db2 (12.0.7, layout 34B02DE8) does contain both rows
+        // (3025 MapID=2962 Atal'Aman, 3069 MapID=2952 The Shadow Enclave).
+        if (addon.LfgDungeonsID && !sLFGDungeonsStore.LookupEntry(addon.LfgDungeonsID))
         {
             TC_LOG_ERROR("sql.sql", "Table gossip_menu_addon: ID {} is using non-existing LfgDungeonsID {}", menuID, addon.LfgDungeonsID);
             addon.LfgDungeonsID = 0;

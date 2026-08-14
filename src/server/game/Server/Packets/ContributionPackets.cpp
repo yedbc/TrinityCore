@@ -28,6 +28,17 @@ void ContributionContribute::Read()
 void ContributionLastUpdateRequest::Read()
 {
     _worldPacket >> ContributionID;
-    _worldPacket >> Field1;
+    _worldPacket >> ContributionGUID;
+}
+
+WorldPacket const* ContributionLastUpdateResponse::Write()
+{
+    // 8 + 4 + 4 = 16 bytes. The handler reads the timestamp as a qword; writing it as a dword shifts both keys
+    // and makes the client read 4 bytes past the payload.
+    _worldPacket << uint64(Data);
+    _worldPacket << uint32(ContributionID);
+    _worldPacket << uint32(ContributionGUID);
+
+    return &_worldPacket;
 }
 }

@@ -18,10 +18,15 @@
 #ifndef GarrisonMgr_h__
 #define GarrisonMgr_h__
 
+#include "AbominationFactory.h"
 #include "Define.h"
+#include "EmberCourt.h"
+#include "PathOfAscension.h"
 #include "Hash.h"
 #include "Position.h"
+#include "QueensConservatory.h"
 #include <list>
+#include <map>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,6 +35,7 @@
 struct CharShipmentEntry;
 struct CharShipmentContainerEntry;
 struct GameObjectsEntry;
+struct GarrAbilityEffectEntry;
 struct GarrAbilityEntry;
 struct GarrAutoCombatantEntry;
 struct GarrAutoSpellEntry;
@@ -153,11 +159,84 @@ public:
     uint32 GetRecruiterForContainer(uint32 containerId) const;
     void LoadOrderHallStandards();
 
+    // Queen's Conservatory (Night Fae unique sanctum feature, GarrTalentTree 319). The wildseed kinds - their
+    // cost, maturation time and reward chest - have no representation in any 12.0.7 DB2, so they are authored
+    // content in the world table `garrison_conservatory_wildseed` rather than constants in the core. With no
+    // rows loaded the Conservatory engine simply refuses to plant; see QueensConservatory.h.
+    void LoadConservatoryWildseeds();
+    ConservatoryWildseedTemplate const* GetConservatoryWildseed(uint32 wildseedEntry) const;
+    std::unordered_map<uint32, ConservatoryWildseedTemplate> const& GetConservatoryWildseeds() const { return _conservatoryWildseeds; }
+
+    // The catalyst items a wildseed pod can be linked to (world table `garrison_conservatory_catalyst`) and
+    // the loot table each catalyst combination pays out (`garrison_conservatory_yield`). The catalyst effects
+    // ARE client-derived - each item's own description states them - but the item set and the loot tables are
+    // content, so neither is compiled in. Empty tables are valid: AttachCatalyst then refuses, and a harvest
+    // falls back to the wildseed's reward chest exactly as it did before catalysts existed.
+    void LoadConservatoryCatalysts();
+    ConservatoryCatalystTemplate const* GetConservatoryCatalyst(uint32 catalystItemId) const;
+    std::unordered_map<uint32, ConservatoryCatalystTemplate> const& GetConservatoryCatalysts() const { return _conservatoryCatalysts; }
+
+    void LoadConservatoryYields();
+    // gameobject_loot_template entry for this catalyst set, preferring a spirit-specific row over the
+    // spiritItemId 0 wildcard. 0 means "no row" - the caller must refuse, never fall back to another table.
+    uint32 GetConservatoryYieldLootId(uint32 spiritItemId, uint8 rootGrainCount, uint8 nightbloomCount) const;
+    std::map<ConservatoryYieldKey, uint32> const& GetConservatoryYields() const { return _conservatoryYields; }
+
+    // Abomination Factory (Necrolord unique sanctum feature, GarrTalentTree 321). The recipe SET is client data
+    // (the 66 SkillLineAbility rows of SkillLine 2787 "Abominable Stitching"); only the rank that unlocks each
+    // recipe is unpublished, so that lives in the world table `garrison_abomination_recipe`. See
+    // AbominationFactory.h for the full derivation.
+    void LoadAbominationRecipes();
+    // Any spell that SkillLine 2787 publishes as a recipe.
+    bool IsAbominationStitchingRecipe(uint32 spellId) const;
+    // The 15 "Construct Body: X" recipes - identified from data as the skill-2787 recipes whose spell carries
+    // SPELL_EFFECT_KILL_CREDIT, not from a hardcoded id list.
+    bool IsAbominationConstructRecipe(uint32 spellId) const;
+    // Researched tiers of tree 321 needed before the recipe is taught; 0 = no authored row (never taught).
+    uint8 GetAbominationRecipeRank(uint32 spellId) const;
+    std::unordered_map<uint32, AbominationRecipeTemplate> const& GetAbominationRecipes() const { return _abominationRecipes; }
+
+    // Path of Ascension (Kyrian unique sanctum feature, GarrTalentTree 320). The tier ladder, the four trial
+    // difficulties (Difficulty 168-171), the scenario (1798) and its map (2375) are all client data and are
+    // consumed directly. What no 68275 row states is WHICH memory occupies which slot of that ladder, so the
+    // memory roster is authored in the world table `garrison_ascension_memory`. See PathOfAscension.h.
+    void LoadAscensionMemories();
+    AscensionMemoryTemplate const* GetAscensionMemory(uint32 memoryId) const;
+    std::unordered_map<uint32, AscensionMemoryTemplate> const& GetAscensionMemories() const { return _ascensionMemories; }
+    // True when this world DB actually instantiates scenario 1798 on map 2375 (a `scenarios` row plus at least
+    // one spawn on the map). False means the Ascension Coliseum is unauthored and a trial must be refused
+    // rather than started - PathOfAscension::StartTrial answers ASCENSION_ERROR_NO_ARENA_CONTENT.
+    bool IsAscensionArenaAuthored() const { return _ascensionArenaAuthored; }
+
+    // The Ember Court (Venthyr unique sanctum feature, GarrTalentTree 324). The unlock ladder, the sixteen
+    // guests, the five attribute axes, the scenario (1791) and its area (13329 on map 2222) are all client
+    // data and are consumed directly. What no 68275 row states is which attributes each guest likes and what
+    // counts as the "Elated" mood, so that half is authored in `garrison_ember_court_guest`. See EmberCourt.h.
+    void LoadEmberCourtGuests();
+    EmberCourtGuestTemplate const* GetEmberCourtGuest(uint8 guestIndex) const;
+    std::unordered_map<uint8, EmberCourtGuestTemplate> const& GetEmberCourtGuests() const { return _emberCourtGuests; }
+    // True when this world DB actually instantiates the Ember Court (a `scenarios` row for map 2222 plus at
+    // least one spawn in area 13329). False means the venue is unauthored and a court must be refused rather
+    // than started - EmberCourt::StartCourt answers EMBER_COURT_ERROR_NO_VENUE_CONTENT.
+    bool IsEmberCourtVenueAuthored() const { return _emberCourtVenueAuthored; }
+
+    // Transport Network (the covenant sanctum travel feature, GarrTalentTree.FeatureTypeIndex 2, trees
+    // 308 Kyrian / 309 Venthyr / 307 NightFae / 310 Necrolord). All 12 rank rows publish ZERO effect fields
+    // (audit-verified against wago @68887), so which teleport/taxi spell each researched tier enables is not
+    // client data - it is authored in the world table `garrison_transport_network`, with every row's spell
+    // verified to carry a real teleport (SpellEffect 15/252 + TARGET_DEST_DB with a spell_target_position row)
+    // or a taxi-node teach (SPELL_EFFECT_DISCOVER_TAXI). See the authoring SQL for source labels.
+    void LoadTransportNetworkSpells();
+    std::vector<uint32> const* GetTransportNetworkSpells(uint32 garrTalentId) const;
+
     // Talent system accessors
     std::vector<GarrTalentTreeEntry const*> const* GetTalentTreesForGarrType(int8 garrTypeID) const;
     std::vector<GarrTalentEntry const*> const* GetTalentsForTree(uint32 garrTalentTreeID) const;
     std::vector<GarrTalentRankEntry const*> const* GetTalentRanksForTalent(uint32 garrTalentID) const;
     GarrTalentResearchEntry const* GetTalentResearchForTree(uint32 garrTalentTreeID) const;
+    // Every GarrAbilityEffect row published for one GarrAbility (GarrTalent.GarrAbilityID carriers included -
+    // that is how the Command Table talent modifiers reach the mission engine). nullptr = none published.
+    std::vector<GarrAbilityEffectEntry const*> const* GetGarrAbilityEffects(uint32 garrAbilityID) const;
 
     // Mission system accessors
     std::vector<GarrMissionEntry const*> const* GetMissionsByGarrType(int8 garrTypeID) const;
@@ -215,6 +294,7 @@ private:
     std::unordered_map<uint32 /*garrTalentTreeID*/, std::vector<GarrTalentEntry const*>> _talentsByTree;
     std::unordered_map<uint32 /*garrTalentID*/, std::vector<GarrTalentRankEntry const*>> _talentRanksByTalent;
     std::unordered_map<uint32 /*garrTalentTreeID*/, GarrTalentResearchEntry const*> _talentResearchByTree;
+    std::unordered_map<uint32 /*garrAbilityID*/, std::vector<GarrAbilityEffectEntry const*>> _abilityEffectsByAbility;
 
     // Auto-combat indices
     std::unordered_map<uint32 /*garrAutoSpellID*/, std::vector<GarrAutoSpellEffectEntry const*>> _autoSpellEffects;
@@ -229,6 +309,30 @@ private:
     std::unordered_map<uint32 /*containerId*/, OrderHallStandard> _orderHallStandardByContainer;
     std::unordered_map<uint32 /*containerId*/, uint32 /*npcEntry*/> _recruiterByContainer;
     std::unordered_map<uint32 /*containerID*/, std::vector<CharShipmentEntry const*>> _shipmentsByContainer;
+
+    // Queen's Conservatory authored wildseed kinds (world table `garrison_conservatory_wildseed`).
+    std::unordered_map<uint32 /*wildseedEntry*/, ConservatoryWildseedTemplate> _conservatoryWildseeds;
+    // Queen's Conservatory catalyst items (`garrison_conservatory_catalyst`) and the loot table each
+    // catalyst combination rolls (`garrison_conservatory_yield`).
+    std::unordered_map<uint32 /*catalystItemId*/, ConservatoryCatalystTemplate> _conservatoryCatalysts;
+    std::map<ConservatoryYieldKey, uint32 /*lootId*/> _conservatoryYields;
+
+    // Abomination Factory. The two sets are derived from client data at startup; the map is authored content.
+    std::unordered_set<uint32 /*spellId*/> _abominationStitchingSpells;
+    std::unordered_set<uint32 /*spellId*/> _abominationConstructSpells;
+    std::unordered_map<uint32 /*spellId*/, AbominationRecipeTemplate> _abominationRecipes;
+
+    // Path of Ascension. The memory roster is authored content; the arena flag is a fact about this world DB.
+    std::unordered_map<uint32 /*memoryId*/, AscensionMemoryTemplate> _ascensionMemories;
+    bool _ascensionArenaAuthored = false;
+
+    // Transport Network authored spell grants (world table `garrison_transport_network`).
+    std::unordered_map<uint32 /*garrTalentId*/, std::vector<uint32 /*spellId*/>> _transportNetworkSpells;
+
+    // The Ember Court. The per-guest preferences are authored content; the venue flag is a fact about this
+    // world DB.
+    std::unordered_map<uint8 /*guestIndex*/, EmberCourtGuestTemplate> _emberCourtGuests;
+    bool _emberCourtVenueAuthored = false;
 
     uint64 _followerDbIdGenerator = UI64LIT(1);
     uint64 _shipmentDbIdGenerator = UI64LIT(1);

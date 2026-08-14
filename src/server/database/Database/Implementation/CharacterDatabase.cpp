@@ -844,11 +844,11 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_SEL_CHARACTER_MYTHIC_PLUS, "SELECT challengeModeId, level, durationMs, deaths, completionDate, score, affix1, affix2, affix3, affix4 FROM character_mythic_plus WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_INS_CHARACTER_MYTHIC_PLUS, "INSERT INTO character_mythic_plus (guid, challengeModeId, level, durationMs, deaths, completionDate, score, affix1, affix2, affix3, affix4) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_MYTHIC_PLUS, "DELETE FROM character_mythic_plus WHERE guid = ?", CONNECTION_ASYNC);
-    PrepareStatement(CHAR_SEL_CHARACTER_MYTHIC_PLUS_WEEKLY, "SELECT challengeModeId, level, completionDate, resetTime FROM character_mythic_plus_weekly WHERE guid = ?", CONNECTION_ASYNC);
-    PrepareStatement(CHAR_INS_CHARACTER_MYTHIC_PLUS_WEEKLY, "INSERT INTO character_mythic_plus_weekly (guid, challengeModeId, level, completionDate, resetTime) VALUES (?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_CHARACTER_MYTHIC_PLUS_WEEKLY, "SELECT challengeModeId, level, timed, completionDate, resetTime FROM character_mythic_plus_weekly WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_INS_CHARACTER_MYTHIC_PLUS_WEEKLY, "INSERT INTO character_mythic_plus_weekly (guid, challengeModeId, level, timed, completionDate, resetTime) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_MYTHIC_PLUS_WEEKLY, "DELETE FROM character_mythic_plus_weekly WHERE guid = ?", CONNECTION_ASYNC);
-    PrepareStatement(CHAR_SEL_CHARACTER_MYTHIC_PLUS_VAULT, "SELECT claimedResetTime FROM character_mythic_plus_vault WHERE guid = ?", CONNECTION_ASYNC);
-    PrepareStatement(CHAR_INS_CHARACTER_MYTHIC_PLUS_VAULT, "INSERT INTO character_mythic_plus_vault (guid, claimedResetTime) VALUES (?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_CHARACTER_MYTHIC_PLUS_VAULT, "SELECT claimedResetTime, keystoneResetTime, prevWeekResetTime, prevWeekBestLevel, prevWeekBestTimedLevel FROM character_mythic_plus_vault WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_INS_CHARACTER_MYTHIC_PLUS_VAULT, "INSERT INTO character_mythic_plus_vault (guid, claimedResetTime, keystoneResetTime, prevWeekResetTime, prevWeekBestLevel, prevWeekBestTimedLevel) VALUES (?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE claimedResetTime = VALUES(claimedResetTime), keystoneResetTime = VALUES(keystoneResetTime), prevWeekResetTime = VALUES(prevWeekResetTime), prevWeekBestLevel = VALUES(prevWeekBestLevel), prevWeekBestTimedLevel = VALUES(prevWeekBestTimedLevel)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_MYTHIC_PLUS_VAULT, "DELETE FROM character_mythic_plus_vault WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_UPD_CHARACTER_GARRISON_FOLLOWER_ACTIVATIONS, "UPDATE character_garrison SET followerActivationsRemainingToday = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_BLUEPRINTS, "SELECT buildingId FROM character_garrison_blueprints WHERE guid = ?", CONNECTION_ASYNC);
@@ -860,8 +860,8 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_SPECIALIZATIONS, "SELECT specId FROM character_garrison_specializations WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_INS_CHARACTER_GARRISON_SPECIALIZATIONS, "INSERT INTO character_garrison_specializations (guid, specId, garrType) VALUES (?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_SPECIALIZATIONS, "DELETE FROM character_garrison_specializations WHERE guid = ? AND garrType = ?", CONNECTION_ASYNC);
-    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_FOLLOWERS, "SELECT dbId, followerId, quality, level, itemLevelWeapon, itemLevelArmor, xp, currentBuilding, currentMission, status, durability, customName FROM character_garrison_followers WHERE guid = ?", CONNECTION_ASYNC);
-    PrepareStatement(CHAR_INS_CHARACTER_GARRISON_FOLLOWERS, "INSERT INTO character_garrison_followers (dbId, guid, followerId, quality, level, itemLevelWeapon, itemLevelArmor, xp, currentBuilding, currentMission, status, durability, customName, garrType) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_FOLLOWERS, "SELECT dbId, followerId, quality, level, itemLevelWeapon, itemLevelArmor, xp, currentBuilding, currentMission, status, durability, customName, health, boardIndex FROM character_garrison_followers WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_INS_CHARACTER_GARRISON_FOLLOWERS, "INSERT INTO character_garrison_followers (dbId, guid, followerId, quality, level, itemLevelWeapon, itemLevelArmor, xp, currentBuilding, currentMission, status, durability, customName, garrType, health, boardIndex) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     // LEFT JOIN (not INNER): followers with no ability rows must still be deleted. An INNER JOIN skips ability-less
     // followers, so SaveToDB then re-INSERTs them -> duplicate dbId -> the whole character save transaction aborts.
     PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_FOLLOWERS, "DELETE gfab, gf FROM character_garrison_followers gf LEFT JOIN character_garrison_follower_abilities gfab ON gfab.dbId = gf.dbId WHERE gf.guid = ? AND gf.garrType = ?", CONNECTION_ASYNC);
@@ -870,6 +870,7 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_MISSIONS, "SELECT dbId, guid, missionRecID, offerTime, offerDuration, startTime, travelDuration, missionDuration, missionState, successChance FROM character_garrison_missions WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_INS_CHARACTER_GARRISON_MISSIONS, "INSERT INTO character_garrison_missions (dbId, guid, missionRecID, offerTime, offerDuration, startTime, travelDuration, missionDuration, missionState, successChance, garrType) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_MISSIONS, "DELETE FROM character_garrison_missions WHERE guid = ? AND garrType = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_MISSION, "DELETE FROM character_garrison_missions WHERE guid = ? AND dbId = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_SHIPMENTS, "SELECT dbId, shipmentId, plotInstanceId, creationTime, duration, assignedFollowerDbId FROM character_garrison_shipments WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_INS_CHARACTER_GARRISON_SHIPMENTS, "INSERT INTO character_garrison_shipments (dbId, guid, shipmentId, plotInstanceId, creationTime, duration, assignedFollowerDbId, garrType) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_SHIPMENTS, "DELETE FROM character_garrison_shipments WHERE guid = ? AND garrType = ?", CONNECTION_ASYNC);
@@ -879,8 +880,13 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_INS_CHARACTER_GARRISON_TALENT, "INSERT INTO character_garrison_talents (guid, garrTalentId, `rank`, researchStartTime, flags, soulbindConduitId, soulbindConduitRank, garrType) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_TALENTS, "DELETE FROM character_garrison_talents WHERE guid = ? AND garrType = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_TALENT, "DELETE FROM character_garrison_talents WHERE guid = ? AND garrTalentId = ?", CONNECTION_ASYNC);
-    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_TROPHIES, "SELECT trophyId FROM character_garrison_trophies WHERE guid = ?", CONNECTION_ASYNC);
-    PrepareStatement(CHAR_INS_CHARACTER_GARRISON_TROPHY, "INSERT INTO character_garrison_trophies (guid, trophyId, garrType) VALUES (?, ?, ?)", CONNECTION_ASYNC);
+    // Daily-reset sweep for temporary talents of one garrison type, for characters that are offline when the
+    // reset happens. In the covenant sanctum (garrType 111) a temporary talent is by construction an Anima
+    // Conductor channel bought with reservoir anima - see Garrison::LearnTalent, which refuses to set the flag
+    // on anything else - so this expires exactly those and nothing else.
+    PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_TEMPORARY_TALENTS_BY_TYPE, "DELETE FROM character_garrison_talents WHERE garrType = ? AND (flags & ?) <> 0", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_TROPHIES, "SELECT trophyInstanceId, trophyId FROM character_garrison_trophies WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_INS_CHARACTER_GARRISON_TROPHY, "INSERT INTO character_garrison_trophies (guid, trophyInstanceId, trophyId, garrType) VALUES (?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_TROPHIES, "DELETE FROM character_garrison_trophies WHERE guid = ? AND garrType = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_ARCHIVED_MISSIONS, "SELECT garrType, missionRecID FROM character_garrison_archived_missions WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_INS_CHARACTER_GARRISON_ARCHIVED_MISSION, "INSERT INTO character_garrison_archived_missions (guid, garrType, missionRecID) VALUES (?, ?, ?)", CONNECTION_ASYNC);
@@ -891,14 +897,35 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_BLUEPRINTS_BY_TYPE, "SELECT buildingId FROM character_garrison_blueprints WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_BUILDINGS_BY_TYPE, "SELECT plotInstanceId, buildingId, timeBuilt, active, currentGarSpecId, timeSpecCooldown FROM character_garrison_buildings WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_SPECIALIZATIONS_BY_TYPE, "SELECT specId FROM character_garrison_specializations WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
-    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_FOLLOWERS_BY_TYPE, "SELECT dbId, followerId, quality, level, itemLevelWeapon, itemLevelArmor, xp, currentBuilding, currentMission, status, durability, customName FROM character_garrison_followers WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
+    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_FOLLOWERS_BY_TYPE, "SELECT dbId, followerId, quality, level, itemLevelWeapon, itemLevelArmor, xp, currentBuilding, currentMission, status, durability, customName, health, boardIndex FROM character_garrison_followers WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_FOLLOWER_ABILITIES_BY_TYPE, "SELECT gfab.dbId, gfab.abilityId FROM character_garrison_follower_abilities gfab INNER JOIN character_garrison_followers gf ON gfab.dbId = gf.dbId WHERE gf.guid = ? AND gf.garrType = ? ORDER BY gfab.slot", CONNECTION_SYNCH);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_MISSIONS_BY_TYPE, "SELECT dbId, guid, missionRecID, offerTime, offerDuration, startTime, travelDuration, missionDuration, missionState, successChance FROM character_garrison_missions WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_SHIPMENTS_BY_TYPE, "SELECT dbId, shipmentId, plotInstanceId, creationTime, duration, assignedFollowerDbId FROM character_garrison_shipments WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_TALENTS_BY_TYPE, "SELECT garrTalentId, `rank`, researchStartTime, flags, soulbindConduitId, soulbindConduitRank FROM character_garrison_talents WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
-    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_TROPHIES_BY_TYPE, "SELECT trophyId FROM character_garrison_trophies WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
+    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_TROPHIES_BY_TYPE, "SELECT trophyInstanceId, trophyId FROM character_garrison_trophies WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
     PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_ARCHIVED_MISSIONS_BY_TYPE, "SELECT garrType, missionRecID FROM character_garrison_archived_missions WHERE guid = ? AND garrType = ?", CONNECTION_SYNCH);
     PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_ARCHIVED_MISSIONS, "DELETE FROM character_garrison_archived_missions WHERE guid = ? AND garrType = ?", CONNECTION_ASYNC);
+
+    // Queen's Conservatory wildseed plots. Loaded synchronously from Garrison::LoadFromDB (covenant sanctum only),
+    // so it follows the same CONNECTION_SYNCH pattern as the other per-garrison-type loads above.
+    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_CONSERVATORY, "SELECT plotId, wildseedEntry, plantedTime, maturesAt, catalyst1, catalyst2, catalyst3, catalyst4, state FROM character_garrison_conservatory WHERE guid = ?", CONNECTION_SYNCH);
+    PrepareStatement(CHAR_INS_CHARACTER_GARRISON_CONSERVATORY, "INSERT INTO character_garrison_conservatory (guid, plotId, wildseedEntry, plantedTime, maturesAt, catalyst1, catalyst2, catalyst3, catalyst4, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_CONSERVATORY, "DELETE FROM character_garrison_conservatory WHERE guid = ?", CONNECTION_ASYNC);
+
+    // Abomination Factory construct stable. Same synchronous covenant-sanctum load path as the Conservatory.
+    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_ABOMINATION, "SELECT recipeSpellId, builtTime FROM character_garrison_abomination_factory WHERE guid = ?", CONNECTION_SYNCH);
+    PrepareStatement(CHAR_INS_CHARACTER_GARRISON_ABOMINATION, "INSERT INTO character_garrison_abomination_factory (guid, recipeSpellId, builtTime) VALUES (?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_ABOMINATION, "DELETE FROM character_garrison_abomination_factory WHERE guid = ?", CONNECTION_ASYNC);
+
+    // Path of Ascension (Kyrian unique sanctum feature, GarrTalentTree 320)
+    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_ASCENSION, "SELECT memoryId, capturedTime, highestTrialWon, lastCompletedTime FROM character_garrison_path_of_ascension WHERE guid = ?", CONNECTION_SYNCH);
+    PrepareStatement(CHAR_INS_CHARACTER_GARRISON_ASCENSION, "INSERT INTO character_garrison_path_of_ascension (guid, memoryId, capturedTime, highestTrialWon, lastCompletedTime) VALUES (?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_ASCENSION, "DELETE FROM character_garrison_path_of_ascension WHERE guid = ?", CONNECTION_ASYNC);
+
+    // The Ember Court (Venthyr unique sanctum feature, GarrTalentTree 324)
+    PrepareStatement(CHAR_SEL_CHARACTER_GARRISON_EMBER_COURT, "SELECT guestIndex, timesHosted, highestMood, lastHostedTime, invited, courtsHeld, lastCourtTime FROM character_garrison_ember_court WHERE guid = ?", CONNECTION_SYNCH);
+    PrepareStatement(CHAR_INS_CHARACTER_GARRISON_EMBER_COURT, "INSERT INTO character_garrison_ember_court (guid, guestIndex, timesHosted, highestMood, lastHostedTime, invited, courtsHeld, lastCourtTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_GARRISON_EMBER_COURT, "DELETE FROM character_garrison_ember_court WHERE guid = ?", CONNECTION_ASYNC);
 
     // Black Market
     PrepareStatement(CHAR_SEL_BLACKMARKET_AUCTIONS, "SELECT marketId, currentBid, time, numBids, bidder FROM blackmarket_auctions", CONNECTION_SYNCH);
@@ -972,9 +999,9 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_UPD_CHARACTER_HOUSING_LEVEL_FAVOR, "UPDATE character_housing SET houseLevel = ?, favor = ? WHERE guid = ?", CONNECTION_ASYNC);
 
     // Neighborhoods
-    PrepareStatement(CHAR_SEL_NEIGHBORHOOD, "SELECT guid, name, neighborhoodMapId, ownerGuid, factionRestriction, isPublic, createTime FROM neighborhoods WHERE guid = ?", CONNECTION_SYNCH);
-    PrepareStatement(CHAR_INS_NEIGHBORHOOD, "INSERT INTO neighborhoods (guid, name, neighborhoodMapId, ownerGuid, factionRestriction, isPublic, createTime) VALUES (?, ?, ?, ?, ?, ?, ?)", CONNECTION_BOTH);
-    PrepareStatement(CHAR_REP_NEIGHBORHOOD, "REPLACE INTO neighborhoods (guid, name, neighborhoodMapId, ownerGuid, factionRestriction, isPublic, createTime) VALUES (?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_NEIGHBORHOOD, "SELECT guid, name, neighborhoodMapId, ownerGuid, factionRestriction, isPublic, createTime, guildId FROM neighborhoods WHERE guid = ?", CONNECTION_SYNCH);
+    PrepareStatement(CHAR_INS_NEIGHBORHOOD, "INSERT INTO neighborhoods (guid, name, neighborhoodMapId, ownerGuid, factionRestriction, isPublic, createTime, guildId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_BOTH);
+    PrepareStatement(CHAR_REP_NEIGHBORHOOD, "REPLACE INTO neighborhoods (guid, name, neighborhoodMapId, ownerGuid, factionRestriction, isPublic, createTime, guildId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_UPD_NEIGHBORHOOD_PUBLIC, "UPDATE neighborhoods SET isPublic = ? WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_UPD_NEIGHBORHOOD_NAME, "UPDATE neighborhoods SET name = ? WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_NEIGHBORHOOD, "DELETE FROM neighborhoods WHERE guid = ?", CONNECTION_ASYNC);
@@ -1055,6 +1082,8 @@ void CharacterDatabaseConnection::DoPrepareStatements()
 
     PrepareStatement(CHAR_SEL_CHARACTER_COVENANT, "SELECT covenantId, soulbindId FROM character_covenant WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_REP_CHARACTER_COVENANT, "REPLACE INTO character_covenant (guid, covenantId, soulbindId) VALUES (?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_CHARACTER_COVENANT_SOULBINDS, "SELECT covenantId, soulbindId FROM character_covenant_soulbind WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_REP_CHARACTER_COVENANT_SOULBIND, "REPLACE INTO character_covenant_soulbind (guid, covenantId, soulbindId) VALUES (?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_SEL_CHARACTER_SOULBIND_CONDUIT, "SELECT conduitId, rankIndex FROM character_soulbind_conduits WHERE guid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_REP_CHARACTER_SOULBIND_CONDUIT, "REPLACE INTO character_soulbind_conduits (guid, conduitId, rankIndex) VALUES (?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_SEL_CHARACTER_SOULBIND_CONDUIT_SOCKET, "SELECT garrTalentId, conduitId, garrTalentTreeId FROM character_soulbind_conduit_sockets WHERE guid = ?", CONNECTION_ASYNC);
@@ -1093,6 +1122,12 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_SEL_ACCOUNT_REPUTATION, "SELECT faction, standing, renownLevel FROM warband_reputation WHERE battlenetAccountId = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_REP_ACCOUNT_REPUTATION, "REPLACE INTO warband_reputation (battlenetAccountId, faction, standing, renownLevel) VALUES (?, ?, ?, ?)", CONNECTION_ASYNC);
 
+    // Phase 10C - renown reward grant tracking
+    PrepareStatement(CHAR_SEL_CHAR_RENOWN_REWARDS_GRANTED, "SELECT renownRewardId FROM character_renown_rewards_granted WHERE characterId = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_INS_CHAR_RENOWN_REWARD_GRANTED, "INSERT IGNORE INTO character_renown_rewards_granted (characterId, renownRewardId) VALUES (?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_WARBAND_RENOWN_REWARDS_GRANTED, "SELECT renownRewardId FROM warband_renown_rewards_granted WHERE battlenetAccountId = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_INS_WARBAND_RENOWN_REWARD_GRANTED, "INSERT IGNORE INTO warband_renown_rewards_granted (battlenetAccountId, renownRewardId) VALUES (?, ?)", CONNECTION_ASYNC);
+
     PrepareStatement(CHAR_SEL_ACCOUNT_CHARACTER_CURRENCIES, "SELECT c.guid, c.name, c.class, c.level, pc.Currency, pc.Quantity FROM characters c INNER JOIN character_currency pc ON c.guid = pc.CharacterGuid WHERE c.battlenetAccount = ? AND c.deleteDate IS NULL", CONNECTION_ASYNC);
     PrepareStatement(CHAR_INS_WARBAND_CURRENCY_TRANSFER_LOG, "INSERT INTO warband_currency_transfer_log (battlenetAccountId, currencyTypeId, sourceCharacterGuid, destCharacterGuid, quantity, timestamp) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_SEL_WARBAND_CURRENCY_TRANSFER_LOG, "SELECT currencyTypeId, sourceCharacterGuid, destCharacterGuid, quantity, timestamp FROM warband_currency_transfer_log WHERE battlenetAccountId = ? ORDER BY timestamp DESC LIMIT 50", CONNECTION_ASYNC);
@@ -1113,6 +1148,24 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_REP_CLUB_FINDER_APPLICATION, "REPLACE INTO club_finder_application (postingId, playerGuid, comment, specs, status, lastUpdatedTime) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_DEL_CLUB_FINDER_APPLICATION, "DELETE FROM club_finder_application WHERE postingId = ? AND playerGuid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_UPD_CLUB_FINDER_POSTING_FLAGS, "UPDATE club_finder_posting SET displayFlags = ? WHERE postingId = ?", CONNECTION_ASYNC);
+
+    PrepareStatement(CHAR_INS_CLUB_MESSAGE, "INSERT INTO club_message (clubId, streamId, epoch, position, authorAccountId, authorGuid, content, createdTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CLUB_MESSAGE_TRIM, "DELETE FROM club_message WHERE clubId = ? AND streamId = ? AND (epoch < ? OR (epoch = ? AND position < ?))", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_REP_CLUB_STREAM_VIEW_MARKER, "REPLACE INTO club_stream_view_marker (clubId, streamId, memberGuid, lastViewTime) VALUES (?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_REP_CLUB_MENTION_VIEW_MARKER, "REPLACE INTO club_mention_view_marker (memberGuid, lastViewTime) VALUES (?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_INS_CLUB_MEMBER_MENTION, "INSERT IGNORE INTO club_member_mention (clubId, streamId, memberGuid, epoch, position, authorGuid, authorAccountId, createdTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CLUB_MEMBER_MENTION, "DELETE FROM club_member_mention WHERE memberGuid = ? AND epoch = ? AND position = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_CHARACTER_COVENANT_CALLINGS, "SELECT covenantId, slot, bountyId, expireTime, refillTime FROM character_covenant_callings WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_COVENANT_CALLINGS, "DELETE FROM character_covenant_callings WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_INS_CHARACTER_COVENANT_CALLINGS, "INSERT INTO character_covenant_callings (guid, covenantId, slot, bountyId, expireTime, refillTime) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+
+    // Character deletion. TC recycles character GUIDs, so every guid-keyed covenant table needs a purge here or
+    // a new character can inherit the deleted one's covenant history (see Player::DeleteFromDB).
+    PrepareStatement(CHAR_DEL_CHARACTER_COVENANT, "DELETE FROM character_covenant WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_COVENANT_RENOWN, "DELETE FROM character_covenant_renown WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_COVENANT_SOULBIND, "DELETE FROM character_covenant_soulbind WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_SOULBIND_CONDUITS, "DELETE FROM character_soulbind_conduits WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_CHARACTER_SOULBIND_CONDUIT_SOCKETS, "DELETE FROM character_soulbind_conduit_sockets WHERE guid = ?", CONNECTION_ASYNC);
 }
 
 CharacterDatabaseConnection::CharacterDatabaseConnection(MySQLConnectionInfo& connInfo, ConnectionFlags connectionFlags) : MySQLConnection(connInfo, connectionFlags)

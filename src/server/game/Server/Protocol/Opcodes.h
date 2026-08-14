@@ -1176,6 +1176,11 @@ enum OpcodeServer : uint32
     SMSG_ACCOUNT_TOY_UPDATE                                         = 0x420048,
     SMSG_ACCOUNT_TRANSMOG_SET_FAVORITES_UPDATE                      = 0x420050,
     SMSG_ACCOUNT_TRANSMOG_UPDATE                                    = 0x42004F,
+    // 68887/68974 additions to the account-collection-update family; observed once each in the login
+    // stream of the 68974 tester capture (small id lists; see C:\dumps\TESTER_SNIFF_68974_MINE.md).
+    // Collection type unidentified - provisional names until a newer-client reflection dump names them.
+    SMSG_ACCOUNT_UNKNOWN_COLLECTION_UPDATE_1                        = 0x420051,
+    SMSG_ACCOUNT_UNKNOWN_COLLECTION_UPDATE_2                        = 0x420058,
     SMSG_ACCOUNT_WARBAND_SCENE_UPDATE                               = 0x420052,
     SMSG_ACHIEVEMENT_DELETED                                        = 0x420191,
     SMSG_ACHIEVEMENT_EARNED                                         = 0x4200EB,
@@ -1270,6 +1275,10 @@ enum OpcodeServer : uint32
     SMSG_BATTLE_PAY_BATTLE_PET_DELIVERED                            = 0x420222,
     SMSG_BATTLE_PAY_COLLECTION_ITEM_DELIVERED                       = 0x420223,
     SMSG_BATTLE_PAY_CONFIRM_PURCHASE                                = 0x420232,
+    // 68887/68974 addition, next value after the delivery family. Nine at login in the 68974 tester
+    // capture, each carrying a grant display string ("500 Tender", "Bananas", ...) - Trading Post
+    // tender/item grant toasts. Provisional name; layout partially unknown (see TESTER_SNIFF_68974_MINE.md).
+    SMSG_BATTLE_PAY_TENDER_GRANTED                                  = 0x420224,
     SMSG_BATTLE_PAY_DELIVERY_ENDED                                  = 0x420220,
     SMSG_BATTLE_PAY_DELIVERY_STARTED                                = 0x42021F,
     SMSG_BATTLE_PAY_DISTRIBUTION_ASSIGN_VAS_RESPONSE                = 0x420316,
@@ -1867,12 +1876,30 @@ enum OpcodeServer : uint32
     SMSG_LFG_LIST_SEARCH_RESULTS                                    = 0x560002,
     SMSG_LFG_LIST_SEARCH_RESULTS_UPDATE                             = 0x560010,
     SMSG_LFG_LIST_SEARCH_STATUS                                     = 0x560003,
-    SMSG_HOUSING_CATALOG_STATE_SYNC                                 = 0x56000E, // ClientMirrorSystem subgroup; sniff-verified owner of 0x56000E (12.0.7 housing capture: ~4KB server->client payload, x2)
-    // 0x56000E RESOLVED to housing (2026-07): the live 12.0.7 housing sniff shows a ~4KB ClientMirrorSystem
-    // bulk-sync payload on 0x56000E, which is the wrong order of magnitude for the tiny LFG blacklist delta.
-    // TC master's SMSG_LFG_LIST_UPDATE_BLACKLIST = 0x56000E is therefore a stale/mislabeled value; parked on
-    // UNKNOWN_OPCODE below until a dedicated LFG-list sniff yields its real opcode. Send-site is disabled.
-    SMSG_LFG_LIST_UPDATE_BLACKLIST                                  = UNKNOWN_OPCODE,
+    // 0x56000E is SMSG_LFG_LIST_UPDATE_BLACKLIST, matching upstream master. The 2026-05-11 "reclaim"
+    // of this value for SMSG_HOUSING_CATALOG_STATE_SYNC was a misidentification and is reverted here;
+    // the housing name is parked on UNKNOWN_OPCODE in the TC-CUSTOM block below. Evidence:
+    //  * Request/reply pairing is exact across 9 captures spanning builds 68275/68453/68974:
+    //    38 x CMSG_REQUEST_LFG_LIST_BLACKLIST (0x3A0183) <-> 38 x SMSG 0x56000E, and 0x56000E never
+    //    appears in any capture without a matching blacklist request.
+    //  * Every observed body satisfies size == 4 + 4 + count*8 exactly, i.e. uint32 count followed by
+    //    count * {uint32 GroupFinderActivityID, uint32 Reason}: 68275 count=506 (4056 B, housing12.0.7.pkt,
+    //    "m+ run12.0.7.pkt", "rated BG 12.0.7.pkt"), 507 (4064 B, ingame-shop capture), 68453 count=1085
+    //    (8688 B, garrisonlevel2upgrade.pkt), 68974 count=456 (3656 B,
+    //    dump_12.0.7.68974_2026-08-07_21-54-14.pkt). Activity IDs are unique and ascending; Reason is
+    //    always drawn from the small set {1,2,3,10,18,19}; no row is implausible as an activity id.
+    //  * The "~4KB ClientMirrorSystem bulk-sync payload" cited as proof of housing ownership IS this packet:
+    //    the 0x56000E record in housing12.0.7.pkt is 4056 B whose leading pairs decode to
+    //    (14,3) (15,3) (22,19) - the exact first rows of the LFG activity blacklist. The old comment's own
+    //    wire description ("uint32 count + count*(uint32 ID, uint32 PackedState)") is that same layout,
+    //    correctly decoded but mislabeled.
+    //  * C:/dumps/OPCODES_MASTER_12_0_7_68275.json: group 0x56 is a contiguous LFG/DF block
+    //    (0x560000..0x560021, 34 entries, all subsystem LFG) containing ZERO housing opcodes. Housing SMSG
+    //    live in groups 0x54 (28), 0x5C (19), 0x33 (16), 0x39 (15) etc, and housing12.0.7.pkt confirms this
+    //    at runtime: its housing traffic is on 0x54/0x55/0x5C, never 0x56.
+    //  * No client opcode named *_CATALOG_STATE_SYNC exists in the 68275 client at all;
+    //    SMSG_HOUSING_CATALOG_STATE_SYNC is a TC-invented name with no client counterpart.
+    SMSG_LFG_LIST_UPDATE_BLACKLIST                                  = 0x56000E,
     SMSG_LFG_LIST_UPDATE_EXPIRATION                                 = 0x56000B,
     SMSG_LFG_LIST_UPDATE_STATUS                                     = 0x56000A,
     SMSG_LFG_OFFER_CONTINUE                                         = 0x560018,
@@ -2587,9 +2614,15 @@ enum OpcodeServer : uint32
     //     UpdateField mechanism. Client fires HOUSE_PLOT_ENTERED via field-change
     //     callback when CurrentHouse changes (verified via IDA xref trace of
     //     sub_7FF75CC8BAA0 registered in the field-change callback table).
-    // SMSG_HOUSING_CATALOG_STATE_SYNC retired here 2026-05-11, real opcode 0x56000E reclaimed
-    // (previously mislabeled as SMSG_LFG_LIST_UPDATE_BLACKLIST per the LFG opcode block).
-    // Retired 2026-05-11: 5 speculative SMSGs (0xF1000003..0xF1000007) â€” Lua-API-confirmed dead.
+    // SMSG_HOUSING_CATALOG_STATE_SYNC: the 2026-05-11 note here claimed 0x56000E was "reclaimed" from a
+    // supposedly mislabeled SMSG_LFG_LIST_UPDATE_BLACKLIST. That was backwards - 0x56000E really is the
+    // LFG blacklist (see the evidence block at the SMSG_LFG_LIST_UPDATE_BLACKLIST line above), so the
+    // value has been returned to it and this name is parked on UNKNOWN_OPCODE. Parking is free: the
+    // HousingCatalogStateSync class is constructed by Housing::BuildCatalogStateSync but nothing calls
+    // Build and there is no send site anywhere in the tree, so nothing regresses. If a real
+    // catalog-state-sync SMSG is ever identified from a capture, give it that verified value here.
+    SMSG_HOUSING_CATALOG_STATE_SYNC                                 = UNKNOWN_OPCODE,
+    // Retired 2026-05-11: 5 speculative SMSGs (0xF1000003..0xF1000007) — Lua-API-confirmed dead.
     // No C_HousingDecor.BatchOperation/PlacementPreview/CreateCatalogSearcher; StartPlacingNewDecor
     // is fire-and-forget; GetHouseEditorAvailability returns sync. None correspond to a retail SMSG.
     // Retired 2026-05-11: 9 speculative SMSG opcodes deleted (0xF1000008..0xF1000010).
@@ -2620,13 +2653,21 @@ enum OpcodeServer : uint32
     // SMSG_INITIATIVE_REWARD_AVAILABLE (0x42036B), plus entity-fragment updates.
 };
 
-inline constexpr std::size_t NUM_SMSG_OPCODES = 1654;
+// 1654 was the old end of the table. Three groups are appended past it: 0x40 (843 slots, 1654-2496),
+// 0x58 (55, 2497-2551) and 0x5C (51, 2552-2602). The slots the latter two used to occupy at 1300 and
+// 1437 are simply left unused - reclaiming them would mean moving every group base after them.
+inline constexpr std::size_t NUM_SMSG_OPCODES = 2603;
 
 inline constexpr std::ptrdiff_t GetOpcodeArrayIndex(OpcodeServer opcode)
 {
     uint32 idInGroup = opcode & 0xFFFF;
     switch (opcode >> 16)
     {
+        // Group 0x40 had no server-side case at all, so every SMSG in it returned -1 and could not be
+        // registered - including SMSG_FEATURE_SYSTEM_STATUS2 (0x40034A, id 842), the four
+        // SMSG_ACCOUNT_HOUSING_* packets and the three WoW Labs ones. Its block is appended past the
+        // old end of the array (1653 + 1) so no existing group base moves.
+        case 0x40: return idInGroup < 843 ? idInGroup + 1654 : -1;
         case 0x42: return idInGroup < 901 ? idInGroup +    0 : -1;
         case 0x43: return idInGroup <   5 ? idInGroup +  901 : -1;
         case 0x46: return idInGroup <  20 ? idInGroup +  906 : -1;
@@ -2643,10 +2684,22 @@ inline constexpr std::ptrdiff_t GetOpcodeArrayIndex(OpcodeServer opcode)
         case 0x54: return idInGroup <  36 ? idInGroup + 1222 : -1;
         case 0x55: return idInGroup <   8 ? idInGroup + 1258 : -1;
         case 0x56: return idInGroup <  34 ? idInGroup + 1266 : -1;
-        case 0x58: return idInGroup <   1 ? idInGroup + 1300 : -1;
+        // The widening to 55 was a mistake and the reason recorded for it was wrong: it claimed to be making
+        // room for SMSG_MOVE_SET_CANT_SWIM / SMSG_MOVE_UNSET_CANT_SWIM at ids 53/54. Those opcodes are
+        // SMSG_MOVE_SET_CANNOT_SWIM (0x5A0037) and SMSG_MOVE_UNSET_CANNOT_SWIM (0x5A0038) - group 0x5A,
+        // ids 55/56, already covered by the 0x5A case below. Group 0x58 holds exactly one opcode,
+        // SMSG_UPDATE_OBJECT (id 0), so slots 2498-2551 are permanently empty. Harmless (an unused slot just
+        // reports "non existing handler"), left in place only because shrinking it moves the 0x5C base.
+        case 0x58: return idInGroup <  55 ? idInGroup + 2497 : -1;
         case 0x5A: return idInGroup < 130 ? idInGroup + 1301 : -1;
         case 0x5B: return idInGroup <   6 ? idInGroup + 1431 : -1;
-        case 0x5C: return idInGroup <  20 ? idInGroup + 1437 : -1;
+        // Same mistake as 0x58 above: the recorded reason was making room for
+        // SMSG_TAKE_SCREENSHOT_FOR_COMPLAINT at id 50, but no such opcode exists. The screenshot opcodes are
+        // SMSG_PLAYER_UPLOAD_SCREENSHOT (0x5F0032) and SMSG_PLAYER_DELAYED_UPLOAD_SCREENSHOT (0x5F0033) -
+        // group 0x5F, ids 50/51, already covered by the 0x5F case below. Group 0x5C is the neighbourhood
+        // block, 19 opcodes with a highest id of 0x13, so the original cap of 20 was correct and slots
+        // 2572-2602 are permanently empty. Harmless, kept only to avoid renumbering.
+        case 0x5C: return idInGroup <  51 ? idInGroup + 2552 : -1;
         case 0x5E: return idInGroup <   8 ? idInGroup + 1457 : -1;
         case 0x5F: return idInGroup <  52 ? idInGroup + 1465 : -1;
         case 0x60: return idInGroup <  41 ? idInGroup + 1517 : -1;
