@@ -226,7 +226,13 @@ void OpcodeTable::InitializeClientOpcodes()
     DEFINE_HANDLER(CMSG_BATTLE_PAY_DISTRIBUTION_ASSIGN_VAS,                 STATUS_IGNORED,   PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_GET_PRODUCT_LIST,                        STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayGetProductList);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_GET_PURCHASE_LIST,                       STATUS_AUTHED,     PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayGetPurchaseList);
-    DEFINE_HANDLER(CMSG_BATTLE_PAY_OPEN_CHECKOUT,                           STATUS_LOGGEDIN,  PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayOpenCheckout);
+    // STATUS_AUTHED like every other CMSG_BATTLE_PAY_*: the Shop opens at CHARACTER SELECT too, and
+    // this branch's purchase path has a whole no-player branch for buying there. STATUS_LOGGEDIN meant
+    // pressing Buy on the glue screen was answered with "Received not allowed opcode" and no SSO token,
+    // i.e. the checkout could never start. The handler needs no Player - it echoes the request's
+    // ClientToken back in SMSG_GENERATE_SSO_TOKEN_RESPONSE, which is itself CONNECTION_TYPE_REALM and so
+    // is deliverable at character select.
+    DEFINE_HANDLER(CMSG_BATTLE_PAY_OPEN_CHECKOUT,                           STATUS_AUTHED,    PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayOpenCheckout);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_REQUEST_PRICE_INFO,                      STATUS_IGNORED,   PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_START_PURCHASE,                          STATUS_AUTHED,     PROCESS_THREADUNSAFE, &WorldSession::HandleBattlePayStartPurchase);
     DEFINE_HANDLER(CMSG_BATTLE_PAY_START_VAS_PURCHASE,                      STATUS_IGNORED,   PROCESS_THREADUNSAFE, &WorldSession::Handle_NULL);
@@ -1445,8 +1451,15 @@ void OpcodeTable::InitializeServerOpcodes()
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMENTATOR_PLAYER_INFO,                                      STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMENTATOR_STATE_CHANGED,                                    STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_COUNT_RESPONSE,                            STATUS_NEVER,       CONNECTION_TYPE_REALM);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_LOG_RESPONSE,                              STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
-    DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_MARKET_PRICE_RESPONSE,                     STATUS_NEVER,       CONNECTION_TYPE_INSTANCE);
+    // REALM, not INSTANCE. WorldSession::SendPacket routes by the connection index declared here and
+    // DROPS the packet if that socket does not exist, so an INSTANCE-routed answer only ever arrives
+    // for a session that has finished establishing its instance connection. Both of these are 1:1
+    // answers to requests that arrive on the REALM socket, both feed the same account-scoped WoW Token
+    // UI as SMSG_COMMERCE_TOKEN_GET_COUNT_RESPONSE and SMSG_COMMERCE_TOKEN_UPDATE - which are already
+    // REALM - and neither carries anything world- or instance-scoped. They were simply the two members
+    // of the family that were declared inconsistently.
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_LOG_RESPONSE,                              STATUS_NEVER,       CONNECTION_TYPE_REALM);
+    DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_GET_MARKET_PRICE_RESPONSE,                     STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMMERCE_TOKEN_UPDATE,                                        STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMPLAINT_RESULT,                                             STATUS_NEVER,       CONNECTION_TYPE_REALM);
     DEFINE_SERVER_OPCODE_HANDLER(SMSG_COMPLETE_SHIPMENT_RESPONSE,                                   STATUS_UNHANDLED,   CONNECTION_TYPE_REALM);
