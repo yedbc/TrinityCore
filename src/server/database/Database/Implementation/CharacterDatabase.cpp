@@ -844,6 +844,21 @@ void CharacterDatabaseConnection::DoPrepareStatements()
     PrepareStatement(CHAR_DEL_CHARACTER_BANK_TAB_SETTINGS, "DELETE FROM character_bank_tab_settings WHERE characterGuid = ?", CONNECTION_ASYNC);
     PrepareStatement(CHAR_INS_CHARACTER_BANK_TAB_SETTINGS, "INSERT INTO character_bank_tab_settings (characterGuid, tabId, name, icon, description, depositFlags) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
     PrepareStatement(CHAR_SEL_ACCOUNT_TOTAL_MONEY, "SELECT SUM(money) FROM characters WHERE account = ? AND deleteDate IS NULL", CONNECTION_ASYNC);
+
+    // In-game Shop character boost. The target is offline (this runs at character select), so the
+    // level, the specialization, the starter kit and the character-select visual all have to be
+    // written straight to the tables the login/enum paths read back.
+    // inventorySlots is how many backpack slots that character actually has unlocked; the boost may not
+    // place anything beyond it, or the items would sit in slots the client cannot show.
+    PrepareStatement(CHAR_SEL_SHOP_BOOST_TARGET, "SELECT account, class, race, level, inventorySlots FROM characters WHERE guid = ? AND deleteInfos_Name IS NULL", CONNECTION_ASYNC);
+    // bag = 0 is the character's own slot space: equipment, the bag/reagent-bag slots and the
+    // backpack. The item entry comes along because the character-select equipment cache is written
+    // from item ENTRIES, and the pieces the kit does not replace have to survive in it.
+    PrepareStatement(CHAR_SEL_SHOP_BOOST_INVENTORY, "SELECT ci.slot, ci.item, ii.itemEntry FROM character_inventory ci INNER JOIN item_instance ii ON ii.guid = ci.item WHERE ci.guid = ? AND ci.bag = 0", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_UPD_SHOP_BOOST_CHARACTER, "UPDATE characters SET level = ?, xp = 0, primarySpecialization = ? WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_REP_SHOP_BOOST, "REPLACE INTO character_shop_boost (guid, productId, distributionId, specializationId, trial, boostedAt) VALUES (?, ?, ?, ?, ?, ?)", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_DEL_SHOP_BOOST, "DELETE FROM character_shop_boost WHERE guid = ?", CONNECTION_ASYNC);
+    PrepareStatement(CHAR_SEL_SHOP_BOOST_ACCOUNT, "SELECT b.guid, b.trial FROM character_shop_boost b INNER JOIN characters c ON c.guid = b.guid WHERE c.account = ?", CONNECTION_ASYNC);
 }
 
 CharacterDatabaseConnection::CharacterDatabaseConnection(MySQLConnectionInfo& connInfo, ConnectionFlags connectionFlags) : MySQLConnection(connInfo, connectionFlags)

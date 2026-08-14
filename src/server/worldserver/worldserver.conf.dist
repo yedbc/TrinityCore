@@ -4604,6 +4604,41 @@ Shop.Entitlements.Enabled = 0
 Shop.Entitlements.AssignEnabled = 0
 
 #
+#    Shop.CharacterBoost.Level
+#        Description: The level a character boost takes a character to.
+#
+#                     A boost is a shop_product carrying a type-5 (service) deliverable whose id is 1
+#                     (CharacterBoost). Buying it creates an entitlement; the player then applies it to
+#                     one of their characters from the character-selection screen, and the server writes
+#                     that character's new level, its chosen specialization, and the starter kit
+#                     CharacterLoadout.db2 ships for the boost purpose - all while it is logged out.
+#
+#                     There is no "correct" value to derive: how far ahead a boost puts a character is a
+#                     realm policy decision. The value is clamped to MaxPlayerLevel, and a boost is
+#                     refused outright for a character that is already at or above it.
+#
+#                     Requires the 2026_08_15_00_characters.sql migration (character_shop_boost) and
+#                     Shop.Entitlements.Enabled + Shop.Entitlements.AssignEnabled.
+#        Default:     80
+#        Minimum:     2
+
+Shop.CharacterBoost.Level = 80
+
+#
+#    Shop.CharacterBoost.BoostType
+#        Description: The boost type the glue screen is told about (FeatureSystemStatusGlueScreen's
+#                     ActiveBoostType / TrialBoostType), sent while the account owns an unapplied boost.
+#
+#                     This is not a free choice: the client matches it against the BoostID carried by
+#                     the CharacterBoost deliverable in the catalog, and 11 is the value the shipped
+#                     12.0.7.68275 catalog template carries (see BattlePayPackets.h - catalog
+#                     deliverable 1161, "type = 1 CharacterBoost, boostID = 11"). Change it only
+#                     alongside a catalog whose boost deliverable carries a different BoostID.
+#        Default:     11
+
+Shop.CharacterBoost.BoostType = 11
+
+#
 #    Shop.PlaceholderName
 #        Description: Card title used for a catalog slot that has no shop_product row routed to it.
 #                     The 68275 catalog template ships nine fixed "simple shape" slots; any slot the

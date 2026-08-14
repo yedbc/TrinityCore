@@ -20,8 +20,13 @@
 #include "Config.h"
 #include "ConditionMgr.h"
 #include "DatabaseEnv.h"
+#include "DB2Stores.h"
+#include "DBCEnums.h"
 #include "GameTime.h"
+#include "Item.h"
+#include "ItemTemplate.h"
 #include "Log.h"
+#include "ObjectMgr.h"
 #include "Player.h"
 #include "Random.h"
 #include "Realm.h"
@@ -29,9 +34,14 @@
 #include "Shop2Service.h"
 #include "StringFormat.h"
 #include "Timer.h"
+#include "TransmogMgr.h"
 #include "World.h"
 #include <algorithm>
+#include <array>
 #include <fstream>
+#include <memory>
+#include <set>
+#include <utility>
 
 namespace
 {
@@ -43,6 +53,138 @@ namespace
     {
         return (p.AvailableFrom == 0 || now >= p.AvailableFrom)
             && (p.AvailableUntil == 0 || now <= p.AvailableUntil);
+    }
+
+    // ---- Character boost kit -------------------------------------------------------------------------
+    //
+    // The kit is not invented here: it is whatever CharacterLoadout.db2 already ships for the boost
+    // purpose. These two numbers only IDENTIFY those rows - Purpose 23 is the boost purpose (9 is the
+    // new-character purpose CharacterLoadoutEntry::IsForNewCharacter() already names) and the boost
+    // ItemContext is the one the client stamps on boost-granted items so their bonus lists scale.
+    // Every candidate row is still validated against the target's class and race before it is used, and
+    // if the client data carries no such row the boost fails rather than inventing gear.
+    constexpr int32 SHOP_BOOST_LOADOUT_PURPOSE = 23;
+    constexpr ItemContext SHOP_BOOST_ITEM_CONTEXT = ItemContext::Character_Boost_Shadowlands_50;
+
+    bool IsBoostLoadoutFor(CharacterLoadoutEntry const* loadout, uint8 classId, uint8 raceId)
+    {
+        return loadout
+            && loadout->Purpose == SHOP_BOOST_LOADOUT_PURPOSE
+            && ItemContext(loadout->ItemContext) == SHOP_BOOST_ITEM_CONTEXT
+            && uint8(loadout->ChrClassID) == classId
+            && (loadout->RaceMask.IsEmpty() || loadout->RaceMask.HasRace(raceId));
+    }
+
+    CharacterLoadoutEntry const* SelectBoostLoadout(uint8 classId, uint8 raceId)
+    {
+        // Lowest ID wins so the choice is stable across restarts and across realms; there is no
+        // per-specialization loadout to pick from at this purpose, only per class (and sometimes race).
+        CharacterLoadoutEntry const* best = nullptr;
+        for (CharacterLoadoutEntry const* loadout : sCharacterLoadoutStore)
+            if (IsBoostLoadoutFor(loadout, classId, raceId) && (!best || loadout->ID < best->ID))
+                best = loadout;
+
+        return best;
+    }
+
+    // The equipment slots an item of this inventory type can occupy, in preference order. Empty means
+    // the item is not equipment and belongs in the backpack.
+    std::vector<uint8> GetEquipmentSlotsFor(ItemTemplate const* proto)
+    {
+        switch (proto->GetInventoryType())
+        {
+            case INVTYPE_HEAD:              return { EQUIPMENT_SLOT_HEAD };
+            case INVTYPE_NECK:              return { EQUIPMENT_SLOT_NECK };
+            case INVTYPE_SHOULDERS:         return { EQUIPMENT_SLOT_SHOULDERS };
+            case INVTYPE_BODY:              return { EQUIPMENT_SLOT_BODY };
+            case INVTYPE_CHEST:
+            case INVTYPE_ROBE:              return { EQUIPMENT_SLOT_CHEST };
+            case INVTYPE_WAIST:             return { EQUIPMENT_SLOT_WAIST };
+            case INVTYPE_LEGS:              return { EQUIPMENT_SLOT_LEGS };
+            case INVTYPE_FEET:              return { EQUIPMENT_SLOT_FEET };
+            case INVTYPE_WRISTS:            return { EQUIPMENT_SLOT_WRISTS };
+            case INVTYPE_HANDS:             return { EQUIPMENT_SLOT_HANDS };
+            case INVTYPE_FINGER:            return { EQUIPMENT_SLOT_FINGER1, EQUIPMENT_SLOT_FINGER2 };
+            case INVTYPE_TRINKET:           return { EQUIPMENT_SLOT_TRINKET1, EQUIPMENT_SLOT_TRINKET2 };
+            case INVTYPE_CLOAK:             return { EQUIPMENT_SLOT_BACK };
+            case INVTYPE_TABARD:            return { EQUIPMENT_SLOT_TABARD };
+            case INVTYPE_SHIELD:
+            case INVTYPE_WEAPONOFFHAND:
+            case INVTYPE_HOLDABLE:          return { EQUIPMENT_SLOT_OFFHAND };
+            case INVTYPE_WEAPONMAINHAND:    return { EQUIPMENT_SLOT_MAINHAND };
+            case INVTYPE_2HWEAPON:          return { EQUIPMENT_SLOT_MAINHAND };
+            case INVTYPE_WEAPON:            return { EQUIPMENT_SLOT_MAINHAND, EQUIPMENT_SLOT_OFFHAND };
+            case INVTYPE_RANGED:
+            case INVTYPE_RANGEDRIGHT:       return { EQUIPMENT_SLOT_MAINHAND };
+            default:                        return { };
+        }
+    }
+
+    // Rewrites `character_select_screen_equipment_cache` for an offline character.
+    //
+    // This cache - not `character_inventory` - is what CHAR_SEL_ENUM joins to fill the VisibleItems of
+    // the character-selection model, and the core's only other writer is
+    // Player::_SaveCharacterSelectOutfit, which runs on a LOGIN SAVE. A boost applied at the glue screen
+    // never passes through that, so without this the boosted character would go on showing its old,
+    // pre-boost gear on the selection screen until it had been played once.
+    //
+    // Transmog is deliberately not consulted: the character is offline, so there is no active outfit to
+    // read, and the default appearance of what it now wears is the honest answer.
+    void WriteCharacterSelectEquipment(ObjectGuid characterGuid,
+        std::array<uint32, EQUIPMENT_SLOT_END> const& equippedItemIds, CharacterDatabaseTransaction trans)
+    {
+        CharacterDatabasePreparedStatement* del = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CHARACTER_SELECT_EQUIPMENT_CACHE_CUSTOMIZATIONS);
+        del->setUInt64(0, characterGuid.GetCounter());
+        trans->Append(del);
+
+        CharacterDatabasePreparedStatement* ins = CharacterDatabase.GetPreparedStatement(CHAR_INS_CHARACTER_SELECT_EQUIPMENT_CACHE_CUSTOMIZATIONS);
+        ins->setUInt64(0, characterGuid.GetCounter());
+
+        for (uint8 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            uint32 const itemId = equippedItemIds[slot];
+            uint32 visibleItemId = 0;
+            uint8 subClass = 0;
+            uint8 inventoryType = uint8(INVTYPE_NON_EQUIP);
+            int32 displayId = 0;
+
+            if (itemId)
+            {
+                if (ItemModifiedAppearanceEntry const* appearance = TransmogMgr::GetDefaultItemModifiedAppearance(itemId))
+                {
+                    if (ItemEntry const* itemEntry = sItemStore.LookupEntry(appearance->ItemID))
+                    {
+                        visibleItemId = itemEntry->ID;
+                        subClass = itemEntry->SubclassID;
+                        inventoryType = uint8(itemEntry->InventoryType);
+                    }
+
+                    if (ItemAppearanceEntry const* itemAppearance = sItemAppearanceStore.LookupEntry(appearance->ItemAppearanceID))
+                        displayId = itemAppearance->ItemDisplayInfoID;
+                }
+                else if (ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId))
+                {
+                    // No appearance record (a container, a non-transmoggable item): the client still
+                    // wants the item's own identity, it just has nothing to draw for it.
+                    visibleItemId = itemId;
+                    subClass = uint8(proto->GetSubClass());
+                    inventoryType = uint8(proto->GetInventoryType());
+                }
+            }
+
+            // The same eight columns per slot, in the same order, as Player::_SaveCharacterSelectOutfit.
+            uint8 const base = 1 + (slot * 8);
+            ins->setUInt32(base + 0, itemId);
+            ins->setUInt32(base + 1, visibleItemId);
+            ins->setUInt8(base + 2, subClass);
+            ins->setUInt8(base + 3, inventoryType);
+            ins->setUInt32(base + 4, uint32(displayId));
+            ins->setUInt32(base + 5, 0);                    // DisplayEnchantID: offline, no illusion applied
+            ins->setInt32(base + 6, 0);                     // SecondaryItemModifiedAppearanceID
+            ins->setUInt8(base + 7, 0);                     // SheatheCategory
+        }
+
+        trans->Append(ins);
     }
 }
 
@@ -280,6 +422,201 @@ bool BattlePayMgr::TransitionEntitlement(uint64 distributionId, uint8 fromStatus
 
     Field* fields = result->Fetch();
     return fields[3].GetUInt8() == toStatus && fields[4].GetUInt64() == toToken;
+}
+
+uint8 BattlePayMgr::GetCharacterBoostLevel()
+{
+    uint32 const configured = sWorld->getIntConfig(CONFIG_SHOP_CHARACTER_BOOST_LEVEL);
+    uint32 const maxLevel = sWorld->getIntConfig(CONFIG_MAX_PLAYER_LEVEL);
+    return uint8(std::min(configured, maxLevel));
+}
+
+int32 BattlePayMgr::GetCharacterBoostType()
+{
+    return int32(sWorld->getIntConfig(CONFIG_SHOP_CHARACTER_BOOST_TYPE));
+}
+
+bool BattlePayMgr::IsCharacterBoostProduct(ShopProduct const& product)
+{
+    return GetServiceType(product) == SHOP_SERVICE_CHARACTER_BOOST;
+}
+
+// Turns an offline character into a boosted one, as one transaction the caller commits.
+//
+// NOTHING IS DELETED. The original equipment is displaced into free backpack slots rather than
+// destroyed, because a boost that eats the gear a player levelled in is a bug report we can never
+// answer. That is also why the whole placement is decided in memory FIRST and the function bails out
+// with an empty transaction if it does not fit: a half-placed kit would be worse than no kit.
+//
+// Statement order inside the transaction matters. `character_inventory` carries a UNIQUE key on
+// (guid, bag, slot), so the displaced originals are moved to their (already free) backpack slots
+// BEFORE the kit is written into the equipment slots they just vacated. At no point do two rows claim
+// the same slot, so no REPLACE ever silently deletes another item's row.
+CharacterDatabaseTransaction BattlePayMgr::BuildCharacterBoostTransaction(ShopBoostTarget const& target,
+    uint32 specializationId, uint64 distributionId, uint32 productId) const
+{
+    CharacterLoadoutEntry const* loadout = SelectBoostLoadout(target.ClassId, target.RaceId);
+    if (!loadout)
+    {
+        TC_LOG_ERROR("network", "BattlePay: no CharacterLoadout with purpose {} / item context {} for class {} race {}; "
+            "cannot boost {}.", SHOP_BOOST_LOADOUT_PURPOSE, uint32(SHOP_BOOST_ITEM_CONTEXT),
+            target.ClassId, target.RaceId, target.Guid.ToString());
+        return nullptr;
+    }
+
+    std::vector<uint32> kit;
+    for (CharacterLoadoutItemEntry const* row : sCharacterLoadoutItemStore)
+        if (row->CharacterLoadoutID == loadout->ID)
+            kit.push_back(row->ItemID);
+
+    if (kit.empty())
+    {
+        TC_LOG_ERROR("network", "BattlePay: CharacterLoadout {} has no items; cannot boost {}.",
+            loadout->ID, target.Guid.ToString());
+        return nullptr;
+    }
+
+    // ---- Plan the placement in memory ---------------------------------------------------------------
+    std::set<uint8> occupied;
+    for (auto const& ownSlot : target.OwnSlots)
+        occupied.insert(ownSlot.first);
+
+    // Only the backpack slots this character has actually unlocked - writing past inventorySlots would
+    // put items where the client has no slot to draw, and the login inventory load would have to rescue
+    // them by mail.
+    uint8 const backpackEnd = uint8(std::min<uint32>(uint32(INVENTORY_SLOT_ITEM_START) + target.BackpackSlots,
+        uint32(INVENTORY_SLOT_ITEM_END)));
+    auto takeBackpackSlot = [&occupied, backpackEnd]() -> uint8
+    {
+        for (uint8 slot = INVENTORY_SLOT_ITEM_START; slot < backpackEnd; ++slot)
+            if (occupied.insert(slot).second)
+                return slot;
+        return NULL_SLOT;
+    };
+
+    std::vector<std::pair<uint64, uint8>> moves;             // item guid -> new backpack slot
+    std::vector<std::pair<uint32, uint8>> placements;        // kit item id -> slot
+    std::array<uint32, EQUIPMENT_SLOT_END> visibleItems = { };
+    for (auto const& [slot, occupant] : target.OwnSlots)
+        if (slot < EQUIPMENT_SLOT_END)
+            visibleItems[slot] = occupant.ItemId;
+
+    for (uint32 itemId : kit)
+    {
+        ItemTemplate const* proto = sObjectMgr->GetItemTemplate(itemId);
+        if (!proto)
+        {
+            TC_LOG_ERROR("network", "BattlePay: CharacterLoadout {} names item {}, which has no template; "
+                "cannot boost {}.", loadout->ID, itemId, target.Guid.ToString());
+            return nullptr;
+        }
+
+        uint8 chosen = NULL_SLOT;
+        for (uint8 slot : GetEquipmentSlotsFor(proto))
+        {
+            // Free slot: take it. Occupied slot: take it too, but only by moving what is there into
+            // the backpack first - and only if the backpack has room, otherwise try the next slot.
+            if (occupied.insert(slot).second)
+            {
+                chosen = slot;
+                break;
+            }
+
+            auto const occupant = target.OwnSlots.find(slot);
+            if (occupant == target.OwnSlots.end())
+                continue;                                   // already re-used by an earlier kit piece
+
+            if (std::any_of(moves.begin(), moves.end(),
+                [&](std::pair<uint64, uint8> const& move) { return move.first == occupant->second.ItemGuid; }))
+                continue;                                   // already displaced by an earlier kit piece
+
+            uint8 const spare = takeBackpackSlot();
+            if (spare == NULL_SLOT)
+                continue;
+
+            moves.emplace_back(occupant->second.ItemGuid, spare);
+            // It is no longer worn, so it leaves the character-select look; the kit piece that took its
+            // place puts its own item id back in below.
+            if (slot < EQUIPMENT_SLOT_END)
+                visibleItems[slot] = 0;
+            chosen = slot;
+            break;
+        }
+
+        if (chosen == NULL_SLOT)
+            chosen = takeBackpackSlot();                    // not equipment, or every candidate slot lost
+
+        if (chosen == NULL_SLOT)
+        {
+            TC_LOG_ERROR("network", "BattlePay: {} has no room for the boost kit (loadout {}); the boost was "
+                "not applied.", target.Guid.ToString(), loadout->ID);
+            return nullptr;
+        }
+
+        placements.emplace_back(itemId, chosen);
+        if (chosen < EQUIPMENT_SLOT_END)
+            visibleItems[chosen] = itemId;
+    }
+
+    // ---- Write it -----------------------------------------------------------------------------------
+    CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+
+    for (auto const& [itemGuid, newSlot] : moves)
+    {
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_INVENTORY_ITEM);
+        stmt->setUInt64(0, target.Guid.GetCounter());
+        stmt->setUInt64(1, UI64LIT(0));
+        stmt->setUInt8(2, newSlot);
+        stmt->setUInt64(3, itemGuid);
+        trans->Append(stmt);
+    }
+
+    for (auto const& [itemId, slot] : placements)
+    {
+        // The boost ItemContext is what gives these items their bonus lists (and with them their item
+        // level) - Item::CreateItem resolves them from the client data, so no bonus id is invented here.
+        std::unique_ptr<Item> item(Item::CreateItem(itemId, 1, SHOP_BOOST_ITEM_CONTEXT, nullptr));
+        if (!item)
+        {
+            TC_LOG_ERROR("network", "BattlePay: could not create boost kit item {} for {}; the boost was "
+                "not applied.", itemId, target.Guid.ToString());
+            return nullptr;
+        }
+
+        item->SetOwnerGUID(target.Guid);
+        item->SaveToDB(trans);
+
+        CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_INVENTORY_ITEM);
+        stmt->setUInt64(0, target.Guid.GetCounter());
+        stmt->setUInt64(1, UI64LIT(0));
+        stmt->setUInt8(2, slot);
+        stmt->setUInt64(3, item->GetGUID().GetCounter());
+        trans->Append(stmt);
+    }
+
+    CharacterDatabasePreparedStatement* levelStmt = CharacterDatabase.GetPreparedStatement(CHAR_UPD_SHOP_BOOST_CHARACTER);
+    levelStmt->setUInt8(0, GetCharacterBoostLevel());
+    levelStmt->setUInt32(1, specializationId);
+    levelStmt->setUInt64(2, target.Guid.GetCounter());
+    trans->Append(levelStmt);
+
+    WriteCharacterSelectEquipment(target.Guid, visibleItems, trans);
+
+    CharacterDatabasePreparedStatement* boostStmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_SHOP_BOOST);
+    boostStmt->setUInt64(0, target.Guid.GetCounter());
+    boostStmt->setUInt32(1, productId);
+    boostStmt->setUInt64(2, distributionId);
+    boostStmt->setUInt32(3, specializationId);
+    boostStmt->setUInt8(4, 0);                              // boosted, not a pending class trial
+    boostStmt->setInt64(5, GameTime::GetGameTime());
+    trans->Append(boostStmt);
+
+    TC_LOG_INFO("network", "BattlePay: boosting {} to level {} (class {}, race {}, spec {}) with loadout {}: "
+        "{} kit item(s), {} original item(s) displaced into the backpack.", target.Guid.ToString(),
+        GetCharacterBoostLevel(), target.ClassId, target.RaceId, specializationId, loadout->ID,
+        placements.size(), moves.size());
+
+    return trans;
 }
 
 void BattlePayMgr::LoadProducts()
