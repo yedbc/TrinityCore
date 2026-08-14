@@ -908,6 +908,31 @@ namespace WorldPackets
             MovementInfo Status;
         };
 
+        // Wire: { PackedGuid Mover; float Scale; }. Verified against 763 captured 12.0.7 packets
+        // (body length is always 2 + popcount(guid mask) + 4, across eight distinct lengths) and
+        // against the 68275 client deserializer.
+        //
+        // Scale is a multiplier on the CURRENT spline's whole time base, not on the remainder and
+        // not an absolute duration. The client applies:
+        //     duration *= Scale;  time_passed *= Scale;  effect_start_time *= Scale;
+        // (back-dating the spline start timestamp to keep time_passed = now - start). Because
+        // elapsed and total are scaled together, time_passed/duration is invariant and the unit
+        // does not jump; remaining time ends up scaled by Scale as well. So:
+        //     Scale = newDuration / oldDuration   (numerically identical to newRemaining/oldRemaining)
+        // Scale <= 0 zeroes the duration and the client finalizes the spline on its next update.
+        // The client silently ignores the packet if the mover has no active spline.
+        //
+        // NOT the same mechanism as SMSG_FLIGHT_SPLINE_SYNC, whose float is a progress fraction
+        // used to set the client's duration_mod_next (a 0.5x-2x drift correction applied on the
+        // NEXT cycle). Do not implement either in terms of the other.
+        //
+        // Left STATUS_UNHANDLED on purpose. TrinityCore retimes an in-flight spline by resplining
+        // (a fresh MoveSplineInit::Launch emits SMSG_MONSTER_MOVE with a new MoveTime), which is
+        // self-consistent and needs no adjust packet - see MovementGenerator::UnitSpeedChanged.
+        // Before enabling this, note that MoveSpline discards MoveSplineInitArgs::HasVelocity, so
+        // it cannot currently tell whether its velocity tracks the owner's speed, and that scaling
+        // a duration does not recompute MoveSpline::vertical_acceleration (derived from the
+        // original duration), so parabolic/jump splines would deform.
         class AdjustSplineDuration final : public ServerPacket
         {
         public:
