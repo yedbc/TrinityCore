@@ -1896,6 +1896,15 @@ FeatureSystem.RecruitAFriend.DaysInCycle = 30
 #                     0 - (Disabled)
 
 FeatureSystem.WarGames.Enabled = 1
+#   FeatureSystem.ReturningPlayerExperience.InactiveDays
+#        Description: How long a character must have been logged out before the character list
+#                     offers it the Arathi Returning Player ("Catch Up") Experience, and before
+#                     the server honors the RPE bit of CMSG_PLAYER_LOGIN. (in days)
+#                     The retail inactivity window is not known; 60 is our chosen default.
+#        Default:     60 - (Offer the Catch Up Experience after 60 days of inactivity)
+#                     0  - (No inactivity requirement, always offered)
+
+FeatureSystem.ReturningPlayerExperience.InactiveDays = 60
 
 #
 #    AllowLoggingIPAddressesInDatabase
