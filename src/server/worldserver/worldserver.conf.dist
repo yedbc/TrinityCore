@@ -1423,51 +1423,6 @@ ChallengeMode.Upgrade.FallbackMoney = 1500000
 ChallengeMode.Upgrade.DiscountAchievements = "3383:61809,3341:42767,3343:42768,3345:42769,3347:42770"
 
 #
-#    ChallengeMode.ScorePerLevel
-#    ChallengeMode.ScorePerAffix
-#    ChallengeMode.ScoreMaxTimeBonus
-#        Description: Mythic+ rating awarded for a timed run. score = keystoneLevel * ScorePerLevel
-#                     + affixCount * ScorePerAffix, plus a time bonus that runs from +ScoreMaxTimeBonus
-#                     for a 40%-under-par clear down to -ScoreMaxTimeBonus at or over par. These
-#                     constants are a server design value - they are not present in the client or in
-#                     DB2 - so they can be tuned to match a live sniff without a rebuild.
-#        Default:     7.5 - ChallengeMode.ScorePerLevel
-#                     5.0 - ChallengeMode.ScorePerAffix
-#                     7.5 - ChallengeMode.ScoreMaxTimeBonus
-#
-
-ChallengeMode.ScorePerLevel = 7.5
-ChallengeMode.ScorePerAffix = 5.0
-ChallengeMode.ScoreMaxTimeBonus = 7.5
-
-#
-#    Housing.EnableBuyHouse
-#    Housing.EnableDeleteHouse
-#    Housing.EnableMoveHouse
-#    Housing.EnableCreateCharterNeighborhood
-#    Housing.EnableCreateGuildNeighborhood
-#        Description: Per-operation gates for the player housing system. Each one gates the matching
-#                     client request; disabling a gate makes the server reject that operation.
-#        Default:     true - (Enabled)
-#                     false - (Disabled)
-#
-
-Housing.EnableBuyHouse = 1
-Housing.EnableDeleteHouse = 1
-Housing.EnableMoveHouse = 1
-Housing.EnableCreateCharterNeighborhood = 1
-Housing.EnableCreateGuildNeighborhood = 1
-
-#
-#    Housing.TutorialsEnabled
-#        Description: Send the housing tutorial/first-run prompts to the client.
-#        Default:     true - (Enabled)
-#                     false - (Disabled)
-#
-
-Housing.TutorialsEnabled = 1
-
-#
 #    Instance.UnloadDelay
 #        Description: Time (in milliseconds) before instance maps are unloaded from memory if no
 #                     characters are inside.
