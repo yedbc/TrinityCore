@@ -91,6 +91,42 @@ namespace WorldPackets
             int32 GameTimeHolidayOffset = 0;
         };
 
+        // SMSG_GAME_TIME_SET / SMSG_GAME_TIME_UPDATE are LoginSetTimeSpeed without the NewSpeed
+        // float - the clock rate is handed out once, at login, and these two correct the clock
+        // afterwards. Both bodies are a uniform 16 bytes in every 12.0.7 capture:
+        //   +0 uint32 ServerTime (packed WowTime)   +8  int32 ServerTimeHolidayOffset
+        //   +4 uint32 GameTime   (packed WowTime)   +12 int32 GameTimeHolidayOffset
+        //
+        // The two client handlers (GameTime_C.cpp) differ in what they apply:
+        //   SMSG_GAME_TIME_SET    re-applies server time AND game time - a hard re-base.
+        //   SMSG_GAME_TIME_UPDATE re-applies game time only and merely validates the server time
+        //                         pair - the cheap periodic correction.
+        class GameTimeSet final : public ServerPacket
+        {
+        public:
+            explicit GameTimeSet() : ServerPacket(SMSG_GAME_TIME_SET, 16) { }
+
+            WorldPacket const* Write() override;
+
+            WowTime ServerTime;
+            WowTime GameTime;
+            int32 ServerTimeHolidayOffset = 0;
+            int32 GameTimeHolidayOffset = 0;
+        };
+
+        class GameTimeUpdate final : public ServerPacket
+        {
+        public:
+            explicit GameTimeUpdate() : ServerPacket(SMSG_GAME_TIME_UPDATE, 16) { }
+
+            WorldPacket const* Write() override;
+
+            WowTime ServerTime;
+            WowTime GameTime;
+            int32 ServerTimeHolidayOffset = 0;
+            int32 GameTimeHolidayOffset = 0;
+        };
+
         class ResetWeeklyCurrency final : public ServerPacket
         {
         public:
@@ -1033,6 +1069,20 @@ namespace WorldPackets
             int32 OverrideLightID = 0;
         };
 
+        // 4 byte body in all 211 captured 12.0.7 occurrences - a single Lightning.db2 id.
+        // 205 of them carry 0, which is the stop form: the client keeps the storm it was last
+        // told about, so leaving a storming zone has to restate it as 0.
+        class StartLightningStorm final : public ServerPacket
+        {
+        public:
+            explicit StartLightningStorm() : ServerPacket(SMSG_START_LIGHTNING_STORM, 4) { }
+            explicit StartLightningStorm(int32 lightningID) : ServerPacket(SMSG_START_LIGHTNING_STORM, 4), LightningID(lightningID) { }
+
+            WorldPacket const* Write() override;
+
+            int32 LightningID = 0;
+        };
+
         class TC_GAME_API DisplayGameError final : public ServerPacket
         {
         public:
@@ -1466,6 +1516,36 @@ namespace WorldPackets
             WorldPacket const* Write() override;
 
             std::vector<CurrencyTransferLogEntry> Entries;
+        };
+
+        // SMSG_DISPLAY_WORLD_TEXT (0x420296) — floats a server-authored, already-formatted string in
+        // the 3D world (the engine behind the Lua AddWorldText / AddCustomWorldText bindings), NOT a
+        // chat line, NOT a centre-screen notification and NOT the Lua combat-text system. The client
+        // handler runs the text through the string-token formatter with Arg1/Arg2 as the two numeric
+        // substitution arguments, then hands it to the world-text renderer; it raises no Lua event and
+        // performs no DB2 lookup, so the display string is entirely the server's to compose.
+        //
+        // Wire, verified against build-68275/68974 captures (5 distinct bodies, zero leftover bytes):
+        //   PackedGuid Guid    — anchor unit; a null guid makes the client fall back to the receiver
+        //   uint32     Arg1
+        //   uint32     Arg2
+        //   Bits<12>   Text length, then FlushBits (the 4 pad bits are 0 in every sample)
+        //   char[len]  Text    — no NUL on the wire
+        //
+        // It is a shared channel: retail sends "|cff94008B+XP" anchored on the creature you killed,
+        // "|cnGOLD_FONT_COLOR:+Gold|r" and "|cnYELLOW_FONT_COLOR:+Neighborly|r" with a null guid, and
+        // "|cff19FF19+Satisfaction|r" anchored on a player. Do not model it as any one system's packet.
+        class DisplayWorldText final : public ServerPacket
+        {
+        public:
+            explicit DisplayWorldText() : ServerPacket(SMSG_DISPLAY_WORLD_TEXT) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid Guid;
+            uint32 Arg1 = 0;
+            uint32 Arg2 = 0;
+            std::string Text;
         };
     }
 }

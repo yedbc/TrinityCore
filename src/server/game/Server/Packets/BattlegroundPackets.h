@@ -255,41 +255,107 @@ namespace WorldPackets
         };
 
         // SMSG_BATTLEFIELD_STATUS_WAIT_FOR_GROUPS (0x48000D) and
-        // SMSG_BATTLEFIELD_STATUS_GROUP_PROPOSAL_FAILED (0x48000E) are DELIBERATELY not implemented.
+        // SMSG_BATTLEFIELD_STATUS_GROUP_PROPOSAL_FAILED (0x48000E).
         //
-        // Their wire form is fully known - it was decoded byte for byte from the 18 + 2 occurrences in
-        // C:\sniff\rated BG 12.0.7.pkt and confirmed against the client readers - and it is recorded here so
-        // the work is not repeated. (Note that "rbg rated BG 12.0.7.pkt" is a byte-identical copy of that
-        // file, so this is one capture and not two.)
+        // Both were decoded byte for byte from the 18 + 2 occurrences in C:\sniff\rated BG 12.0.7.pkt and
+        // confirmed against the client readers. (Note that "rbg rated BG 12.0.7.pkt" is a byte-identical copy
+        // of that file, so this is one capture and not two.) The decode is kept here because the wire form is
+        // the only place the field MEANINGS are written down.
         //
-        //   0x48000D  BattlefieldStatusHeader (the struct above, read by sub_7FF7290FAAE0 - identical field
-        //             order to operator<<(ByteBuffer&, BattlefieldStatusHeader const&))
-        //             uint32 MapID, uint32 TimeoutMs (30000 in every capture). The first of the two is only
-        //             INFERRED to be a map: it holds 2656, 2107 and then 2245 across the three proposal
-        //             runs, and the match that finally started ran on map 2245 - plus the already-working
-        //             siblings above write Mapid immediately before Timeout in exactly this position.
-        //             uint8 SlotsPerSide[2] and uint8 AwaitedPerSide[2], written index-interleaved as
+        //   0x48000D  BattlefieldStatusHeader - 46 bytes: 9-byte packed guid + Id + Type + int64 Time + a bit
+        //             flush for the RideTicket, then QueueID count 1, RangeMin 0, RangeMax 90, TeamSize 0,
+        //             InstanceID 0, the 8-byte QueueID, then the RegisteredMatch/TournamentRules bits and a
+        //             flush (captured 0x80, i.e. a rated match). Read by sub_7FF7290FAAE0, identical field
+        //             order to operator<<(ByteBuffer&, BattlefieldStatusHeader const&).
+        //             Then uint32 MapID, uint32 TimeoutMs (30000 in every capture),
+        //             uint8 SlotsPerSide[2] and uint8 AwaitedPerSide[2] written index-interleaved as
         //                 SlotsPerSide[0], AwaitedPerSide[0], SlotsPerSide[1], AwaitedPerSide[1],
-        //             then the 3x3 role block below.
-        //   0x48000E  BattlefieldStatusHeader, then the 3x3 role block below. Nothing else.
+        //             then the 3x3 role block below. 68-byte body.
+        //   0x48000E  BattlefieldStatusHeader, then the 3x3 role block. Nothing else. 56-byte body.
         //
-        // The role block is read by sub_7FF7290FAD90 into three uint8[3] arrays A/B/C indexed by role, and
-        // the wire order is index-interleaved: A[0],B[0],C[0], A[1],B[1],C[1], A[2],B[2],C[2], then one bit
-        // plus a flush. The role order is TANK, HEALER, DAMAGER - read straight out of the client's own
-        // name table at 0x7FF72C3C5DE0. The consumers (sub_7FF72AAB93E0 for 0x48000D, sub_7FF72AAB97D0 for
-        // 0x48000E) build a vector of a struct the client itself names PvpRoleQueueInfo, whose fields are
-        // { roleName, A[i] + B[i] + C[i], B[i], C[i] } - so the three counts SUM to that role's requirement.
-        // The captured rated Blitz match reads as 0 tanks / 4 healers / 12 damagers = 16 players = 8v8, and
-        // every one of the 18 samples balances: sum(A) equals AwaitedPerSide[0] + AwaitedPerSide[1] and
-        // sum(B) equals the players already secured.
+        // The role block is read by sub_7FF7290FAD90 into three uint8[3] arrays indexed by role - Awaited at
+        // struct +0, Secured at +3, Lost at +6 - and the wire order is index-interleaved:
+        // Awaited[0],Secured[0],Lost[0], Awaited[1],Secured[1],Lost[1], Awaited[2],Secured[2],Lost[2].
+        // One bit and a flush follow; sub_7FF7290FAD90 stores it (shr al, 7) at struct +9, and the consumer
+        // sub_7FF72AAB93E0 tests exactly that byte (cmp byte ptr [r15+0x81], 0) and SKIPS building the whole
+        // role list when it is clear - so it is a "these role counts are populated" gate, not padding. It is
+        // set in all 20 captured bodies. The role order is TANK, HEALER, DAMAGER, read out of the client's own
+        // name table at 0x7FF72C3C5DE0; that is the same numbering as ChrSpecializationRole, which is what
+        // lets the server fill these counters from a player's actual specialization.
+        // The consumers (sub_7FF72AAB93E0 for 0x48000D, sub_7FF72AAB97D0 for 0x48000E) build a vector of a
+        // struct the client names PvpRoleQueueInfo, whose fields are
+        // { roleName, Awaited[i] + Secured[i] + Lost[i], Secured[i], Lost[i] } - so the three counters SUM to
+        // that role's requirement and the client shows Secured out of that sum.
         //
-        // What is missing is not the layout, it is the server state. Sending either packet honestly requires
-        // a role-aware battleground matchmaker with a group-proposal phase: a per-role target composition, a
-        // running count of which queued players fill which role, and a 30 second proposal that individual
-        // players accept or decline (0x48000E is the "they did not all accept" outcome - its handler raises
-        // client message 0x336 and plays sound 0x43BD). This core has none of that: BattlegroundQueue fills
-        // by team headcount only, and there is no proposal step for battlegrounds at all. Every number in
-        // these two packets would therefore have to be fabricated, so they stay STATUS_UNHANDLED.
+        // Semantics, established by re-decoding all 20 bodies with their tick timestamps:
+        //   Awaited = still to be secured, Secured = secured already, Lost = failed to secure.
+        //   In 0x48000D, Lost is 0 in every sample and sum(Awaited) == AwaitedPerSide[0] + AwaitedPerSide[1].
+        //   In 0x48000E, Awaited is 0 and Lost holds exactly the Awaited vector of the immediately preceding
+        //   0x48000D - the proposal collapsed and the outstanding players became losses. Both invariants hold
+        //   in every sample, and Awaited+Secured+Lost is the constant [0, 4, 12] = 16 players = 8v8 throughout.
+        //
+        // The capture also settles that this is a BOUNDED proposal and not an open-ended queue readout. Three
+        // runs, each with its own MapID, each inside the advertised 30000 ms:
+        //   map 2656, ticks 138410..166467 = 28.1 s, then 0x48000E with Lost = [0,2,4] (6 outstanding)
+        //   map 2107, ticks 871891..894382 = 22.5 s, then 0x48000E with Lost = [0,0,1] (1 outstanding)
+        //   map 2245, ticks 906202..911487 =  5.3 s, then a terminal 0x48000D that zeroes AwaitedPerSide and
+        //                                            the whole role block - the match formed.
+        //
+        // This core runs that phase for the Battleground Blitz solo queue, so every field written below is
+        // real: BattlegroundQueue creates the battleground FIRST - which is what makes MapID and the per-side
+        // split exist at all - invites its members with a 30 s deadline, and ports nobody until all of them
+        // have accepted. See BattlegroundProposal in BattlegroundQueue.h. Secured counts accepted members,
+        // Awaited the ones still deciding, and a decline or a deadline miss collapses the proposal into
+        // 0x48000E with the outstanding members as Lost. Retail's per-run MapID churn falls out for free: a
+        // collapsed proposal drops its battleground and the next attempt calls CreateNewBattleground again.
+        //
+        // Their CONNECTION_TYPE_REALM declaration is confirmed rather than merely a safe default: retail sends
+        // both on connection index 0 in the capture, unlike SMSG_BATTLEFIELD_STATUS_QUEUED on index 1.
+
+        // Wire order of the per-role counters, identical to ChrSpecializationRole (Tank 0, Healer 1, Dps 2).
+        enum class PvpQueueRole : uint8
+        {
+            Tank    = 0,
+            Healer  = 1,
+            Damager = 2
+        };
+
+        std::size_t constexpr PVP_QUEUE_ROLE_COUNT = 3;
+
+        struct PvpRoleQueueCounts
+        {
+            std::array<uint8, PVP_QUEUE_ROLE_COUNT> Awaited = { };  // still to be secured
+            std::array<uint8, PVP_QUEUE_ROLE_COUNT> Secured = { };  // secured already
+            std::array<uint8, PVP_QUEUE_ROLE_COUNT> Lost = { };     // failed to secure
+            // Gates the client's entire role display - see sub_7FF72AAB93E0. Set in all 20 captured bodies.
+            bool HasRoleCounts = true;
+        };
+
+        class BattlefieldStatusWaitForGroups final : public ServerPacket
+        {
+        public:
+            explicit BattlefieldStatusWaitForGroups() : ServerPacket(SMSG_BATTLEFIELD_STATUS_WAIT_FOR_GROUPS, sizeof(BattlefieldStatusHeader) + 4 + 4 + 4 + 10) { }
+
+            WorldPacket const* Write() override;
+
+            BattlefieldStatusHeader Hdr;
+            uint32 Mapid = 0;
+            uint32 Timeout = 0;
+            std::array<uint8, 2> SlotsPerSide = { };
+            std::array<uint8, 2> AwaitedPerSide = { };
+            PvpRoleQueueCounts Roles;
+        };
+
+        class BattlefieldStatusGroupProposalFailed final : public ServerPacket
+        {
+        public:
+            explicit BattlefieldStatusGroupProposalFailed() : ServerPacket(SMSG_BATTLEFIELD_STATUS_GROUP_PROPOSAL_FAILED, sizeof(BattlefieldStatusHeader) + 10) { }
+
+            WorldPacket const* Write() override;
+
+            BattlefieldStatusHeader Hdr;
+            PvpRoleQueueCounts Roles;
+        };
 
         class BattlemasterJoin final : public ClientPacket
         {

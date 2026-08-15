@@ -134,6 +134,11 @@ enum BattlegroundTimeIntervals
     //REMIND_INTERVAL                 = 10000,                // ms
     INVITATION_REMIND_TIME          = 20000,                // ms
     INVITE_ACCEPT_WAIT_TIME         = 90000,                // ms
+    // Deadline of an all-or-nothing group proposal (solo-queue modes). Shorter than INVITE_ACCEPT_WAIT_TIME
+    // because it is not a per-player invite the rest of the lobby can outlive - the whole proposal collapses
+    // when it expires. 30000 is what SMSG_BATTLEFIELD_STATUS_WAIT_FOR_GROUPS advertises in every captured
+    // body of C:\sniff\rated BG 12.0.7.pkt, and all three captured proposal runs fit inside it.
+    PROPOSAL_ACCEPT_WAIT_TIME       = 30000,                // ms
     TIME_AUTOCLOSE_BATTLEGROUND     = 120000,               // ms
     MAX_OFFLINE_TIME                = 300,                  // secs
     RESPAWN_ONE_DAY                 = 86400,                // secs
@@ -299,6 +304,23 @@ class TC_GAME_API Battleground
         PvPTeamId GetWinner() const { return _winnerTeamId; }
         uint32 GetScriptId() const;
         uint32 GetBonusHonorFromKill(uint32 kills) const;
+
+        // Single source of truth for the honor paid on completing a random or Call to Arms
+        // battleground. Both the award (Battleground::EndBattleground) and the advertisement
+        // (Player::SendPvpRewards, i.e. the PvP rewards frame) must call this and nothing else, so the
+        // figure the client is shown cannot drift from the figure actually paid.
+        //
+        // winner                - true for the winning team's payout, false for the loser's.
+        // alreadyWonRandomToday - Player::GetRandomWinner(); selects the "Last" (repeat) value over the
+        //                         "First" (first random-battleground win of the day) value.
+        // applyHonorRate        - false yields the raw configured amount, which is what must be handed
+        //                         to Player::RewardHonor, because RewardHonor applies Rate.Honor
+        //                         itself. true yields the amount the player actually ends up with,
+        //                         which is what the rewards frame has to advertise.
+        //
+        // The configured values are FLAT HONOR AMOUNTS, not honorable-kill counts; they must never be
+        // routed through GetBonusHonorFromKill(). See the comment on the definition.
+        static uint32 GetBattlegroundCompletionHonor(bool winner, bool alreadyWonRandomToday, bool applyHonorRate);
 
         // Set methods:
         //here we can count minlevel and maxlevel for players

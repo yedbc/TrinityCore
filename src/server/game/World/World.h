@@ -97,6 +97,7 @@ enum WorldTimers
     WUPDATE_CHECK_FILECHANGES,
     WUPDATE_WHO_LIST,
     WUPDATE_CHANNEL_SAVE,
+    WUPDATE_GAMETIME,
     WUPDATE_COUNT
 };
 
@@ -352,6 +353,7 @@ enum WorldIntConfigs : uint32
     CONFIG_DEATH_SICKNESS_LEVEL,
     CONFIG_DISABLE_BREATHING,
     CONFIG_BATTLEGROUND_INVITATION_TYPE,
+    CONFIG_BATTLEGROUND_BLITZ_TANKS_PER_TEAM,
     CONFIG_BATTLEGROUND_BLITZ_HEALERS_PER_TEAM,
     CONFIG_BRAWL_PVP_BRAWL_ID,
     CONFIG_BRAWL_BATTLEMASTER_LIST_ID,
@@ -367,6 +369,7 @@ enum WorldIntConfigs : uint32
     CONFIG_ARENA_START_MATCHMAKER_RATING,
     CONFIG_MAX_WHO,
     CONFIG_WHO_LIST_UPDATE_INTERVAL,
+    CONFIG_GAMETIME_UPDATE_INTERVAL,
     CONFIG_HONOR_AFTER_DUEL,
     CONFIG_PVP_TOKEN_MAP_TYPE,
     CONFIG_PVP_TOKEN_ID,
@@ -880,6 +883,7 @@ class TC_GAME_API World
         time_t mail_timer;
         time_t mail_timer_expires;
         time_t blackmarket_timer;
+        time_t m_lastGameTimeBroadcast;
 
         SessionMap m_sessions;
         std::unordered_multimap<ObjectGuid, WorldSession*> m_sessionsByBnetGuid;
@@ -947,6 +951,8 @@ class TC_GAME_API World
         AutobroadcastContainer m_Autobroadcasts;
 
         void ProcessQueryCallbacks();
+
+        void BroadcastGameTime();
 
         void SendGuidWarning();
         void DoGuidWarningRestart();

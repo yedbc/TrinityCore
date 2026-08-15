@@ -105,6 +105,7 @@
 #include "Language.h"
 #include "LanguageMgr.h"
 #include "LFGMgr.h"
+#include "LFGPackets.h"
 #include "ListUtils.h"
 #include "Log.h"
 #include "Loot.h"
@@ -1650,9 +1651,12 @@ void Player::RegenerateAll()
         if (power != POWER_RUNES)
             Regenerate(power);
 
-    // Runes act as cooldowns, and they don't need to send any data
     if (GetClass() == CLASS_DEATH_KNIGHT)
     {
+        // Draining a rune is announced through the cast packets' rune list, but a rune coming back is not:
+        // SetRuneCooldown only republishes the POWER_RUNES count, which says how many are ready and never
+        // which ones. Collect the runes that finished this tick and name them.
+        uint32 addedRunesMask = 0;
         uint32 regeneratedRunes = 0;
         uint32 regenIndex = 0;
         while (regeneratedRunes < MAX_RECHARGING_RUNES && m_runes->CooldownOrder.size() > regenIndex)
@@ -1665,9 +1669,19 @@ void Player::RegenerateAll()
                 ++regenIndex;
             }
             else
+            {
                 SetRuneCooldown(runeToRegen, 0);
+                addedRunesMask |= 1u << runeToRegen;
+            }
 
             ++regeneratedRunes;
+        }
+
+        if (addedRunesMask)
+        {
+            WorldPackets::Spells::AddRunePower addRunePower;
+            addRunePower.AddedRunesMask = addedRunesMask;
+            SendDirectMessage(addRunePower.Write());
         }
     }
 
@@ -7479,10 +7493,80 @@ void Player::SendCurrencies() const
     SendDirectMessage(packet.Write());
 }
 
+// SMSG_REQUEST_PVP_REWARDS_RESPONSE (0x480014) is decoded but DELIBERATELY not sent. The layout is recorded
+// here so the decode is not repeated; what blocks it is reward data this core does not have.
+//
+// The wire form was pinned from all 6 occurrences in the 12.0.7 family of captures (build-filtered to
+// 68275/68453/68974 and content-hash deduplicated - "rbg rated BG 12.0.7.pkt" is a byte-identical copy of
+// "rated BG 12.0.7.pkt", so the rated Blitz session counts once, not twice). Bodies are 304, 304, 348, 348,
+// 584 and 592 bytes. The shape is fixed, not counted:
+//
+//     RewardBlock[0]
+//     uint8  A            // 2 in the two small captures, 3 in the rated Blitz one
+//     uint8  B            // 0xC0 in all six
+//     RewardBlock[1] .. RewardBlock[12]        // 13 blocks in total, always all 13 present
+//
+// where RewardBlock is byte for byte the existing WorldPackets::LFG::LfgPlayerQuestReward and its
+// operator<< in LFGPackets.cpp - uint8 Mask, int32 RewardMoney, int32 RewardXP, the three uint32 counts up
+// front, then Item[]/Currency[]/BonusCurrency[] as {int32,int32} pairs, then one byte of MSB-first
+// OptionalInit bits (0x80 RewardSpellID, 0x40 ArtifactXPCategory, 0x20 ArtifactXP, 0x10 Honor) and the
+// present optionals in that order. That parser consumes all six bodies with ZERO bytes left over, which is
+// what settles the 13-block count: the client reader sub_7FF7290FB600 likewise calls the per-block reader
+// sub_7FF7291DAB70 thirteen times with two loose u8 reads after the first, and the two agree exactly.
+// Unpopulated activities are sent as all-zero blocks - retail itself left blocks 8 and 10 empty in the rated
+// Blitz capture, and left all but four blocks empty for a levelling character.
+//
+// Decoded values, for anyone verifying this later (currency 1792 = Honor, 1602 = Conquest): the rated Blitz
+// session carried e.g. Honor 300 + Conquest 8000 in block 0, Conquest 29800 + Honor 850 in block 1, and
+// Honor 200 with item 135539 in block 12; several blocks carry RewardSpellID 192953. The two non-PvP
+// captures are a levelling character and carry RewardXP (2150, 12250) where the max-level one carries none.
+//
+// The request side is already correct and needs no new trigger: CMSG_REQUEST_PVP_REWARDS (0x3A0041) has an
+// empty body, matching RequestPVPRewards, and every response in the captures is a direct 1:1 reply to it
+// 100-250 ms later. WorldSession::HandleRequestPvpReward -> here is exactly where retail answers.
+//
+// Only what this core will actually pay is published, and it is read from the same configuration the award
+// path reads, so the advertised figure cannot drift from the received one:
+//   - Honour is the winner's bonus from Battleground::EndBattleground, obtained by calling the very
+//     function that path calls - Battleground::GetBattlegroundCompletionHonor - instead of re-deriving it
+//     here. It was re-derived once, and that was a live drift hazard rather than a theoretical one: the
+//     award path treated the config value as an honorable-kill COUNT, and when that was fixed a
+//     re-derivation here would have gone on advertising ceil(270 * 80 * 1.55) = 33,480 for a win that
+//     pays 270. The first-win-of-the-day distinction is the player's own GetRandomWinner() flag, exactly
+//     as it is there. Rate.Honor IS applied to the advertised figure, because the award path's
+//     Player::RewardHonor applies it before the player receives anything and this frame states what the
+//     player receives; the shared function does that arithmetic so both sites agree by construction.
+//   - Conquest is deliberately NOT advertised. CONFIG_BG_REWARD_WINNER_CONQUEST_FIRST/LAST are declared in
+//     World.cpp and read by nothing at all, so this core awards no Conquest; publishing a figure would
+//     promise a payout that never arrives.
+//   - No item or spell rewards are advertised, because nothing in this core grants the ones retail sends.
+//   - The arena blocks stay empty on purpose rather than by omission: RewardHonor returns early in arenas,
+//     so 2v2, 3v3 and Skirmish genuinely pay no honour here and empty is the truthful answer.
+//   - The remaining blocks are activities this core does not run, and retail itself transmits those as
+//     all-zero blocks, so they are left zero rather than filled with something invented.
+//
+// Note on the opcode table: retail sends 0x480014 on connection index 1, while it is declared
+// CONNECTION_TYPE_REALM here. That difference is intentional and must not be "fixed". REALM always has a
+// socket, this frame is opened in the open world where an instance socket need not exist, and
+// SMSG_BATTLEFIELD_STATUS_QUEUED is likewise declared REALM on this branch and works live despite retail
+// also sending it on index 1.
 void Player::SendPvpRewards() const
 {
-    //WorldPacket packet(SMSG_REQUEST_PVP_REWARDS_RESPONSE, 24);
-    //GetSession()->SendPacket(&packet);
+    WorldPackets::LFG::RequestPvpRewardsResponse response;
+
+    // The same function Battleground::EndBattleground pays out of, with Rate.Honor applied because that
+    // path's RewardHonor applies it before the player sees the honor. Never re-derive this here.
+    uint32 const winnerHonor = Battleground::GetBattlegroundCompletionHonor(true, GetRandomWinner(), true);
+
+    // Every battleground pays this same bonus - EndBattleground does not vary it by bracket - so the
+    // battleground-shaped activities this core actually queues for all advertise it, and nothing else does.
+    for (uint8 slot : { uint8(WorldPackets::LFG::RequestPvpRewardsResponse::RandomBattleground),
+                        uint8(WorldPackets::LFG::RequestPvpRewardsResponse::RatedBattleground),
+                        uint8(WorldPackets::LFG::RequestPvpRewardsResponse::BrawlBattleground),
+                        uint8(WorldPackets::LFG::RequestPvpRewardsResponse::BattlegroundBlitz) })
+        response.Activity[slot].Honor = int32(winnerHonor);
+
+    SendDirectMessage(response.Write());
 }
 
 void Player::SetCreateCurrency(uint32 id, uint32 amount)
@@ -9645,6 +9729,12 @@ void Player::SendInitWorldStates(uint32 zoneId, uint32 areaId) const
         mapId, zoneId, areaId, uint32(packet.Worldstates.size()));
 
     SendDirectMessage(packet.Write());
+
+    // The rotating world states go out with the static ones, which is where the 12.0.7 captures show
+    // them: SMSG_ACTIVE_SCHEDULED_WORLD_STATE_INFO sits in the same burst as SMSG_INIT_WORLD_STATES.
+    // Realm-global content, but the client needs it before it can put a countdown on any widget the
+    // zone it just entered shows.
+    WorldStateMgr::SendActiveScheduledWorldStateInfo(this);
 }
 
 void Player::SetBindPoint(ObjectGuid guid) const
@@ -14985,22 +15075,48 @@ void Player::OnGossipSelect(WorldObject* source, int32 gossipOptionId, uint32 me
         case GossipOptionNpc::RuneforgeLegendaryUpgrade: // NYI
             break;
         // GossipOptionNpc::ProfessionsCraftingOrder (48) deliberately keeps no case and is NOT listed here: the
-        // 12.0.7 client's GossipNPCOption.db2 carries zero rows of that type, so no live NPC can raise it. If a
-        // future build adds one, give it the same fall-through the customer-order option gets below.
+        // 12.0.7 client's GossipNPCOption.db2 carries zero rows of that type, so no live NPC can raise it. It
+        // therefore reaches `default:`, which sets handled = false and opens the generic interaction - strictly
+        // more useful than the upstream "// NYI" stub, which consumed the option and sent nothing. That stub is
+        // deliberately NOT reinstated here: feature/housing-system still carried it only because the branch
+        // predates feature/crafting-orders' removal of it.
         case GossipOptionNpc::ProfessionsCustomerOrder:
-            // Crafting-order clerk (Clerk Galesong/Goldspark on menu 27907, Head Clerk Mimzy Sprazzlerock and the
-            // other eight clerks on menu 30243). Fall through to the generic !handled branch, which sends
-            // SMSG_GOSSIP_OPTION_NPC_INTERACTION{GossipNpcOptionID}; the client resolves that id through
-            // GossipNPCOption.db2 (rows 32410 and 42522, both ProfessionID=2) into
-            // PlayerInteractionType::ProfessionsCustomerOrder and raises the crafting-order frame. From there the
-            // CMSG_CRAFTING_ORDER_* handlers this branch already implements take over.
+        {
+            // The crafting-order clerk has its own dedicated open opcode, so it belongs in this
+            // switch rather than in the generic !handled fall-through — exactly like the auctioneer
+            // above. SMSG_CRAFTING_HOUSE_HELLO_RESPONSE REPLACES SMSG_GOSSIP_OPTION_NPC_INTERACTION
+            // here; it does not accompany it.
             //
-            // This was an upstream "// NYI" stub, which consumed the option as handled and sent nothing - so every
-            // clerk in the game was a dead click even though the whole crafting-order backend was live. The
-            // accompanying world SQL populates gossip_menu_option.GossipNpcOptionID on both menus; without it the
-            // fall-through would send NPCInteractionOpenResult instead, which is not the retail trigger.
-            handled = false;
+            // Capture evidence (build 68275, ingame-shop_ordersCrafting_professions.pkt, three
+            // identical sequences at ticks 383194 / 761111 / 788488, clerk menu 30243 — the same menu
+            // the crafting-order work targets):
+            //     CMSG_GOSSIP_SELECT_OPTION{guid, 30243, 107733}
+            //   ~150 ms later
+            //     SMSG_CRAFTING_HOUSE_HELLO_RESPONSE{guid, 0x40}      <- the only reply
+            //     CMSG_CRAFTING_ORDER_LIST_MY_ORDERS{same guid}
+            // SMSG_GOSSIP_OPTION_NPC_INTERACTION appears zero times in those windows, and
+            // SMSG_NPC_INTERACTION_OPEN_RESULT zero times in the whole 12.0.7 capture set. That is
+            // not a dead mechanism in the session: the same capture carries three
+            // SMSG_GOSSIP_OPTION_NPC_INTERACTION records for a GameObject, so retail deliberately
+            // does not use it for this clerk.
+            //
+            // The client handler (sub_7FF72ACDB8D0) opens PlayerInteractionType 60 itself and then
+            // fires CRAFTINGORDERS_SHOW_CUSTOMER, so nothing else is needed to raise the frame.
+            PlayerTalkClass->GetInteractionData().StartInteraction(guid, PlayerInteractionType::ProfessionsCustomerOrder);
+
+            WorldPackets::Housing::CraftingHouseHelloResponse craftingHouseHello;
+            craftingHouseHello.Guid = guid;
+            craftingHouseHello.OpenForBusiness = true;  // clear raises CRAFTING_HOUSE_DISABLED instead
+            SendDirectMessage(craftingHouseHello.Write());
+
+            // Merge note (integration/all-systems): feature/crafting-orders reached this line first and set
+            // handled = false here, shipping world SQL that populates gossip_menu_option.GossipNpcOptionID on
+            // menus 27907 and 30243. The capture evidence above wins, so the replace semantics are kept and
+            // `handled` stays true. That SQL is then only inert, not wrong: GossipNpcOptionID is read solely on
+            // the !handled path, which this case no longer takes. Leave the rows in place - they cost nothing
+            // and are the correct data if a future build ever restores the generic trigger.
             break;
+        }
         case GossipOptionNpc::BarbersChoice: // NYI - unknown if needs sending
             break;
         default:
@@ -20190,15 +20306,17 @@ bool Player::LoadFromDB(ObjectGuid guid, CharacterDatabaseQueryHolder const& hol
             }
 
             // Calculate progress in the 0-1000 scale (sniff: ProgressRequired=1000)
-            float progressRequired = 1000.0f;
+            float progressRequired = INITIATIVE_PROGRESS_REQUIRED;
             float currentProgress = activeInit->Progress * progressRequired;
 
-            // Find current milestone
+            // Find current milestone. RequiredContributionAmount is a percentage (DB2: 25/50/75/100)
+            // while Progress is a 0..1 fraction, so it has to be scaled before comparing — comparing
+            // them raw pinned CurrentMilestoneID to the first milestone forever.
             int32 currentMilestoneID = -1;
             auto milestones = sInitiativeManager.GetMilestonesForCycle(cycleID);
             for (auto const& m : milestones)
             {
-                if (activeInit->Progress < m.RequiredContributionAmount)
+                if (activeInit->Progress * INITIATIVE_MILESTONE_SCALE < m.RequiredContributionAmount)
                 {
                     currentMilestoneID = static_cast<int32>(m.MilestoneID);
                     break;
@@ -28725,6 +28843,26 @@ void Player::SendTransferAborted(uint32 mapid, TransferAbortReason reason, uint8
     transferAborted.TransfertAbort = reason;
     transferAborted.MapDifficultyXConditionID = mapDifficultyXConditionID;
     SendDirectMessage(transferAborted.Write());
+}
+
+void Player::SendPreloadWorld(int32 mapId, Position const& destination) const
+{
+    WorldPackets::Movement::PreloadWorld preloadWorld;
+    preloadWorld.MapID = mapId;
+    // Retail sends the player's current position with a zeroed facing, and expresses the
+    // destination as a delta from it - the client streams around Loc.Pos + MovementOffset.
+    preloadWorld.Loc.Pos = Position(GetPositionX(), GetPositionY(), GetPositionZ(), 0.0f);
+    preloadWorld.Reason = NEW_WORLD_SEAMLESS;
+    preloadWorld.MovementOffset = Position(destination.GetPositionX() - GetPositionX(),
+        destination.GetPositionY() - GetPositionY(), destination.GetPositionZ() - GetPositionZ());
+    SendDirectMessage(preloadWorld.Write());
+}
+
+void Player::SendCancelPreloadWorld(int32 mapId) const
+{
+    WorldPackets::Movement::CancelPreloadWorld cancelPreloadWorld;
+    cancelPreloadWorld.MapID = mapId;
+    SendDirectMessage(cancelPreloadWorld.Write());
 }
 
 void Player::ApplyEquipCooldown(Item* pItem)

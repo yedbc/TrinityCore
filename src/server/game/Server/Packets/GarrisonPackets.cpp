@@ -585,12 +585,13 @@ WorldPacket const* GarrisonBuildingSetActiveSpecializationResult::Write()
     return &_worldPacket;
 }
 
-// IDA case 4980797 (§8.47): u32 Result, u64 BuildingDbID, u32 GarrPlotInstanceID.
+// u32 GarrPlotInstanceID, u64 TimeBuilt, u32 Result - see the header for the disassembly that inverts the
+// order the old comment claimed. Result LAST is the field the client's `cmp [rcx+0x30], 0` gate reads.
 WorldPacket const* GarrisonCompleteBuildingConstructionResult::Write()
 {
-    _worldPacket << uint32(Result);
-    _worldPacket << uint64(BuildingDbID);
     _worldPacket << uint32(GarrPlotInstanceID);
+    _worldPacket << uint64(TimeBuilt);
+    _worldPacket << uint32(Result);
 
     return &_worldPacket;
 }
@@ -608,8 +609,10 @@ WorldPacket const* GarrisonOpenCrafter::Write()
 }
 
 // IDA case 4980817 (§8.51): generic byte-block helper. Conservative: u32 NewMinLevel.
+// 8 bytes, not 4 - the client's handler (0x22A0BA0) reads two u32s out of the opaque tail. See the header.
 WorldPacket const* GarrisonAutoTroopMinLevelUpdateResult::Write()
 {
+    _worldPacket << uint32(UnkLookupKey);
     _worldPacket << uint32(NewMinLevel);
 
     return &_worldPacket;
@@ -674,12 +677,15 @@ void GarrisonMissionBonusRoll::Read()
 void OpenMissionNpc::Read()
 {
     _worldPacket >> NpcGUID;
-    // Trailing uint8 (GarrFollowerTypeID) is intentionally left unread — see GarrisonPackets.h.
+    // Trailing uint8 (GarrFollowerTypeID). Consumed but deliberately not stored — see GarrisonPackets.h for
+    // why this class must not grow a member. Skipping it keeps the object layout byte-identical and stops the
+    // "read stop at 14 from 15" tail warning the client's extra byte produced on every open.
+    _worldPacket.read_skip<uint8>();
 }
 
 void GarrisonGetMissionReward::Read()
 {
-    _worldPacket >> NpcGUID;
+    _worldPacket >> DbID;           // RAW uint64, not a PackedGuid — see GarrisonPackets.h
     _worldPacket >> MissionRecID;
 }
 
@@ -1156,7 +1162,7 @@ WorldPacket const* GarrisonCollectionRemoveEntry::Write()
 {
     _worldPacket << uint8(GarrTypeID);
     _worldPacket << uint32(CollectionType);
-    _worldPacket << uint32(GarrTalentID);
+    _worldPacket << uint32(EntryID);
 
     return &_worldPacket;
 }
@@ -1202,8 +1208,8 @@ WorldPacket const* GarrisonAddSpecGroups::Write()
     _worldPacket << uint32(SpecGroups.size());
     for (GarrisonSpecGroup const& specGroup : SpecGroups)
     {
-        _worldPacket << uint32(specGroup.GarrSpecGroupID);
-        _worldPacket << uint32(specGroup.SelectedTalentTreeID);
+        _worldPacket << uint32(specGroup.ChrSpecializationID);
+        _worldPacket << uint32(specGroup.SoulbindID);
     }
 
     return &_worldPacket;
@@ -1280,7 +1286,7 @@ WorldPacket const* GarrisonSwapBuildingsResponse::Write()
 void GarrisonLearnTalent::Read()
 {
     _worldPacket >> GarrTalentID;
-    _worldPacket >> Bits<1>(IsTemporary);
+    _worldPacket >> IsTemporary;        // whole uint32, not a bit — see GarrisonPackets.h
 }
 
 void GarrisonResearchTalent::Read()
@@ -1521,6 +1527,9 @@ void SetUsingPartyGarrison::Read()
 
 void QueryGarrisonPetName::Read()
 {
+    // Leading raw uint64 the reader used to swallow as the guid's mask bytes — see GarrisonPackets.h.
+    // Consumed rather than stored so the packet object's layout does not change; the handler needs only the guid.
+    _worldPacket.read_skip<uint64>();
     _worldPacket >> NpcGUID;
 }
 

@@ -384,31 +384,47 @@ namespace WorldPackets
         // Field meanings, strongest evidence first:
         //
         //  Severity          (+0x00) observed 1 and 2. Named after EncounterEventSeverity
-        //                    (Low=0/Medium=1/High=2) and EncounterEvent.db2's Severity column. INFERRED -
-        //                    the only other single-byte enum in range would be EncounterTimelineEventSource,
-        //                    which is excluded because server-pushed events are Source=Encounter=0 and this
-        //                    byte is never 0.
+        //                    (Low=0/Medium=1/High=2) and EncounterEvent.db2's Severity column. No longer
+        //                    inferred: that column reads 1 for rows 278/279/280 and 2 for row 285, which is
+        //                    what the capture carries alongside those EncounterEventIDs.
         //  EventID           (+0x04) PROVEN. Monotonically increasing instance id (1,2,3,4 then 5,6 from
         //                    APPENDs, then 7..). CAST_UPDATE refers back to it.
         //  EncounterEventID  (+0x08) observed 278-285, stable 1:1 with (SpellID, IconFileID) across every
-        //                    packet. INFERRED to be the EncounterEvent.db2 row id ("ID of the encounter
-        //                    event record" - EncounterEventInfo.encounterEventID).
-        //  SpellID           (+0x0C) observed 377034/376997/377004 and 388544/388567/388796/388923.
+        //                    packet. NOW PROVEN, not inferred: the client's own EncounterEvent.db2 (present
+        //                    in the extracted data as dbc/enUS/EncounterEvent.db2, WDC5, 622 rows, ids
+        //                    1-809) has rows 278/279/280 carrying SpellID 376997/377004/377034 and rows
+        //                    282/283/284/285 carrying 388544/388567/388796/388923 - i.e. all 7 captured
+        //                    (EncounterEventID, SpellID) pairs are that table's rows, exactly. Its
+        //                    parent-lookup column is the DungeonEncounterID, so the client already knows
+        //                    which events belong to which encounter.
+        //  SpellID           (+0x0C) observed 377034/376997/377004 and 388544/388567/388796/388923. Equal to
+        //                    EncounterEvent.db2's SpellID for the accompanying EncounterEventID, 7/7.
         //  Unused_28         (+0x28) 0 in all 11 observed elements.
-        //  Unknown_2C        (+0x2C) 0 in 9 of 11; 230954 and 223315 in one element each. NOT a FileDataID
-        //                    (230954 resolves to a draenei face texture in the CASC listfile, i.e. noise).
-        //                    Left unnamed.
+        //  BroadcastTextID   (+0x2C) 0 in most elements; 230954, 223315 and 308255 observed. Was left
+        //                    unnamed as "NOT a FileDataID"; that was right about what it is not. It is
+        //                    EncounterEvent.db2's BroadcastTextID column: rows 285, 279 and 274 carry
+        //                    exactly 230954, 223315 and 308255, and 513 of the 622 rows carry 0, matching
+        //                    "0 in most elements". 3/3 on the non-zero values.
         //  Unused_30         (+0x30) 0 in all 11 observed elements.
         //  IconFileID        (+0x34) PROVEN. All 7 distinct observed values resolve in the CASC listfile to
         //                    interface/icons/*.blp (spell_lifegivingseed, spell_nature_earthquake,
         //                    ability_smash, inv_misc_branch_01, inv_icon_wing06b,
         //                    inv_misc_raptortalon_nightmare, ability_vehicle_sonicshockwave). 7/7.
+        //                    Note it is NOT EncounterEvent.db2's IconFileDataID: that column is 0 in 621 of
+        //                    its 622 rows, so retail is sending the *spell's* icon here. Which is why
+        //                    InstanceScript falls back to SpellInfo::IconFileDataId when a timeline row
+        //                    leaves this at 0.
         //  Caster            (+0x38) packed GUID, HighGuid 8 (Creature) / 9 (Vehicle). Identical for every
         //                    element of a given packet.
         //  Timestamp         (+0x4C) PROVEN to be a millisecond clock: two SEQUENCE packets 59026 sniff-ms
         //                    apart differ by 59025 here, and an APPEND 9025 ms later differs by 9019.
         //                    Written as GameTime::GetGameTimeMS().
-        //  Unused_54         (+0x54) 0 in all 11 observed elements.
+        //  Flags             (+0x54) was Unknown_54: 128 in every element carrying EncounterEventID 294
+        //                    (spell 1282251) and 0 everywhere else. That is EncounterEvent.db2's Flags
+        //                    column echoed back - row 294 is the one row among the captured ids whose Flags
+        //                    is 128, and rows 278-285, 293 and 295 all carry 0. 11/11 across the capture.
+        //                    Observed values across the whole table are 0/1/4/5/8/32/64/128/132/136/161/
+        //                    192/256/260/264/384/512, so it is a real flag field, not padding.
         //  MaxQueueDuration  (+0x58) 5000 in all 11 observed elements. Named after
         //                    EncounterTimelineEventInfo.maxQueueDuration ("hold duration for this event
         //                    after it reaches the end of the timeline"). INFERRED.
@@ -439,12 +455,12 @@ namespace WorldPackets
             uint32 EncounterEventID = 0;
             int32 SpellID = 0;
             uint32 Unused_28 = 0;
-            uint32 Unknown_2C = 0;
+            uint32 BroadcastTextID = 0;             // EncounterEvent.db2 BroadcastTextID
             uint32 Unused_30 = 0;
             int32 IconFileID = 0;
             ObjectGuid Caster;
             uint32 Timestamp = 0;
-            uint32 Unused_54 = 0;
+            uint32 Flags = 0;                       // EncounterEvent.db2 Flags
             uint32 MaxQueueDuration = 0;
             uint32 Duration = 0;
             uint8 CastState = 2;                    // EncounterEventCastState::NotCasting
@@ -487,6 +503,15 @@ namespace WorldPackets
         //   uint8 CastState, uint8 Unknown_3D, uint32 Timestamp, uint32 TimeToCastMs, bit7|bit6 byte.
         // 4+4+16+4+1+1+4+4+1 = 39, and 38 when the GUID packs to 15 bytes. Both sizes are in the capture.
         //
+        // The 39/38 split is ENTIRELY the PackedGUID width - there is no optional or conditional field in
+        // this packet. Across all 52 CAST_UPDATEs in the 68275-family captures, the 45 that are 39 bytes
+        // carry a 16-byte caster GUID and the 7 that are 38 bytes carry a 15-byte one, and every one of the
+        // 52 parses to exactly zero trailing slack. The same effect explains SEQUENCE's 292 (4 + 4*72) and
+        // 217 (4 + 3*71). All 7 short ones belong to DungeonEncounterID 2564: every caster in these
+        // captures shares low mask 0xE7, but 2564's caster is the one whose high qword ends in a zero byte
+        // (high = 0x202F313BC0BB3E00), so its high mask is 0xFE instead of 0xFF and one data byte drops.
+        // Nothing about the packet's field set changes - only how many bytes the GUID spends.
+        //
         // DungeonEncounterID is not a guess: the two CAST_UPDATE runs in C:\sniff\m+ run12.0.7.pkt carry
         // 0x0A03 (2563) and 0x0A04 (2564), and SMSG_ENCOUNTER_START at the very same sniff ticks (496010,
         // 743769) carries those same two DungeonEncounterIDs - see the EncounterStart comment above.
@@ -495,8 +520,29 @@ namespace WorldPackets
         // for EventID 1 arrives 18027 ms after the SEQUENCE that created it with 18000, and reports 18000,
         // not 0. Same for 30000, 28000, 33000, 55000, 9000, 5000.
         //
-        // The trailing byte is 0x80 in all eight captured CAST_UPDATEs, i.e. bit7 set, while it is 0x00 in
+        // The trailing byte is 0x80 in all 52 captured CAST_UPDATEs, i.e. bit7 set, while it is 0x00 in
         // every SEQUENCE/APPEND element. Whatever the bit means, it flips on when the cast happens.
+        //
+        // CastState is NOT always 1. 49 of the 52 carry 1 (Casting) with Unknown_3D 0, but 3 carry
+        // CastState 3 (EncounterEventCastState::Expired) with Unknown_3D 0xFF and TimeToCastMs 0. Those 3
+        // are the retail "the queued ability was never actually cast" branch, and they land at
+        // Timestamp + Duration, i.e. the event's cast moment plus MaxQueueDuration - matching to within
+        // 190/258/71 ms on the three occurrences, which is far too tight to be coincidence. All 3 are the
+        // same ability (EncounterEventID 294) that casts normally on other pulls, so state 1 and state 3
+        // are genuine alternatives for one event, not a property of the ability.
+        //
+        // The server now emits the Expired branch, because the data-driven timeline supplies the "the
+        // scheduled cast did not happen" signal that was missing. Rows in `instance_encounter_timeline` are
+        // a prediction made ahead of the cast rather than an announcement by the caster, so the prediction
+        // can be falsified: InstanceScript::UpdateEncounterTimeline checks, at the moment a countdown
+        // reaches zero, whether the unit that was supposed to cast is still present and alive. If it is
+        // not, the event is held for MaxQueueDuration and then reported Expired - which lands it at
+        // Timestamp + Duration, exactly where the 3 captured Expired updates land.
+        //
+        // That check is deliberately the only trigger. It is the one falsification available without
+        // guessing: observing "the boss did not cast this" in general would need a spell-cast hook the core
+        // does not have, and polling for an instant cast would miss it and report a false Expired.
+        // InstanceScript::ExpireEncounterTimelineEvent lets a script state it outright.
         class InstanceEncounterEventCastUpdate final : public ServerPacket
         {
         public:
@@ -508,8 +554,8 @@ namespace WorldPackets
             uint32 EncounterEventID = 0;
             ObjectGuid Caster;
             uint32 DungeonEncounterID = 0;
-            uint8 CastState = 1;                    // EncounterEventCastState::Casting
-            uint8 Unknown_3D = 0;                   // 0 in every capture
+            uint8 CastState = 1;                    // EncounterEventCastState::Casting; 3 == Expired
+            uint8 Unknown_3D = 0;                   // 0 alongside CastState 1, 0xFF alongside CastState 3
             uint32 Timestamp = 0;
             uint32 TimeToCastMs = 0;
             bool UnkBit7 = true;                    // 0x80 in every capture
@@ -643,7 +689,12 @@ namespace WorldPackets
 
             void Read() override;
 
-            uint32 DifficultyID = 0;
+            // The 68275 client writes this as a uint16, not a uint32: the serializer at client RVA 0x6A7840
+            // does `movzx edx, word ptr [msg+0x20]; call write_uint16 (0x33CCDC0)` and nothing else, so the
+            // whole body is two bytes. Reading a uint32 off a two-byte packet threw ByteBufferPositionException
+            // and the handler never ran. The sibling CMSG_SET_DUNGEON_DIFFICULTY (client RVA 0x5D7650) uses the
+            // same uint16 write and MiscPackets already reads it as int16 - this one was the odd man out.
+            uint16 DifficultyID = 0;
         };
 
         class ToggleDifficulty final : public ClientPacket

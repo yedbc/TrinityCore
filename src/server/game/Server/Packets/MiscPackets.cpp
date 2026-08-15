@@ -56,6 +56,26 @@ WorldPacket const* LoginSetTimeSpeed::Write()
     return &_worldPacket;
 }
 
+WorldPacket const* GameTimeSet::Write()
+{
+    _worldPacket << ServerTime;
+    _worldPacket << GameTime;
+    _worldPacket << int32(ServerTimeHolidayOffset);
+    _worldPacket << int32(GameTimeHolidayOffset);
+
+    return &_worldPacket;
+}
+
+WorldPacket const* GameTimeUpdate::Write()
+{
+    _worldPacket << ServerTime;
+    _worldPacket << GameTime;
+    _worldPacket << int32(ServerTimeHolidayOffset);
+    _worldPacket << int32(GameTimeHolidayOffset);
+
+    return &_worldPacket;
+}
+
 WorldPacket const* SetCurrency::Write()
 {
     _worldPacket << int32(Type);
@@ -784,6 +804,13 @@ WorldPacket const* OverrideLight::Write()
     return &_worldPacket;
 }
 
+WorldPacket const* StartLightningStorm::Write()
+{
+    _worldPacket << int32(LightningID);
+
+    return &_worldPacket;
+}
+
 WorldPacket const* DisplayGameError::Write()
 {
     _worldPacket << uint32(Error);
@@ -1093,6 +1120,19 @@ WorldPacket const* CurrencyTransferLog::Write()
         _worldPacket << uint32(entry.Timestamp);
         _worldPacket << int32(0);
     }
+
+    return &_worldPacket;
+}
+
+WorldPacket const* DisplayWorldText::Write()
+{
+    _worldPacket << Guid;
+    _worldPacket << uint32(Arg1);
+    _worldPacket << uint32(Arg2);
+    _worldPacket << SizedString::BitsSize<12>(Text);
+    _worldPacket.FlushBits();
+
+    _worldPacket << SizedString::Data(Text);
 
     return &_worldPacket;
 }
