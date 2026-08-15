@@ -1519,9 +1519,13 @@ void GameEventMgr::UpdateEventQuests(uint16 event_id, bool activate)
 
 void GameEventMgr::UpdateWorldStates(uint16 event_id, bool Activate)
 {
-    if (Optional<int32> worldStateId = mGameEvent[event_id].WorldStateId)
+    // Direct optional check + deref rather than capturing into a condition-scope variable: the
+    // capture form relies on std::optional's explicit operator bool firing in a declaration-in-
+    // condition, which some toolchains/STL configs reject at *worldStateId. Behaviour-identical,
+    // more portable.
+    if (mGameEvent[event_id].WorldStateId)
     {
-        WorldStateMgr::SetValue(*worldStateId, Activate ? 1 : 0, false, nullptr);
+        WorldStateMgr::SetValue(*mGameEvent[event_id].WorldStateId, Activate ? 1 : 0, false, nullptr);
 
         // The event just changed the value this world state's schedule reports, so every client's copy
         // of it is now stale.
