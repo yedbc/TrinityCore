@@ -30,6 +30,9 @@ void AddSC_cheat_commandscript();
 void AddSC_conduit_commandscript();
 void AddSC_debug_commandscript();
 void AddSC_delve_commandscript();
+
+void AddSC_decorduel_commandscript();
+void AddSC_postal_commandscript();
 void AddSC_deserter_commandscript();
 void AddSC_garrison_commandscript();
 void AddSC_disable_commandscript();
@@ -85,6 +88,9 @@ void AddCommandsScripts()
     AddSC_conduit_commandscript();
     AddSC_debug_commandscript();
     AddSC_delve_commandscript();
+
+    AddSC_decorduel_commandscript();
+    AddSC_postal_commandscript();
     AddSC_deserter_commandscript();
     AddSC_garrison_commandscript();
     AddSC_disable_commandscript();

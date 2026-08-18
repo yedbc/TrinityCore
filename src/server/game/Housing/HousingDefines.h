@@ -752,6 +752,28 @@ enum HouseLevelRewardValueType : uint8
 // still slamming the door on arbitrary-coordinate GameObject spam that the old
 // Position::IsPositionValid() check (|coord| < ~64000) let straight through.
 static constexpr float HOUSING_MAX_DECOR_LOCAL_EXTENT  = 1024.0f;
+// #16 Outdoor Lighting (12.0.7): DecorCategory.db2 id 4 "Lighting" (subcategories
+// 16-21: Large/Wall/Ceiling/Small/Misc Lights). 12.0.7 lets Lighting decor be
+// placed outdoors on the plot; the placement path classifies a decor as Lighting
+// through DecorXDecorSubcategory -> DecorSubcategory.DecorCategoryID.
+static constexpr uint32 HOUSING_DECOR_CATEGORY_LIGHTING = 4;
+// A4 / RETAIL PARITY-OUTDOOR-LIGHT-RADIUS: 12.0.7 rule "two lights cannot overlap".
+// The exact light-to-light overlap radius is NOT datamineable from DB2 or any
+// capture we hold (CAPTURE-BLOCKED). This is a documented default minimum
+// separation between two exterior lights, in local decor space (yards) — replace
+// with the sniffed value once an outdoor-light placement capture exists.
+static constexpr float HOUSING_LIGHT_OVERLAP_RADIUS = 3.0f;
+
+// H-05 bound for CMSG_HOUSE_EXTERIOR_SET_HOUSE_POSITION. A player may nudge the
+// house around its own plot; they may not relocate it. The plot's placement
+// volume is the RoomWmoData geobox SpawnRoomForPlot uses (~+/-35 x +/-30 yards),
+// so these half-extents are deliberately a little wider than that - generous
+// enough never to reject a legitimate reposition, tight enough that the house
+// cannot be parked on a neighbour's plot or flung off the map. Before this the
+// handler validated std::isfinite() and nothing else, and the value was
+// persisted, so any finite coordinate survived a restart.
+static constexpr float HOUSING_MAX_HOUSE_PLOT_OFFSET_XY = 45.0f;
+static constexpr float HOUSING_MAX_HOUSE_PLOT_OFFSET_Z  = 50.0f;
 // m3/A6 decoration throttle: at most BURST place/move/remove ops per WINDOW_MS.
 // Generous enough for rapid legitimate redecorating, tight enough to cap the
 // AddToMap + synchronous-DB-write amplification a scripted client can drive.
@@ -966,5 +988,83 @@ static constexpr float HOUSE_INTERIOR_FLOOR_HEIGHT = 12.0f;
 // go_housing_door script to them explicitly - without it the door inside the house is inert.
 static constexpr uint32 INTERIOR_DOOR_GO_ALLIANCE = 575017; // displayId 113554
 static constexpr uint32 INTERIOR_DOOR_GO_HORDE    = 587318;
+
+// ============================================================================
+// Patch 12.1.0 (build 69299) additions — RE spec:
+//   c:\dumps\tools\dump121\housing\housing_12_1_spec.md
+// Enum MEMBER NAMES are binary-verified (client reflection strings / auto_HOUSING_*
+// event + ERR_HOUSING_* error tables). Enum NUMERIC VALUES are inferred (string-order
+// ordinals) — the client enum-constant registrar tables are not cleanly recoverable
+// offline (spec §5). Flagged accordingly; confirm values against a 12.1 capture/DB.
+// ============================================================================
+
+// Blueprint category. Names from HOUSING_BLUEPRINT_COLLECTION_GROUP_{HOUSE,INTERIOR,
+// EXTERIOR,ROOM,BACKUP} client event strings [BIN]. Values = string order [INF].
+enum class HousingBlueprintType : uint32
+{
+    House    = 0,
+    Interior = 1,
+    Exterior = 2,
+    Room     = 3,
+    Backup   = 4,
+};
+
+// Content granularity of a blueprint's item list (JamBlueprintItemList carries decor/
+// dye/room/fixture ID sets). Mirrors HousingBlueprintType groups. Names [BIN] / values [INF].
+enum class HousingBlueprintContentType : uint32
+{
+    House    = 0,
+    Interior = 1,
+    Exterior = 2,
+    Room     = 3,
+    Backup   = 4,
+};
+
+// JamHousingBlueprint.flags bitmask. Client has HousingBlueprintFlag/Meta but the member
+// values were NOT recovered offline — kept opaque; do not assume a meaning. [INF]
+enum HousingBlueprintFlags : uint32
+{
+    HOUSING_BLUEPRINT_FLAG_NONE = 0x0,
+    // values unresolved offline (spec §5) — treat JamHousingBlueprint.flags as opaque uint32
+};
+
+// ImportBlueprint requirement gate. Bits from ERR_HOUSING_BLUEPRINT_REQUIREMENT_* [BIN];
+// bit positions = error-string order [INF]. Import is refused unless the target house
+// satisfies all set requirements (spec §6).
+enum HousingBlueprintUnmetRequirementFlags : uint32
+{
+    HOUSING_BLUEPRINT_REQ_NONE             = 0x0,
+    HOUSING_BLUEPRINT_REQ_EXTERIOR_FACTION = 0x1,
+    HOUSING_BLUEPRINT_REQ_HOUSE_TYPE       = 0x2,
+    HOUSING_BLUEPRINT_REQ_HOUSE_SIZE       = 0x4,
+};
+
+// JamHouseBudgetEntry.budgetType. Categories from the Lua budget accessors
+// Get{Max,Spent}PlacementBudget / Get{Max,Spent}PetPlacementBudget / GetRoomPlacementBudget
+// [BIN names] / values [INF]. Each is tracked separately within interior vs exterior.
+enum class HouseBudgetType : uint32
+{
+    Decor   = 0,
+    PetBed  = 1,
+    Room    = 2,
+    Fixture = 3,
+};
+
+// Pet beds (12.1): decor items with their own placement budget. Caps come from client
+// config globals housingMaxPetBedsInterior@0x127F60 / housingMaxPetBedsExterior@0x127FD0
+// [BIN symbols]. Default caps are placeholders until a value capture/DB confirms. [INF]
+static constexpr uint32 HOUSING_MAX_PET_BEDS_INTERIOR = 6;
+static constexpr uint32 HOUSING_MAX_PET_BEDS_EXTERIOR = 6;
+
+// Blueprint per-BNet-account caps. Client events HOUSING_BLUEPRINTS_MAX_PER_BNET_ACCOUNT
+// @0x13B993F and HOUSING_BLUEPRINTS_MAX_BACKUPS_PER_BNET_ACCOUNT@0x13B9968 exist [BIN];
+// the numeric caps are format-string args, not recovered offline — placeholders. [INF]
+static constexpr uint32 HOUSING_BLUEPRINTS_MAX_PER_BNET_ACCOUNT = 50;
+static constexpr uint32 HOUSING_BLUEPRINTS_MAX_BACKUPS_PER_BNET = 10;
+
+// 12.1 raised the displayed house level cap to 12 (patch notes). MAX_HOUSE_LEVEL above is
+// already 20 (headroom); levels 11-12 are HouseLevelData.db2 rows + larger budgets +
+// large-exterior unlock — a DATA change, not a code cap. [data]
+static constexpr uint32 HOUSING_DISPLAY_LEVEL_CAP_12_1 = 12;
 
 #endif // TRINITYCORE_HOUSING_DEFINES_H

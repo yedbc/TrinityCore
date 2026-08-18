@@ -587,6 +587,13 @@ namespace WorldPackets
 
     namespace Housing
     {
+        // Patch 12.1.0 (build 69299) blueprint packets (HousingBlueprintPackets.h)
+        class HousingBlueprintRequestCollection;
+        class HousingBlueprintRequestContents;
+        class HousingBlueprintExport;
+        class HousingBlueprintExportRoom;
+        class HousingBlueprintRename;
+        class HousingBlueprintImport;
         class HouseExteriorCommitPosition;
         class HouseInteriorLeaveHouse;
         class HousingDecorSetEditMode;
@@ -1949,6 +1956,11 @@ class TC_GAME_API WorldSession
         // m3/A6: returns false (and consumes no budget) when the per-session
         // decoration throttle is exceeded; handlers then reply TOO_MANY_REQUESTS.
         bool CheckHousingDecorThrottle();
+
+        // H-25: a charter may only be signed by someone who was asked to sign it.
+        void AddPendingCharterSignatureRequest(uint64 charterId) { _pendingCharterSignatureRequests.insert(charterId); }
+        bool HasPendingCharterSignatureRequest(uint64 charterId) const { return _pendingCharterSignatureRequests.contains(charterId); }
+        void ClearPendingCharterSignatureRequest(uint64 charterId) { _pendingCharterSignatureRequests.erase(charterId); }
         void HandleHousingDecorSetEditMode(WorldPackets::Housing::HousingDecorSetEditMode const& housingDecorSetEditMode);
         void HandleHousingDecorPlace(WorldPackets::Housing::HousingDecorPlace const& housingDecorPlace);
         void HandleHousingDecorMove(WorldPackets::Housing::HousingDecorMove const& housingDecorMove);
@@ -1962,6 +1974,15 @@ class TC_GAME_API WorldSession
         // Retired 2026-05-11: HandleHousingDecorStartPlacingNewDecor + CatalogCreateSearcher (TC-CUSTOM CMSGs).
         void HandleGetLastCatalogFetch(WorldPackets::Housing::GetLastCatalogFetch const& getLastCatalogFetch);
         void HandleUpdateLastCatalogFetch(WorldPackets::Housing::UpdateLastCatalogFetch const& updateLastCatalogFetch);
+
+        // Housing - Blueprint System (Patch 12.1.0 / build 69299). See HousingHandler.cpp.
+        // Bound only when the base is on the 12.1 opcode table (HOUSING_12_1_OPCODES gate).
+        void HandleHousingBlueprintRequestCollection(WorldPackets::Housing::HousingBlueprintRequestCollection const& packet);
+        void HandleHousingBlueprintRequestContents(WorldPackets::Housing::HousingBlueprintRequestContents const& packet);
+        void HandleHousingBlueprintExport(WorldPackets::Housing::HousingBlueprintExport const& packet);
+        void HandleHousingBlueprintExportRoom(WorldPackets::Housing::HousingBlueprintExportRoom const& packet);
+        void HandleHousingBlueprintRename(WorldPackets::Housing::HousingBlueprintRename const& packet);
+        void HandleHousingBlueprintImport(WorldPackets::Housing::HousingBlueprintImport const& packet);
 
         // Housing - Fixture System
         void SendFixtureUpdateObject(Player* player, Housing* housing);
@@ -2991,6 +3012,15 @@ class TC_GAME_API WorldSession
         // HOUSING_DECOR_THROTTLE_BURST edits per HOUSING_DECOR_THROTTLE_WINDOW_MS.
         uint32 _housingDecorThrottleWindowStart = 0;
         uint32 _housingDecorThrottleCount = 0;
+
+        // H-25: charter ids this session has actually been asked to sign.
+        // CMSG_NEIGHBORHOOD_CHARTER_ADD_SIGNATURE takes the charter id from the client
+        // and charter ids are creator GUID counters, so without this any player could
+        // sign any charter on the realm by enumerating ids, and
+        // CMSG_NEIGHBORHOOD_CHARTER_SEND_SIGNATURE_REQUEST - which exists to invite a
+        // signer - was decorative. Session-scoped on purpose: a signature request is an
+        // in-the-moment offer, so it does not survive a relog, and nothing is persisted.
+        std::unordered_set<uint64> _pendingCharterSignatureRequests;
 
         WorldSession(WorldSession const& right) = delete;
         WorldSession& operator=(WorldSession const& right) = delete;
