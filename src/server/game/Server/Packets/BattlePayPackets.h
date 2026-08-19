@@ -47,6 +47,22 @@ namespace WorldPackets
             void Read() override { }
         };
 
+        // CMSG_CATALOG_SHOP_LICENSE_GAME_DATA_REQUEST. Sent by the client mid-checkout carrying its own
+        // license / game data. The body is variable (876/140/52/36/24 bytes across the 12.1.0.69382
+        // capture). We keep the whole body so the handler can log its size for future response modeling;
+        // the paired response wire (SMSG 0x4202C1) is not yet recovered - see
+        // WorldSession::HandleCatalogShopLicenseGameDataRequest.
+        class CatalogShopLicenseGameDataRequest final : public ClientPacket
+        {
+        public:
+            explicit CatalogShopLicenseGameDataRequest(WorldPacket&& packet)
+                : ClientPacket(CMSG_CATALOG_SHOP_LICENSE_GAME_DATA_REQUEST, std::move(packet)) { }
+
+            void Read() override;
+
+            std::vector<uint8> Data;    // raw request body, retained for diagnostics only
+        };
+
         // The 12.0.7 catalog is a nested reflection bitstream that cannot be re-serialized field-by-field
         // offline (see docs). For P0 we replay a byte-exact, client-validated catalog blob captured from a
         // real 68275 session, so the shop opens and displays real products. RawData is the message BODY
@@ -403,9 +419,10 @@ namespace WorldPackets
             bool Flag = false;
         };
 
-        // Client opens the checkout. The u32 is the ClientToken the server must echo back verbatim in
-        // SMSG_GENERATE_SSO_TOKEN_RESPONSE (proven 1:1 in all 8 captures - checkout #N -> response #N
-        // with the same u32). It is not a distributionID. See COMMERCE_AUDIT C-09.
+        // Client opens the checkout. Body is 8 bytes: { u32 ClientToken, u32 ProductID } (12.1.0.69382
+        // capture, Midnight ProductID 0x417070 in all 7 attempts). ClientToken is the token the SSO/token
+        // handshake echoes back verbatim for an in-game-currency product (COMMERCE_AUDIT C-09); ProductID
+        // selects the product and decides the payment rail - see HandleBattlePayOpenCheckout.
         class OpenCheckout final : public ClientPacket
         {
         public:
@@ -414,6 +431,7 @@ namespace WorldPackets
             void Read() override;
 
             uint32 ClientToken = 0;
+            uint32 ProductID = 0;
         };
 
         // Server-driven purchase confirmation prompt (retail interposes this between StartPurchase and

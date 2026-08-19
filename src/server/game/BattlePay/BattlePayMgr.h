@@ -29,6 +29,29 @@
 
 class Player;
 
+// Payment method of a shop product (ShopProduct::Currency). Distinct from the client's CurrencyTypes.db2
+// ids - this is how the SERVER charges. REAL_MONEY is the Rail A marker: such a product is never charged
+// on the wire; its checkout goes to the shop2 web overlay (or is granted instantly for QA) per
+// Shop.RealMoney.Mode. The COMMERCE_MASTER_PLAN's "CurrencyTypesID == 0 (real money)" maps to this value,
+// because value 0 here already means "free".
+enum ShopCurrency : uint8
+{
+    SHOP_CURRENCY_FREE       = 0,   // no cost
+    SHOP_CURRENCY_GOLD       = 1,   // copper
+    SHOP_CURRENCY_ITEM_TOKEN = 2,   // a token item (PriceItemId x PriceItemCount)
+    SHOP_CURRENCY_CUSTOM     = 3,   // custom currency amount
+    SHOP_CURRENCY_REAL_MONEY = 4    // real money -> Rail A (web checkout); never charged on the wire
+};
+
+// Server behaviour when a real-money (Rail A) product's checkout is opened. Read from the
+// Shop.RealMoney.Mode config string; see BattlePayMgr::GetRealMoneyMode.
+enum ShopRealMoneyMode : uint8
+{
+    SHOP_REAL_MONEY_WEB      = 0,   // let the client web-checkout; the realm sends no game response
+    SHOP_REAL_MONEY_INSTANT  = 1,   // grant server-side immediately with no charge (private-realm QA)
+    SHOP_REAL_MONEY_DISABLED = 2    // refuse: no SSO token, no grant
+};
+
 // A single deliverable payload of a shop product (>1 per product = a bundle).
 struct ShopDeliverable
 {
@@ -106,7 +129,7 @@ struct ShopProduct
     bool   Enabled   = true;
     std::string Name;
     std::string Description;
-    uint8  Currency  = 1;           // 0 free | 1 gold(copper) | 2 item-token | 3 custom-currency
+    uint8  Currency  = 1;           // ShopCurrency: 0 free | 1 gold | 2 item-token | 3 custom | 4 real-money(web)
     uint64 Price     = 0;           // copper (currency 1) or currency amount (3)
     uint32 PriceItemId = 0;         // currency 2: token item
     uint32 PriceItemCount = 0;
@@ -193,6 +216,11 @@ public:
     static bool NeedsEntitlement(ShopProduct const& product, Player* player);
     // The VAS service type a product's type-5 deliverable names, or 0 if it has none.
     static uint8 GetServiceType(ShopProduct const& product);
+
+    // How the realm treats a real-money (Rail A) checkout, from the Shop.RealMoney.Mode config string
+    // ("web" | "instant" | "disabled"; unknown values fall back to the default). See the OPEN_CHECKOUT
+    // rail branch in HandleBattlePayOpenCheckout.
+    static ShopRealMoneyMode GetRealMoneyMode();
 
     // Allocates the next DistributionID (realm-namespaced, seeded from the store at startup).
     uint64 GenerateDistributionID() { return ++_distributionCounter; }

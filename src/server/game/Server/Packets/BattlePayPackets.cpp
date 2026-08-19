@@ -178,6 +178,18 @@ void StartPurchase::Read()
 void OpenCheckout::Read()
 {
     _worldPacket >> ClientToken;
+    _worldPacket >> ProductID;
+}
+
+void CatalogShopLicenseGameDataRequest::Read()
+{
+    // The response wire is not yet modeled, so this body is retained for diagnostics only (its size
+    // identifies which of the captured request variants it is). Consume the whole body so the packet
+    // is not reported as under-read.
+    size_t const len = _worldPacket.size();
+    Data.resize(len);
+    if (len)
+        _worldPacket.read(Data.data(), len);
 }
 
 WorldPacket const* StartPurchaseResponse::Write()

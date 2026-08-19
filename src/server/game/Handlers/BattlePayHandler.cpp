@@ -591,11 +591,103 @@ void WorldSession::HandleBattlePayOpenCheckout(WorldPackets::BattlePay::OpenChec
     if (!sWorld->getBoolConfig(CONFIG_SHOP_ENABLED))
         return;
 
-    // Retail answers CMSG_BATTLE_PAY_OPEN_CHECKOUT with SMSG_GENERATE_SSO_TOKEN_RESPONSE as a strict
-    // 1:1 echo of the request's ClientToken (proven in all 8 captures: checkout #N -> response #N with
-    // the same u32). Answering from here - rather than pushing the token unsolicited at login - is what
-    // lets checkouts #2+ get a reply. See COMMERCE_AUDIT C-09 / WOW_TOKEN_RE_68275.md.
-    SendGenerateSsoToken(openCheckout.ClientToken);
+    // Two payment rails, decided by the checked-out product (resolve the advertised productID -> catalog):
+    //
+    // Rail B - IN-GAME CURRENCY. A product we route whose Currency is anything but real money is bought on
+    //   the wire. Keep the proven handshake: SMSG_GENERATE_SSO_TOKEN_RESPONSE echoing the request's
+    //   ClientToken 1:1 (COMMERCE_AUDIT C-09 / WOW_TOKEN_RE_68275.md). Answering from here - not from an
+    //   unsolicited push at login - is what lets checkouts #2+ get a reply.
+    //
+    // Rail A - REAL MONEY. Either a product explicitly flagged Currency 4 (real money), OR an un-reskinned
+    //   retail catalog card we do not route to a shop_product (e.g. the Midnight expansion, ProductID
+    //   0x417070). The 12.1.0.69382 sniff proves the client gets NO game-packet response for such a
+    //   product and opens the shop2 web overlay itself; the old 1:1 SSO echo here was only ever correct for
+    //   in-game-currency items. Behaviour is governed by Shop.RealMoney.Mode.
+    ShopProduct const* product = sBattlePayMgr->GetProductByAdvertisedId(openCheckout.ProductID);
+    if (product && product->Currency != SHOP_CURRENCY_REAL_MONEY)
+    {
+        SendGenerateSsoToken(openCheckout.ClientToken);
+        return;
+    }
+
+    switch (BattlePayMgr::GetRealMoneyMode())
+    {
+        case SHOP_REAL_MONEY_INSTANT:
+        {
+            // Grant the product server-side with no charge (private-realm QA default). Reuse the proven
+            // delivery path: a real-money product carries Currency 4, which the charge checks (== gold,
+            // == item token) never match, so nothing is deducted. An unrouted retail card has no
+            // shop_product to grant - honest no-op rather than a faked success.
+            if (!product)
+            {
+                TC_LOG_INFO("network", "BattlePay: {} opened a real-money checkout for unrouted product {} with "
+                    "Shop.RealMoney.Mode=instant, but no shop_product is seeded for it - nothing to grant.",
+                    GetPlayerInfo(), openCheckout.ProductID);
+                return;
+            }
+
+            // The client resends OPEN_CHECKOUT on each web-payment failure (7 retries in the capture);
+            // throttle identical rapid retries so instant mode grants exactly once, reusing the same
+            // per-session guard as the StartPurchase path.
+            static constexpr uint32 BATTLEPAY_INSTANT_THROTTLE_MS = 2000;
+            uint32 const now = getMSTime();
+            if (_battlePayPurchaseInFlight ||
+                (_lastBattlePayPurchaseMSTime && getMSTimeDiff(_lastBattlePayPurchaseMSTime, now) < BATTLEPAY_INSTANT_THROTTLE_MS))
+            {
+                TC_LOG_DEBUG("network", "BattlePay: throttled duplicate real-money instant checkout from {} (product {}).",
+                    GetPlayerInfo(), openCheckout.ProductID);
+                return;
+            }
+            _lastBattlePayPurchaseMSTime = now;
+
+            TC_LOG_INFO("network", "BattlePay: {} real-money checkout for product {} granted instantly "
+                "(Shop.RealMoney.Mode=instant, no charge).", GetPlayerInfo(), openCheckout.ProductID);
+
+            _battlePayPurchaseInFlight = true;
+            BattlePayProcessPurchase(openCheckout.ProductID);
+            _battlePayPurchaseInFlight = false;
+            return;
+        }
+        case SHOP_REAL_MONEY_DISABLED:
+            // Refuse politely: no SSO token, no grant. The client opened its own web overlay on
+            // OPEN_CHECKOUT and the realm cannot recall that, but it neither authenticates the web session
+            // nor delivers anything, so the purchase cannot complete. Logged for the operator.
+            TC_LOG_INFO("network", "BattlePay: {} attempted a real-money checkout for product {} but "
+                "Shop.RealMoney.Mode=disabled - refused (no SSO, no grant).", GetPlayerInfo(), openCheckout.ProductID);
+            return;
+        case SHOP_REAL_MONEY_WEB:
+        default:
+            // Sniff-accurate: the client already opened the shop2 HTTPS overlay from OPEN_CHECKOUT, so the
+            // game connection sends NO response. Completion, if any, arrives from the web backend (Rail A3).
+            TC_LOG_DEBUG("network", "BattlePay: {} opened a real-money web checkout for product {} (client token {}); "
+                "no game response (Shop.RealMoney.Mode=web).", GetPlayerInfo(), openCheckout.ProductID, openCheckout.ClientToken);
+            return;
+    }
+}
+
+// CMSG_CATALOG_SHOP_LICENSE_GAME_DATA_REQUEST. The client sends this mid-checkout carrying its own
+// license / game data (variable body: 876/140/52/36/24 bytes in the 12.1.0.69382 capture). Retail answers
+// on SMSG opcode 0x4202C1 - which our opcode map currently mis-names SMSG_VAS_GET_QUEUE_MINUTES_RESPONSE
+// (the sniff's 0x4502C1 is that opcode plus the sniff's fixed 0x030000 server-opcode bias) - with an
+// 11465/1025/423/403/40-byte payload.
+//
+// That response is a nested reflection bitstream whose FIELD LAYOUT is not recovered - the capture gives
+// only the sizes, not the member types. Emitting a guessed layout on that opcode would risk the client's
+// reflection parser rejecting it and disconnecting, which is exactly the "do not invent wire" hazard. So
+// this handler does the honest, safe thing: it makes the opcode an EXPECTED, real handler (no more
+// STATUS_UNHANDLED / Handle_NULL), logs the body size so a future capture can be matched to a variant, and
+// sends nothing. The 69382 capture shows the checkout proceeds (the client drives its own web overlay from
+// OPEN_CHECKOUT) without the realm answering this, so withholding the un-modeled response does not stall
+// the client. When the response wire is recovered, this is where it is sent.
+void WorldSession::HandleCatalogShopLicenseGameDataRequest(WorldPackets::BattlePay::CatalogShopLicenseGameDataRequest& request)
+{
+    if (!sWorld->getBoolConfig(CONFIG_SHOP_ENABLED))
+        return;
+
+    TC_LOG_INFO("network", "BattlePay: CATALOG_SHOP_LICENSE_GAME_DATA_REQUEST from {} ({} body bytes). The paired "
+        "response (SMSG 0x4202C1) is an un-modeled reflection payload and is deliberately not answered - see the "
+        "handler note. If the client stalls waiting for it, capture the response bytes and model them here.",
+        GetPlayerInfo(), request.Data.size());
 }
 
 namespace
