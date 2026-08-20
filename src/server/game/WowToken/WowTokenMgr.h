@@ -37,10 +37,11 @@ enum WowTokenState : uint8
 struct WowToken
 {
     uint64 Id            = 0;
-    uint32 OwnerAccount  = 0;
+    uint32 OwnerAccount  = 0;   // owning account; the seller's account while WOW_TOKEN_STATE_LISTED
     WowTokenState State  = WOW_TOKEN_STATE_AUCTIONABLE;
     uint64 Price         = 0;   // copper; only meaningful while WOW_TOKEN_STATE_LISTED
     time_t CreateTime    = 0;
+    uint64 SellerGuid    = 0;   // character lowguid that listed the token, so sale proceeds can be mailed
 };
 
 // Account-level WoW Token holdings and the token market.
@@ -66,11 +67,30 @@ public:
 
     WowToken const* GetToken(uint64 tokenId) const;
 
+    // First token an account holds in the given state, or nullptr. Used by the market handlers which
+    // operate on the account's holdings rather than trusting a client-supplied token id.
+    WowToken const* GetFirstToken(uint32 accountId, WowTokenState state) const;
+
     // Creates a token owned by an account and persists it. Returns the new token id.
     uint64 CreateToken(uint32 accountId, WowTokenState state);
 
     // Moves a token between states (and optionally owners), persisting the change.
     bool SetTokenState(uint64 tokenId, WowTokenState state, uint32 ownerAccount, uint64 price = 0);
+
+    // ---- Token market (gated by WowToken.Market.Enabled) --------------------------------------------
+    // Lists an account's auctionable token on the market at 'price'. 'sellerCharGuid' is the character
+    // lowguid that will receive the gold when the listing sells. Returns false if the token is not an
+    // auctionable holding of that account.
+    bool ListToken(uint64 tokenId, uint32 sellerAccount, uint64 sellerCharGuid, uint64 price);
+
+    // Removes the cheapest market listing and hands it to 'buyerAccount' as a consumable token. On success
+    // returns the token id and reports the listing's price and the seller's character guid; returns 0 when
+    // nothing is listed.
+    uint64 TakeCheapestListing(uint32 buyerAccount, uint64& outPrice, uint64& outSellerCharGuid);
+
+    // Consumes (deletes) a redeemed token owned by an account. Returns false if the token is not a
+    // consumable holding of that account.
+    bool RedeemToken(uint64 tokenId, uint32 accountId);
 
     // Generates a fresh single sign-on token, of the form "<REGION>-<32 lowercase hex>-<bnet account id>"
     // (observed retail body length 45, e.g. "US-" + 32 hex + "-" + a 9-digit account id). The hex half is
@@ -85,6 +105,9 @@ private:
     ~WowTokenMgr() = default;
     WowTokenMgr(WowTokenMgr const&) = delete;
     WowTokenMgr& operator=(WowTokenMgr const&) = delete;
+
+    // Writes the token's mutable columns (account, state, price, seller_guid) back to the auth DB.
+    void Persist(WowToken const& token);
 
     std::unordered_map<uint64, WowToken> _tokens;
     uint64 _maxTokenId = 0;

@@ -41,8 +41,8 @@ void WowTokenMgr::Load()
     _tokens.clear();
     _maxTokenId = 0;
 
-    //                                                     0   1        2      3      4
-    QueryResult result = LoginDatabase.Query("SELECT id, account, state, price, createTime FROM account_wow_token");
+    //                                                     0   1        2      3      4           5
+    QueryResult result = LoginDatabase.Query("SELECT id, account, state, price, createTime, seller_guid FROM account_wow_token");
     if (!result)
     {
         TC_LOG_INFO("server.loading", ">> Loaded 0 WoW tokens. The table is empty.");
@@ -58,6 +58,7 @@ void WowTokenMgr::Load()
         token.OwnerAccount = fields[1].GetUInt32();
         token.Price        = fields[3].GetUInt64();
         token.CreateTime   = fields[4].GetInt64();
+        token.SellerGuid   = fields[5].GetUInt64();
 
         uint8 state = fields[2].GetUInt8();
         if (state > WOW_TOKEN_STATE_LISTED)
@@ -124,6 +125,17 @@ WowToken const* WowTokenMgr::GetToken(uint64 tokenId) const
     return itr != _tokens.end() ? &itr->second : nullptr;
 }
 
+WowToken const* WowTokenMgr::GetFirstToken(uint32 accountId, WowTokenState state) const
+{
+    WowToken const* found = nullptr;
+    for (auto const& [tokenId, token] : _tokens)
+        if (token.OwnerAccount == accountId && token.State == state)
+            if (!found || token.Id < found->Id)
+                found = &token;
+
+    return found;
+}
+
 uint64 WowTokenMgr::CreateToken(uint32 accountId, WowTokenState state)
 {
     WowToken token;
@@ -140,6 +152,7 @@ uint64 WowTokenMgr::CreateToken(uint32 accountId, WowTokenState state)
     stmt->setUInt8(2, uint8(token.State));
     stmt->setUInt64(3, token.Price);
     stmt->setInt64(4, token.CreateTime);
+    stmt->setUInt64(5, token.SellerGuid);
     LoginDatabase.Execute(stmt);
 
     return token.Id;
@@ -156,11 +169,76 @@ bool WowTokenMgr::SetTokenState(uint64 tokenId, WowTokenState state, uint32 owne
     token.OwnerAccount = ownerAccount;
     token.Price        = price;
 
+    Persist(token);
+    return true;
+}
+
+void WowTokenMgr::Persist(WowToken const& token)
+{
     LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_UPD_ACCOUNT_WOW_TOKEN);
     stmt->setUInt32(0, token.OwnerAccount);
     stmt->setUInt8(1, uint8(token.State));
     stmt->setUInt64(2, token.Price);
-    stmt->setUInt64(3, token.Id);
+    stmt->setUInt64(3, token.SellerGuid);
+    stmt->setUInt64(4, token.Id);
+    LoginDatabase.Execute(stmt);
+}
+
+bool WowTokenMgr::ListToken(uint64 tokenId, uint32 sellerAccount, uint64 sellerCharGuid, uint64 price)
+{
+    auto itr = _tokens.find(tokenId);
+    if (itr == _tokens.end())
+        return false;
+
+    WowToken& token = itr->second;
+    if (token.OwnerAccount != sellerAccount || token.State != WOW_TOKEN_STATE_AUCTIONABLE)
+        return false;
+
+    token.State      = WOW_TOKEN_STATE_LISTED;
+    token.Price      = price;
+    token.SellerGuid = sellerCharGuid;
+    // OwnerAccount stays the seller so proceeds can be routed when the listing sells.
+
+    Persist(token);
+    return true;
+}
+
+uint64 WowTokenMgr::TakeCheapestListing(uint32 buyerAccount, uint64& outPrice, uint64& outSellerCharGuid)
+{
+    WowToken* cheapest = nullptr;
+    for (auto& [tokenId, token] : _tokens)
+        if (token.State == WOW_TOKEN_STATE_LISTED)
+            if (!cheapest || token.Price < cheapest->Price || (token.Price == cheapest->Price && token.Id < cheapest->Id))
+                cheapest = &token;
+
+    if (!cheapest)
+        return 0;
+
+    outPrice          = cheapest->Price;
+    outSellerCharGuid = cheapest->SellerGuid;
+
+    cheapest->State        = WOW_TOKEN_STATE_CONSUMABLE;
+    cheapest->OwnerAccount = buyerAccount;
+    cheapest->Price        = 0;
+    cheapest->SellerGuid   = 0;
+
+    Persist(*cheapest);
+    return cheapest->Id;
+}
+
+bool WowTokenMgr::RedeemToken(uint64 tokenId, uint32 accountId)
+{
+    auto itr = _tokens.find(tokenId);
+    if (itr == _tokens.end())
+        return false;
+
+    if (itr->second.OwnerAccount != accountId || itr->second.State != WOW_TOKEN_STATE_CONSUMABLE)
+        return false;
+
+    _tokens.erase(itr);
+
+    LoginDatabasePreparedStatement* stmt = LoginDatabase.GetPreparedStatement(LOGIN_DEL_ACCOUNT_WOW_TOKEN);
+    stmt->setUInt64(0, tokenId);
     LoginDatabase.Execute(stmt);
 
     return true;
