@@ -121,4 +121,89 @@ WorldPacket const* CommerceTokenGetMarketPriceResponse::Write()
 
     return &_worldPacket;
 }
+
+void AuctionableTokenSell::Read()
+{
+    _worldPacket >> TokenID;
+    _worldPacket >> Price;
+    _worldPacket >> ClientToken;
+}
+
+void AuctionableTokenSellAtMarketPrice::Read()
+{
+    _worldPacket >> Guid;
+    _worldPacket >> ClientToken;
+    _worldPacket >> Unk;
+    _worldPacket >> UnkPrice;
+    _worldPacket >> Bits<1>(Confirmed);
+}
+
+WorldPacket const* AuctionableTokenSellAtMarketPriceResponse::Write()
+{
+    _worldPacket << ClientToken;
+    _worldPacket << Result;
+
+    return &_worldPacket;
+}
+
+void ConsumableTokenBuy::Read()
+{
+    _worldPacket >> ClientToken;
+    _worldPacket >> Guid;
+    _worldPacket >> Unk;
+}
+
+void ConsumableTokenBuyAtMarketPrice::Read()
+{
+    _worldPacket >> Unk;
+    _worldPacket >> ClientToken;
+    _worldPacket >> Unk2;
+    _worldPacket >> Bits<1>(Confirmed);
+}
+
+WorldPacket const* ConsumableTokenBuyAtMarketPriceResponse::Write()
+{
+    _worldPacket << ClientToken;
+    _worldPacket << Result;
+
+    return &_worldPacket;
+}
+
+void ConsumableTokenRedeem::Read()
+{
+    _worldPacket >> RedeemType;
+    _worldPacket >> TokenID;
+    _worldPacket >> ClientToken;
+}
+
+void ConsumableTokenRedeemConfirmation::Read()
+{
+    _worldPacket >> RedeemType;
+    _worldPacket >> TokenID;
+    _worldPacket >> Guid;
+    _worldPacket >> ClientToken;
+    _worldPacket >> Bits<1>(Confirmed);
+}
+
+WorldPacket const* ConsumableTokenRedeemConfirmRequired::Write()
+{
+    _worldPacket << ClientToken;
+    _worldPacket << ChoiceType;
+    _worldPacket << Result;
+    _worldPacket << Amount;
+    _worldPacket << Amount2;
+    _worldPacket << Seconds;
+    _worldPacket << Flags;
+
+    return &_worldPacket;
+}
+
+WorldPacket const* ConsumableTokenRedeemResponse::Write()
+{
+    _worldPacket << ClientToken;
+    _worldPacket << Result;
+    _worldPacket << ChoiceType;
+
+    return &_worldPacket;
+}
 }

@@ -398,6 +398,7 @@ CREATE TABLE `account_wow_token` (
   `state` tinyint unsigned NOT NULL DEFAULT '0' COMMENT '0 Auctionable, 1 Consumable, 2 Listed on the market',
   `price` bigint unsigned NOT NULL DEFAULT '0' COMMENT 'Copper, only meaningful while state = 2',
   `createTime` bigint NOT NULL DEFAULT '0',
+  `seller_guid` bigint unsigned NOT NULL DEFAULT '0' COMMENT 'Character lowguid that listed the token; receives the sale proceeds by mail',
   PRIMARY KEY (`id`),
   KEY `idx_account` (`account`),
   KEY `idx_state` (`state`)
