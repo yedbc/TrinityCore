@@ -199,17 +199,41 @@ void ChallengeModeMgr::ResolveActiveSeason()
     _activeSeasonId = uint32(sConfigMgr->GetIntDefault("ChallengeMode.SeasonId", 0));
     if (!_activeSeasonId)
     {
-        int32 bestExpansion = -1;
-        int32 bestStart = -1;
-        for (MythicPlusSeasonEntry const* season : sMythicPlusSeasonStore)
+        // Auto-detect the latest-started season of the highest expansion. A live vault-granting season always has
+        // MythicPlusSeasonRewardLevels rows; MythicPlusSeason also carries placeholder/event rows with no reward
+        // data (e.g. Midnight has season 122 with the highest StartTimeEvent but zero reward levels, while the
+        // real S1 content season 117 carries the 233-272 reward-level table). Skipping the reward-less rows keeps
+        // the pick a real content season, so GetVaultRewardLevelCap()/GetVaultActivityTierId() resolve and the
+        // active season stays consistent with the display season. Fall back to considering every season only if
+        // the DB2 carries no reward-level data at all (stripped client / older data).
+        auto seasonHasRewardLevels = [](uint32 seasonId)
         {
-            if (season->ExpansionLevel > bestExpansion
-                || (season->ExpansionLevel == bestExpansion && season->StartTimeEvent > bestStart))
+            for (MythicPlusSeasonRewardLevelsEntry const* rewardLevel : sMythicPlusSeasonRewardLevelsStore)
+                if (rewardLevel->MythicPlusSeasonID == seasonId)
+                    return true;
+            return false;
+        };
+
+        for (bool requireRewards : { true, false })
+        {
+            int32 bestExpansion = -1;
+            int32 bestStart = -1;
+            for (MythicPlusSeasonEntry const* season : sMythicPlusSeasonStore)
             {
-                bestExpansion = season->ExpansionLevel;
-                bestStart = season->StartTimeEvent;
-                _activeSeasonId = season->ID;
+                if (requireRewards && !seasonHasRewardLevels(season->ID))
+                    continue;
+
+                if (season->ExpansionLevel > bestExpansion
+                    || (season->ExpansionLevel == bestExpansion && season->StartTimeEvent > bestStart))
+                {
+                    bestExpansion = season->ExpansionLevel;
+                    bestStart = season->StartTimeEvent;
+                    _activeSeasonId = season->ID;
+                }
             }
+
+            if (_activeSeasonId)
+                break;
         }
     }
 
