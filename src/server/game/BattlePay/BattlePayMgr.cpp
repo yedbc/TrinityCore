@@ -436,6 +436,24 @@ int32 BattlePayMgr::GetCharacterBoostType()
     return int32(sWorld->getIntConfig(CONFIG_SHOP_CHARACTER_BOOST_TYPE));
 }
 
+ShopRealMoneyMode BattlePayMgr::GetRealMoneyMode()
+{
+    // Read the string directly from the config: World has no string-config array, and this is queried
+    // only on OPEN_CHECKOUT of a real-money product (rare), so a per-call lookup is fine. Default
+    // "instant" so a fresh test realm can buy real-money products for QA without a web backend.
+    std::string const mode = sConfigMgr->GetStringDefault("Shop.RealMoney.Mode", "instant");
+    if (mode == "web")
+        return SHOP_REAL_MONEY_WEB;
+    if (mode == "disabled")
+        return SHOP_REAL_MONEY_DISABLED;
+    if (mode == "instant")
+        return SHOP_REAL_MONEY_INSTANT;
+
+    TC_LOG_ERROR("server.loading", "BattlePay: Shop.RealMoney.Mode = '{}' is not one of web|instant|disabled; "
+        "using 'instant'.", mode);
+    return SHOP_REAL_MONEY_INSTANT;
+}
+
 bool BattlePayMgr::IsCharacterBoostProduct(ShopProduct const& product)
 {
     return GetServiceType(product) == SHOP_SERVICE_CHARACTER_BOOST;

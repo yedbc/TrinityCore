@@ -217,6 +217,7 @@ enum LoginDatabaseStatements : uint32
 
     LOGIN_INS_ACCOUNT_WOW_TOKEN,
     LOGIN_UPD_ACCOUNT_WOW_TOKEN,
+    LOGIN_DEL_ACCOUNT_WOW_TOKEN,
 
     // Battle.net friends v2 - durable friend graph (see BnetFriendsMgr)
     LOGIN_UPD_BNET_BATTLE_TAG,

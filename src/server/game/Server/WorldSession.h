@@ -139,6 +139,7 @@ namespace WorldPackets
         class GetPurchaseList;
         class StartPurchase;
         class OpenCheckout;
+        class CatalogShopLicenseGameDataRequest;
         class ConfirmPurchaseResponse;
         class DistributionAssignToTarget;
         class CharacterUpgradeStart;
@@ -1186,6 +1187,12 @@ namespace WorldPackets
         class CommerceTokenGetCount;
         class ConsumableTokenCanVeteranBuy;
         class CanRedeemTokenForBalance;
+        class AuctionableTokenSell;
+        class AuctionableTokenSellAtMarketPrice;
+        class ConsumableTokenBuy;
+        class ConsumableTokenBuyAtMarketPrice;
+        class ConsumableTokenRedeem;
+        class ConsumableTokenRedeemConfirmation;
     }
 
     namespace Totem
@@ -2628,6 +2635,12 @@ class TC_GAME_API WorldSession
         void HandleCommerceTokenGetCount(WorldPackets::Token::CommerceTokenGetCount& commerceTokenGetCount);
         void HandleConsumableTokenCanVeteranBuy(WorldPackets::Token::ConsumableTokenCanVeteranBuy& consumableTokenCanVeteranBuy);
         void HandleCanRedeemTokenForBalance(WorldPackets::Token::CanRedeemTokenForBalance& canRedeemTokenForBalance);
+        void HandleAuctionableTokenSell(WorldPackets::Token::AuctionableTokenSell& auctionableTokenSell);
+        void HandleAuctionableTokenSellAtMarketPrice(WorldPackets::Token::AuctionableTokenSellAtMarketPrice& auctionableTokenSellAtMarketPrice);
+        void HandleConsumableTokenBuy(WorldPackets::Token::ConsumableTokenBuy& consumableTokenBuy);
+        void HandleConsumableTokenBuyAtMarketPrice(WorldPackets::Token::ConsumableTokenBuyAtMarketPrice& consumableTokenBuyAtMarketPrice);
+        void HandleConsumableTokenRedeem(WorldPackets::Token::ConsumableTokenRedeem& consumableTokenRedeem);
+        void HandleConsumableTokenRedeemConfirmation(WorldPackets::Token::ConsumableTokenRedeemConfirmation& consumableTokenRedeemConfirmation);
         void SendCommerceTokenUpdate();
         void SendGenerateSsoToken(uint32 clientToken);
 
@@ -2732,6 +2745,7 @@ class TC_GAME_API WorldSession
         void HandleVasGetServiceStatus(WorldPackets::BattlePay::VasGetServiceStatus& packet);
         void HandleBattlePayStartPurchase(WorldPackets::BattlePay::StartPurchase& startPurchase);
         void HandleBattlePayOpenCheckout(WorldPackets::BattlePay::OpenCheckout& openCheckout);
+        void HandleCatalogShopLicenseGameDataRequest(WorldPackets::BattlePay::CatalogShopLicenseGameDataRequest& request);
         void HandleBattlePayConfirmPurchaseResponse(WorldPackets::BattlePay::ConfirmPurchaseResponse& confirmPurchaseResponse);
         void BattlePayProcessPurchase(uint32 productID);
         void SendBattlePayDistributionList();

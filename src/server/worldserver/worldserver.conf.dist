@@ -567,9 +567,21 @@ Auction.TaintedSearchDelay = 3000
 #                     NOTE: buying a WoW Token from the in-game Shop for GOLD (GrantType 3) is a separate,
 #                     already-working path and is NOT gated by this switch.
 #        Default:     0 - (token market disabled)
-#                     1 - (token market enabled; requires the trade handshakes to be implemented)
+#                     1 - (token market enabled; sell / buy / redeem legs active)
 
 WowToken.Market.Enabled = 0
+
+#
+#    WowToken.Market.Price
+#        Description: The token market price in COPPER. This single price is used for all three legs -
+#                     the sell payout, the buy cost and the redeem grant - so there is no arbitrage
+#                     between them. On this core a redeemed token grants gold equal to this price (there
+#                     is no game-time / Battle.net-balance ledger), which is economy-neutral because a
+#                     token is acquired by spending the same amount of gold in the Shop. Only meaningful
+#                     while WowToken.Market.Enabled = 1.
+#        Default:     50000000 - (5000 gold)
+
+WowToken.Market.Price = 50000000
 
 #
 ###################################################################################################
@@ -5387,6 +5399,29 @@ Shop.Shop2CurrencyCode = "USD"
 #                     0 - (Disabled, direct grant - purchases complete server-side but the UI hangs)
 
 Shop.PurchaseConfirmation = 1
+
+#
+#    Shop.RealMoney.Mode
+#        Description: What the realm does when the client opens the checkout
+#                     (CMSG_BATTLE_PAY_OPEN_CHECKOUT) for a REAL-MONEY product - one flagged currency 4
+#                     in shop_product, or an un-reskinned retail catalog card the realm does not route to
+#                     a shop_product (e.g. the Midnight expansion). The 12.1.0.69382 sniff proves such a
+#                     product gets NO game-packet response: the client opens the shop2 web overlay itself.
+#                     In-game-currency products (currency 0/1/2/3) are unaffected - they keep the
+#                     SSO/START_CHECKOUT handshake regardless of this setting.
+#
+#                         web      - Let the client web-checkout. The realm sends no game response, exactly
+#                                    as retail does. Needs a real (or mock) shop2 payment backend for the
+#                                    purchase to ever complete.
+#                         instant  - Grant the product server-side immediately with NO charge. The
+#                                    pragmatic private-realm/QA default: a seeded real-money product is
+#                                    delivered through the normal delivery path so it can be tested without
+#                                    a payment backend. An un-routed retail card has nothing to grant and
+#                                    is a logged no-op. Rapid client retries are throttled to grant once.
+#                         disabled - Refuse politely: no SSO token, no grant. The purchase cannot complete.
+#        Default:     "instant"
+
+Shop.RealMoney.Mode = "instant"
 
 #
 #    Shop.Entitlements.Enabled
