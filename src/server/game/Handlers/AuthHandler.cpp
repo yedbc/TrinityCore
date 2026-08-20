@@ -146,6 +146,27 @@ void WorldSession::SendFeatureSystemStatusGlueScreen()
 
     features.AvailableGameModeIDs.push_back(8); // GameMode.db2, standard
 
+    // In-game Shop character boost. These three are what the client's glue screen reads to decide
+    // whether to offer a boost at all: C_CharacterServices consults IsTrialBoostEnabled before drawing
+    // the boost/"Try New Class" affordances, and the two type fields tell it WHICH boost, which has to
+    // match the BoostID our catalog's CharacterBoost deliverable carries or the UI describes a different
+    // product to the one the account owns.
+    //
+    // They follow ownership, not configuration: the flag is set only while this account actually holds
+    // an unapplied boost entitlement, so the client never offers a boost that CMSG_CHARACTER_UPGRADE_START
+    // would then have to refuse. _shopBoostAdvertised records what we said, so the Shop can push a
+    // corrected copy of this packet when the answer changes mid-session (see LoadBattlePayEntitlements).
+    _shopBoostAdvertised = shopEnabled
+        && sWorld->getBoolConfig(CONFIG_SHOP_ENTITLEMENTS_ENABLED)
+        && HasBattlePayCharacterBoost();
+
+    if (_shopBoostAdvertised)
+    {
+        features.TrialBoostEnabled = true;
+        features.ActiveBoostType = BattlePayMgr::GetCharacterBoostType();
+        features.TrialBoostType = BattlePayMgr::GetCharacterBoostType();
+    }
+
     SendPacket(features.Write());
 
     WorldPackets::System::MirrorVarSingle vars[] =

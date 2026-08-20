@@ -4560,6 +4560,29 @@ Shop.Shop2CurrencyCode = "USD"
 Shop.PurchaseConfirmation = 1
 
 #
+#    Shop.RealMoney.Mode
+#        Description: What the realm does when the client opens the checkout
+#                     (CMSG_BATTLE_PAY_OPEN_CHECKOUT) for a REAL-MONEY product - one flagged currency 4
+#                     in shop_product, or an un-reskinned retail catalog card the realm does not route to
+#                     a shop_product (e.g. the Midnight expansion). The 12.1.0.69382 sniff proves such a
+#                     product gets NO game-packet response: the client opens the shop2 web overlay itself.
+#                     In-game-currency products (currency 0/1/2/3) are unaffected - they keep the
+#                     SSO/START_CHECKOUT handshake regardless of this setting.
+#
+#                         web      - Let the client web-checkout. The realm sends no game response, exactly
+#                                    as retail does. Needs a real (or mock) shop2 payment backend for the
+#                                    purchase to ever complete.
+#                         instant  - Grant the product server-side immediately with NO charge. The
+#                                    pragmatic private-realm/QA default: a seeded real-money product is
+#                                    delivered through the normal delivery path so it can be tested without
+#                                    a payment backend. An un-routed retail card has nothing to grant and
+#                                    is a logged no-op. Rapid client retries are throttled to grant once.
+#                         disabled - Refuse politely: no SSO token, no grant. The purchase cannot complete.
+#        Default:     "instant"
+
+Shop.RealMoney.Mode = "instant"
+
+#
 #    Shop.Entitlements.Enabled
 #        Description: Enable the entitlement ("distribution") model: a purchase that cannot be delivered
 #                     on the spot becomes an owned-but-unapplied entry the player assigns to a character
@@ -4602,6 +4625,41 @@ Shop.Entitlements.Enabled = 0
 #                     1 - (Assignments are applied)
 
 Shop.Entitlements.AssignEnabled = 0
+
+#
+#    Shop.CharacterBoost.Level
+#        Description: The level a character boost takes a character to.
+#
+#                     A boost is a shop_product carrying a type-5 (service) deliverable whose id is 1
+#                     (CharacterBoost). Buying it creates an entitlement; the player then applies it to
+#                     one of their characters from the character-selection screen, and the server writes
+#                     that character's new level, its chosen specialization, and the starter kit
+#                     CharacterLoadout.db2 ships for the boost purpose - all while it is logged out.
+#
+#                     There is no "correct" value to derive: how far ahead a boost puts a character is a
+#                     realm policy decision. The value is clamped to MaxPlayerLevel, and a boost is
+#                     refused outright for a character that is already at or above it.
+#
+#                     Requires the 2026_08_15_00_characters.sql migration (character_shop_boost) and
+#                     Shop.Entitlements.Enabled + Shop.Entitlements.AssignEnabled.
+#        Default:     80
+#        Minimum:     2
+
+Shop.CharacterBoost.Level = 80
+
+#
+#    Shop.CharacterBoost.BoostType
+#        Description: The boost type the glue screen is told about (FeatureSystemStatusGlueScreen's
+#                     ActiveBoostType / TrialBoostType), sent while the account owns an unapplied boost.
+#
+#                     This is not a free choice: the client matches it against the BoostID carried by
+#                     the CharacterBoost deliverable in the catalog, and 11 is the value the shipped
+#                     12.0.7.68275 catalog template carries (see BattlePayPackets.h - catalog
+#                     deliverable 1161, "type = 1 CharacterBoost, boostID = 11"). Change it only
+#                     alongside a catalog whose boost deliverable carries a different BoostID.
+#        Default:     11
+
+Shop.CharacterBoost.BoostType = 11
 
 #
 #    Shop.PlaceholderName

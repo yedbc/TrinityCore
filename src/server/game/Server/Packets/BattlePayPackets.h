@@ -47,6 +47,22 @@ namespace WorldPackets
             void Read() override { }
         };
 
+        // CMSG_CATALOG_SHOP_LICENSE_GAME_DATA_REQUEST. Sent by the client mid-checkout carrying its own
+        // license / game data. The body is variable (876/140/52/36/24 bytes across the 12.1.0.69382
+        // capture). We keep the whole body so the handler can log its size for future response modeling;
+        // the paired response wire (SMSG 0x4202C1) is not yet recovered - see
+        // WorldSession::HandleCatalogShopLicenseGameDataRequest.
+        class CatalogShopLicenseGameDataRequest final : public ClientPacket
+        {
+        public:
+            explicit CatalogShopLicenseGameDataRequest(WorldPacket&& packet)
+                : ClientPacket(CMSG_CATALOG_SHOP_LICENSE_GAME_DATA_REQUEST, std::move(packet)) { }
+
+            void Read() override;
+
+            std::vector<uint8> Data;    // raw request body, retained for diagnostics only
+        };
+
         // The 12.0.7 catalog is a nested reflection bitstream that cannot be re-serialized field-by-field
         // offline (see docs). For P0 we replay a byte-exact, client-validated catalog blob captured from a
         // real 68275 session, so the shop opens and displays real products. RawData is the message BODY
@@ -177,6 +193,125 @@ namespace WorldPackets
         // it for entitlements whose product Type is 12 or 20 (rule matched exactly on both captured
         // accounts: 9-of-77 and 1-of-7) - types our catalog never emits anyway. Send the product through
         // 0x42021E or the distribution list instead; those have registered handlers.
+        //
+        // RE-VERIFIED against the 68275 image (2026-08-14), by a stronger method than the original
+        // finding: the 12.0.7 client dispatches every message in this group through a per-opcode thunk
+        // that indirects through a writable function-pointer slot, and the slot for 0x420224 is
+        // rva 0x44028E0 (VA 0x7FF72CEA28E0). A linear scan of the WHOLE image for RIP-relative stores
+        // (`48/4C 89 /r mod=00 rm=101` and `48 C7 05 ...`) targeting that slot finds ZERO write sites,
+        // while every one of its neighbours has exactly two (a register in the BattlePay registrar at
+        // rva 0x23D4360 and a null-out in the matching unregister at rva 0x23D4574). The dispatch is
+        // therefore a permanent no-op. THE FINDING STILL HOLDS - do not wire this opcode.
+
+        // ---------------------------------------------------------------------------------------------
+        // Purchase delivery notifications (0x42021F - 0x420223).
+        //
+        // HOW THESE WERE RECOVERED (no capture exists and none ever will - retail is on 12.1.0):
+        // the client's SMSG dispatcher is one giant switch, sub_7FF729103660, keyed on the raw opcode.
+        // Each case runs three calls in order: a per-opcode PARSER, then a dispatch THUNK, then the
+        // message destructor. The parser gives the wire layout; the thunk indirects through a global
+        // slot that the BattlePay registrar (rva 0x23D4360) fills in, and THAT is what decides whether
+        // the client does anything at all with the message.
+        //
+        // What the five delivery opcodes actually do in 12.0.7:
+        //
+        //   0x42021F DELIVERY_STARTED   parser rva 0x608110  slot 0x4402910 -> rva 0x1D80E0
+        //                               *** rva 0x1D80E0 is the three bytes `C2 00 00` = `ret 0`. ***
+        //                               The client parses the body and calls a function that returns
+        //                               immediately. NOT WIRED - see the refusal note below.
+        //   0x420220 DELIVERY_ENDED     parser rva 0x608190  slot 0x4402908 -> rva 0x23CD870  (real)
+        //   0x420221 MOUNT_DELIVERED    parser rva 0x608270  slot 0x4402900 -> rva 0x23CD930  (real)
+        //   0x420222 BATTLE_PET_DELIV.  parser rva 0x6082F0  slot 0x44028F0 -> rva 0x23CD930  (real)
+        //   0x420223 COLLECTION_ITEM_D. parser rva 0x608380  slot 0x44028F8 -> rva 0x23CD930  (real)
+        //
+        // The three *_DELIVERED opcodes share ONE handler, rva 0x23CD930, whose entire body is
+        // "fire the Lua event whose id is 0xF8EB3D280E974224" - it never touches the parsed payload.
+        // DELIVERY_ENDED's handler (rva 0x23CD870) walks its element vector under a feature-flag gate
+        // and then fires THE SAME event id. So all four live opcodes collapse to a single client-visible
+        // effect: one "a delivery happened, refresh" event. That is exactly the signal a freshly granted
+        // mount or toy needs in order to appear without a UI reload, and it is what this server was
+        // missing: the grant happened silently and only PURCHASE_UPDATE went out.
+        //
+        // DELIVERY_STARTED is deliberately NOT implemented. Wiring it would put bytes on the wire for a
+        // handler that is a bare `ret` - the same situation as SMSG_BATTLE_PAY_TENDER_GRANTED above, and
+        // refused for the same reason. It is not "unsupported"; it is proven inert.
+        //
+        // SMSG_BATTLE_PAY_BATTLE_PET_DELIVERED is also not implemented, and for a different reason worth
+        // stating: its layout IS recovered (parser rva 0x6082F0 = `uint32; PackedGuid`), but the handler
+        // provably ignores both fields, and this server has no proven source for either of them. Wiring
+        // it would mean inventing two field values to obtain a client effect that
+        // SMSG_BATTLE_PAY_COLLECTION_ITEM_DELIVERED - which has no fields to invent - already produces
+        // identically. Battle-pet grants therefore ride the collection-item notification.
+        // ---------------------------------------------------------------------------------------------
+
+        // SMSG_BATTLE_PAY_MOUNT_DELIVERED (0x420221) and SMSG_BATTLE_PAY_COLLECTION_ITEM_DELIVERED
+        // (0x420223) have IDENTICAL wire shape. Their parsers (rva 0x608270 / 0x608380) make exactly one
+        // call, to rva 0x33CC980, with the count argument computed as `packet[0x18] - packet[0x1C]`,
+        // i.e. "however many bytes are left". That primitive (disassembled at rva 0x33CC980) zeroes the
+        // out-pointer first, bounds-checks the request, and on success stores a POINTER into the packet
+        // buffer and advances the read cursor - it is a zero-copy blob view, and the length is never
+        // stored anywhere in the message object. The handler then never reads it.
+        //
+        // So these messages carry NO fields. An empty body is the complete and correct encoding, not a
+        // placeholder: there is no value the client could observe, and because the primitive zeroes its
+        // output before the bounds check, an empty body cannot leave the client reading uninitialised
+        // memory either (that was checked specifically, since the parser does not pre-zero its own slot).
+        class DeliveryNotification final : public ServerPacket
+        {
+        public:
+            explicit DeliveryNotification(OpcodeServer opcode) : ServerPacket(opcode, 0) { }
+
+            WorldPacket const* Write() override { return &_worldPacket; }
+        };
+
+        // One entry of SMSG_BATTLE_PAY_DELIVERY_ENDED's element vector. Shape proven from the element
+        // parser at rva 0x72BD40 (memory stride 0x70) and the nested reader it calls at rva 0x72C010:
+        //
+        //     uint32   ProductID                          (READ_U32   -> elem+0x00)
+        //     Bits<1>  hasUnlockList ; FlushBits          (READ_U8 + `shr dl,7` -> optional flag elem+0x28)
+        //     Bits<7>  choiceCount   ; FlushBits          (nested, READ_U8 + `shr rdx,1`)
+        //     choiceCount x { uint8; uint32 }             (nested loop, 8-byte stride)
+        //     if (hasUnlockList) {
+        //         uint8  kind                             (READ_U8  -> elem+0x08)
+        //         uint32 count                            (READ_U32)
+        //         count x uint32                          (loop -> vector at elem+0x10)
+        //     }
+        //
+        // Note both bit fields are read as whole bytes with a shift, i.e. each is written and flushed on
+        // its own - they are NOT one packed group. Nothing here is guessed: every read is a call to a
+        // known primitive (0x33CC410 = uint32, 0x33CC370 = uint8, both confirmed by disassembly, the
+        // latter being the byte a bit group is flushed into).
+        //
+        // We emit ProductID and leave both sub-lists empty, because this server genuinely has neither: a
+        // "choice" only exists for products the client picks a variant of, and the unlock list is a set of
+        // ids we do not produce. Empty is a legal encoding of both - the client's loops are plain
+        // `for (i < count)` and its per-element call is behind a feature gate that an empty element
+        // satisfies trivially.
+        struct DeliveredProduct
+        {
+            uint32 ProductID = 0;
+        };
+
+        // SMSG_BATTLE_PAY_DELIVERY_ENDED (0x420220). Layout proven from the parser at rva 0x608190:
+        //
+        //     uint64 PurchaseID                  (READ_U64, primitive rva 0x33CC460 - disassembled and
+        //                                         confirmed to read exactly 8 bytes and advance by 8)
+        //     uint32 Count                       (READ_U32)
+        //     Count x DeliveredProduct
+        //
+        // The client's handler (rva 0x23CD870) reads only the vector pointer and the count; PurchaseID is
+        // parsed and never touched. We send the real PurchaseID anyway - it is the id of the purchase
+        // whose delivery just ended, it costs nothing, and inventing was never necessary here.
+        class DeliveryEnded final : public ServerPacket
+        {
+        public:
+            explicit DeliveryEnded() : ServerPacket(SMSG_BATTLE_PAY_DELIVERY_ENDED, 8 + 4) { }
+
+            WorldPacket const* Write() override;
+
+            uint64 PurchaseID = 0;
+            std::vector<DeliveredProduct> Products;
+        };
 
         // One row of the account's entitlement ledger: which deliverable the account owns, and for how
         // long. Stride is exactly 25 bytes on the wire (4 + 8 + 8 + 4 + 1), which is what makes the
@@ -284,9 +419,10 @@ namespace WorldPackets
             bool Flag = false;
         };
 
-        // Client opens the checkout. The u32 is the ClientToken the server must echo back verbatim in
-        // SMSG_GENERATE_SSO_TOKEN_RESPONSE (proven 1:1 in all 8 captures - checkout #N -> response #N
-        // with the same u32). It is not a distributionID. See COMMERCE_AUDIT C-09.
+        // Client opens the checkout. Body is 8 bytes: { u32 ClientToken, u32 ProductID } (12.1.0.69382
+        // capture, Midnight ProductID 0x417070 in all 7 attempts). ClientToken is the token the SSO/token
+        // handshake echoes back verbatim for an in-game-currency product (COMMERCE_AUDIT C-09); ProductID
+        // selects the product and decides the payment rail - see HandleBattlePayOpenCheckout.
         class OpenCheckout final : public ClientPacket
         {
         public:
@@ -295,6 +431,7 @@ namespace WorldPackets
             void Read() override;
 
             uint32 ClientToken = 0;
+            uint32 ProductID = 0;
         };
 
         // Server-driven purchase confirmation prompt (retail interposes this between StartPurchase and
@@ -484,6 +621,67 @@ namespace WorldPackets
 
             uint8 ServiceStatus = 0;
             uint8 Unknown = 0;
+        };
+
+        // ---- Character boost (VAS service type 1) ---------------------------------------------------
+        //
+        // These four live here rather than in CharacterPackets because the whole flow is the Shop's: a
+        // boost is one of this account's owned entitlements being spent, and the handler hangs off
+        // BattlePayMgr. Only the opcode NAMES belong to the character group.
+
+        // CMSG_CHARACTER_UPGRADE_START (0x4000F4). The client picks the character and the specialization
+        // it wants to come out of the boost as. There is no DistributionID in the body, so the server
+        // chooses which of the account's owned boost entitlements to spend.
+        //
+        // Layout PROVEN from the client's own serializer (0x5D99F0, a straight-line writer, no branches):
+        // after the opcode word it writes a PackedGuid and then a uint32 - entry 0x4000f4 of
+        // c:/dumps/tools/cmsg_sweep/cmsg_layouts_68275.json, `"wire": "pguid u32"`, confidence HIGH.
+        class CharacterUpgradeStart final : public ClientPacket
+        {
+        public:
+            explicit CharacterUpgradeStart(WorldPacket&& packet) : ClientPacket(CMSG_CHARACTER_UPGRADE_START, std::move(packet)) { }
+
+            void Read() override;
+
+            ObjectGuid CharacterGUID;
+            uint32 SpecializationID = 0;    ///< ChrSpecialization.db2 id the boosted character comes out as
+        };
+
+        // The three server answers. Each is a single ObjectGuid - proven from the client's own parsers
+        // (0x420267 -> sub_7FF7290ABAB0, 0x420268 -> sub_7FF7290ABB10, 0x420269 -> sub_7FF7290ABB70),
+        // every one of which reads exactly one guid and nothing else.
+        //
+        // STARTED goes out once the boost has been paid for and is about to be written; COMPLETE only
+        // after it is durably committed; ABORTED whenever it is not going to happen, so the client's
+        // boost UI is never left waiting on a request the server quietly dropped.
+        class CharacterUpgradeStarted final : public ServerPacket
+        {
+        public:
+            explicit CharacterUpgradeStarted() : ServerPacket(SMSG_CHARACTER_UPGRADE_STARTED, 18) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid CharacterGUID;
+        };
+
+        class CharacterUpgradeComplete final : public ServerPacket
+        {
+        public:
+            explicit CharacterUpgradeComplete() : ServerPacket(SMSG_CHARACTER_UPGRADE_COMPLETE, 18) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid CharacterGUID;
+        };
+
+        class CharacterUpgradeAborted final : public ServerPacket
+        {
+        public:
+            explicit CharacterUpgradeAborted() : ServerPacket(SMSG_CHARACTER_UPGRADE_ABORTED, 18) { }
+
+            WorldPacket const* Write() override;
+
+            ObjectGuid CharacterGUID;
         };
     }
 }

@@ -372,6 +372,10 @@ public:
     {
         CHARACTERS,
         CUSTOMIZATIONS,
+        // In-game Shop boosts. Read here rather than cached separately so the flags are guaranteed to be
+        // available when the enumeration packet is built - a boost record that arrived a moment too late
+        // would mean the character list silently lost its "boosted" / "class trial" markings.
+        SHOP_BOOSTS,
 
         MAX
     };
@@ -399,6 +403,10 @@ public:
         stmt = CharacterDatabase.GetPreparedStatement(statements[isDeletedCharacters ? 1 : 0][2]);
         stmt->setUInt32(0, accountId);
         result &= SetPreparedQuery(CUSTOMIZATIONS, stmt);
+
+        stmt = CharacterDatabase.GetPreparedStatement(CHAR_SEL_SHOP_BOOST_ACCOUNT);
+        stmt->setUInt32(0, accountId);
+        result &= SetPreparedQuery(SHOP_BOOSTS, stmt);
 
         return result;
     }
@@ -432,16 +440,52 @@ void WorldSession::HandleCharEnum(CharacterDatabaseQueryHolder const& holder)
         } while (customizationsResult->NextRow());
     }
 
+    // In-game Shop: which of this account's characters have been boosted, and which are class trials
+    // still waiting for a boost.
+    //
+    // MERGED, not replaced, and the deleted-character enumeration does not touch them at all. A class
+    // trial is recorded with an asynchronous write the moment the character is created, and the client
+    // re-enumerates immediately afterwards - the two run on different database connections, so the
+    // enumeration can legitimately read the account before that row has landed. Clearing here would
+    // then lose the marking for a character this session knows perfectly well it just created. Entries
+    // are removed where they actually stop being true: the boost erases the trial it consumed, and a
+    // deleted character simply stops appearing in the list.
+    if (!charEnum.IsDeletedCharacters)
+    {
+        if (PreparedQueryResult boostResult = holder.GetPreparedResult(EnumCharactersQueryHolder::SHOP_BOOSTS))
+        {
+            do
+            {
+                Field* fields = boostResult->Fetch();
+                ObjectGuid::LowType const guid = fields[0].GetUInt64();
+                if (fields[1].GetUInt8())
+                    _shopTrialCharacters.insert(guid);
+                else
+                    _shopBoostedCharacters.insert(guid);
+            }
+            while (boostResult->NextRow());
+        }
+    }
+
     if (PreparedQueryResult result = holder.GetPreparedResult(EnumCharactersQueryHolder::CHARACTERS))
     {
         do
         {
             charEnum.Characters.emplace_back(result->Fetch());
 
-            WorldPackets::Character::EnumCharactersResult::CharacterInfoBasic& charInfo = charEnum.Characters.back().Basic;
+            WorldPackets::Character::EnumCharactersResult::CharacterInfo& characterEntry = charEnum.Characters.back();
+            WorldPackets::Character::EnumCharactersResult::CharacterInfoBasic& charInfo = characterEntry.Basic;
 
             if (std::vector<UF::ChrCustomizationChoice>* customizationsForChar = Trinity::Containers::MapGetValuePtr(customizations, charInfo.Guid.GetCounter()))
                 charInfo.Customizations = std::move(*customizationsForChar);
+
+            // In-game Shop boost markings. USED_MAX_LEVEL_BOOST is what stops the client offering a
+            // boost to a character that has already had one; TRIAL_BOOST is what draws the class-trial
+            // plate on a character created through "Try New Class" that has not been boosted yet.
+            if (IsCharacterShopBoosted(charInfo.Guid.GetCounter()))
+                charInfo.Flags4 |= CHARACTER_FLAG_4_USED_MAX_LEVEL_BOOST;
+            else if (IsCharacterShopTrial(charInfo.Guid.GetCounter()))
+                characterEntry.RestrictionsAndMails.RestrictionFlags |= CHARACTER_RESTRICTION_FLAG_TRIAL_BOOST;
 
             TC_LOG_INFO("network", "Loading char guid {} from account {}.", charInfo.Guid.ToString(), GetAccountId());
 
@@ -493,7 +537,10 @@ void WorldSession::HandleCharEnum(CharacterDatabaseQueryHolder const& holder)
         _collectionMgr->SendWarbandSceneCollectionData();
 }
 
-void WorldSession::HandleCharEnumOpcode(WorldPackets::Character::EnumCharacters& /*enumCharacters*/)
+// Body of the enumeration, split out from the opcode handler so the server can also push a fresh
+// character list on its own initiative - which is what a character boost needs: it changes the target's
+// level, its flags and the gear the selection screen draws, none of which the client will re-request.
+void WorldSession::SendCharacterEnum()
 {
     // remove expired bans
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_EXPIRED_BANS);
@@ -511,6 +558,11 @@ void WorldSession::HandleCharEnumOpcode(WorldPackets::Character::EnumCharacters&
     {
         HandleCharEnum(static_cast<EnumCharactersQueryHolder const&>(result));
     });
+}
+
+void WorldSession::HandleCharEnumOpcode(WorldPackets::Character::EnumCharacters& /*enumCharacters*/)
+{
+    SendCharacterEnum();
 }
 
 void WorldSession::HandleCharUndeleteEnumOpcode(WorldPackets::Character::EnumCharacters& /*enumCharacters*/)
@@ -964,6 +1016,17 @@ void WorldSession::HandleCharCreateOpcode(WorldPackets::Character::CreateCharact
                 return;
             }
 
+            // "Try New Class": the client sets IsTrialBoost when the player creates a character it
+            // intends to spend a boost on, and follows the creation with CMSG_CHARACTER_UPGRADE_START.
+            // Without an owned boost the trial could never be lifted, so the character is created as a
+            // perfectly ordinary one and only the class-trial MARKING is dropped. Creation itself is
+            // never failed over this: character creation is far too load-bearing to gate on a
+            // single-bit flag whose reading has not been confirmed against a live client.
+            bool const isTrialBoost = createInfo->IsTrialBoost && HasBattlePayCharacterBoost();
+            if (createInfo->IsTrialBoost && !isTrialBoost)
+                TC_LOG_INFO("network", "BattlePay: class-trial marking dropped for a new character on account {} - "
+                    "it owns no unapplied character boost.", GetAccountId());
+
             std::shared_ptr<Player> newChar(new Player(this), [](Player* ptr)
             {
                 ptr->CleanupsBeforeDelete();
@@ -995,7 +1058,8 @@ void WorldSession::HandleCharCreateOpcode(WorldPackets::Character::CreateCharact
             stmt->setUInt32(2, sRealmList->GetCurrentRealmId().Realm);
             trans->Append(stmt);
 
-            AddTransactionCallback(CharacterDatabase.AsyncCommitTransaction(characterTransaction)).AfterComplete([this, newChar = std::move(newChar), trans](bool success)
+            AddTransactionCallback(CharacterDatabase.AsyncCommitTransaction(characterTransaction)).AfterComplete(
+                [this, newChar = std::move(newChar), trans, isTrialBoost](bool success)
             {
                 if (success)
                 {
@@ -1004,6 +1068,25 @@ void WorldSession::HandleCharCreateOpcode(WorldPackets::Character::CreateCharact
                     TC_LOG_INFO("entities.player.character", "Account: {} (IP: {}) Create Character: {} {}", GetAccountId(), GetRemoteAddress(), newChar->GetName(), newChar->GetGUID().ToString());
                     sScriptMgr->OnPlayerCreate(newChar.get());
                     sCharacterCache->AddCharacterCacheEntry(newChar->GetGUID(), GetAccountId(), newChar->GetName(), newChar->GetNativeGender(), newChar->GetRace(), newChar->GetClass(), newChar->GetLevel(), false);
+
+                    // Record the class trial. This consumes NOTHING - the boost entitlement is spent by
+                    // CMSG_CHARACTER_UPGRADE_START, which the client sends next - it only marks the
+                    // character so the enumeration draws the class-trial plate until that happens.
+                    if (isTrialBoost)
+                    {
+                        CharacterDatabasePreparedStatement* boostStmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_SHOP_BOOST);
+                        boostStmt->setUInt64(0, newChar->GetGUID().GetCounter());
+                        boostStmt->setUInt32(1, 0);         // no product yet: nothing has been spent
+                        boostStmt->setUInt64(2, UI64LIT(0));
+                        boostStmt->setUInt32(3, 0);
+                        boostStmt->setUInt8(4, 1);          // trial
+                        boostStmt->setInt64(5, GameTime::GetGameTime());
+                        CharacterDatabase.Execute(boostStmt);
+
+                        _shopTrialCharacters.insert(newChar->GetGUID().GetCounter());
+                        TC_LOG_INFO("network", "BattlePay: {} created as a class trial for account {}.",
+                            newChar->GetGUID().ToString(), GetAccountId());
+                    }
 
                     SendCharCreate(CHAR_CREATE_SUCCESS, newChar->GetGUID());
                 }
